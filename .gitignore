@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+env/
+*.egg-info/
+
+# MLflow store and run outputs — regenerate by running the pipeline.
+runs/mlflow.db
+mlruns/
+catboost_info/
+
+# Saved model artifacts (T0-1) — these are build outputs, not source.
+models/
+*.joblib
+*.pkl
+
+.DS_Store
+.idea/
+.vscode/

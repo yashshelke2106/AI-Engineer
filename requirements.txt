@@ -1,0 +1,14 @@
+pandas>=2.2
+numpy>=1.26
+scikit-learn>=1.5
+scipy>=1.13
+xgboost>=2.0
+lightgbm>=4.3
+catboost>=1.2
+optuna>=3.6
+mlflow>=2.14
+shap>=0.45
+statsmodels>=0.14
+category_encoders>=2.6
+pyarrow>=16.0
+joblib>=1.4
