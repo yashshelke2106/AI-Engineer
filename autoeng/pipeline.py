@@ -45,6 +45,7 @@ from autoeng.modeling.search import (
 )
 from autoeng.modeling.time_series import run_time_series_search
 from autoeng.profiling.profiler import profile_dataset
+from autoeng.registry.model_store import save_model
 from autoeng.reporting.report_generator import generate_report
 from autoeng.tracking.mlflow_tracker import log_pipeline_run
 
@@ -61,7 +62,35 @@ class PipelineRunResult:
     report_path: str
     leaderboard: dict[str, Any] | None = None
     held_out_metrics: dict[str, float] | None = None
+    model_artifact: dict[str, Any] | None = None
     extra: dict[str, Any] = field(default_factory=dict)
+
+
+def _persist_final_model(
+    estimator, X_train, y_train, profile, roles, *,
+    problem_type: str, model_name: str | None, selection_source: str,
+    dataset_path: str, model_dir: Path,
+) -> dict[str, Any]:
+    """
+    Save the fitted winner plus its training schema, and return a JSON-able
+    record of what happened for the report and MLflow.
+
+    A failure here is *reported*, not raised. Raising would throw away a
+    completed leaderboard, HPO sweep and explanation — minutes of work — over a
+    serialization problem. Swallowing it silently would be worse: the report
+    would go on citing an artifact that does not exist. So whichever of the two
+    actually happened is what the report says.
+    """
+    try:
+        saved = save_model(
+            estimator, X_train, y_train, profile, roles,
+            problem_type=problem_type, model_name=model_name,
+            output_dir=model_dir, selection_source=selection_source,
+            dataset_path=dataset_path,
+        )
+        return saved.as_dict()
+    except Exception as e:  # noqa: BLE001 - see docstring
+        return {"status": "failed", "error": f"{type(e).__name__}: {e}"}
 
 
 def _regression_metric_from_r2(pipeline, X_test, y_test) -> dict[str, float]:
@@ -164,6 +193,11 @@ def run_pipeline(
     hpo_results_list: list[dict[str, Any]] = []
     explanation_dict = None
     held_out_metrics = None
+    # Only the supervised branches fit a single final estimator worth
+    # persisting; time series may select a classical baseline (no fitted
+    # object) and clustering has no model to serve.
+    model_artifact: dict[str, Any] | None = None
+    model_dir = out_dir / "models" / run_name
     pre_leak_dict = {"flags": []}
     post_leak_dict = {"flags": []}
     clustering_summary = None
@@ -214,6 +248,11 @@ def run_pipeline(
             if final_params:
                 final_pipeline.named_steps["model"].set_params(**final_params)
         final_pipeline.fit(X_train, y_train)
+        model_artifact = _persist_final_model(
+            final_pipeline, X_train, y_train, profile, roles,
+            problem_type=chosen.problem_type.value, model_name=final_name,
+            selection_source=final_source, dataset_path=dataset_path, model_dir=model_dir,
+        )
 
         held_out_metrics = _classification_metric(final_pipeline, X_test, y_test, n_classes)
         explanation = explain_winner(
@@ -269,6 +308,11 @@ def run_pipeline(
             if final_params:
                 final_pipeline.named_steps["model"].set_params(**final_params)
         final_pipeline.fit(X_train, y_train)
+        model_artifact = _persist_final_model(
+            final_pipeline, X_train, y_train, profile, roles,
+            problem_type=chosen.problem_type.value, model_name=final_name,
+            selection_source=final_source, dataset_path=dataset_path, model_dir=model_dir,
+        )
 
         held_out_metrics = _regression_metric_from_r2(final_pipeline, X_test, y_test)
         explanation = explain_winner(
@@ -371,6 +415,7 @@ def run_pipeline(
         explanation=explanation_dict, held_out_metrics=held_out_metrics,
         clustering_summary=clustering_summary, time_series_baselines=ts_baselines,
         target_source=target_source, time_series_setup=ts_setup_dict,
+        model_artifact=model_artifact,
     )
 
     report_path = out_dir / f"{run_name}_report.md"
@@ -389,6 +434,7 @@ def run_pipeline(
                                               "runner_up_score": None, "margin": None, "hpo_improvement": None,
                                               "feature_importances": [], "importance_method": "n/a", "narrative": ""},
             final_report_text=report_text,
+            model_artifact=model_artifact,
         )
     except Exception as e:  # noqa: BLE001 - tracking must never take down the run
         (out_dir / f"{run_name}_mlflow_error.txt").write_text(f"{type(e).__name__}: {e}")
@@ -396,6 +442,6 @@ def run_pipeline(
     return PipelineRunResult(
         run_id=run_id, problem_type=chosen.problem_type.value, target_column=target_column,
         report_text=report_text, report_path=str(report_path), leaderboard=leaderboard_dict,
-        held_out_metrics=held_out_metrics,
+        held_out_metrics=held_out_metrics, model_artifact=model_artifact,
         extra={"mlflow_tracking_uri": mlflow_tracking_uri, "explanation": explanation_dict},
     )

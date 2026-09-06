@@ -37,6 +37,7 @@ def generate_report(
     time_series_baselines: list[dict[str, Any]] | None = None,
     target_source: str = "auto-detected",
     time_series_setup: dict[str, Any] | None = None,
+    model_artifact: dict[str, Any] | None = None,
 ) -> str:
     chosen = problem_decision["chosen"]
     lines: list[str] = []
@@ -165,8 +166,32 @@ def generate_report(
             lines.append(f"- {k}: {v:.4f}")
         lines.append("")
 
+    # Placed immediately after the held-out metrics on purpose: those numbers
+    # describe this artifact, and the two belong side by side.
+    if model_artifact:
+        lines.append("## 9. Persisted Model Artifact\n")
+        if model_artifact.get("status") == "saved":
+            lines.append(f"- **Model:** `{model_artifact['model_path']}`")
+            lines.append(f"- **Training schema:** `{model_artifact['schema_path']}`")
+            lines.append(f"- **Estimator class:** `{model_artifact['estimator_class']}`")
+            if model_artifact.get("mlflow_model_dir"):
+                lines.append(f"- **MLflow model:** `{model_artifact['mlflow_model_dir']}`")
+            for w in model_artifact.get("warnings") or []:
+                lines.append(f"- *Warning:* {w}")
+            lines.append(
+                "\nThe schema records column order, dtypes, semantic types, feature roles, target "
+                "class labels, and per-feature reference distributions (quantiles for numeric "
+                "columns, category frequencies for categorical ones) taken from the training "
+                "partition — the baseline a later drift check compares against.\n"
+            )
+        else:
+            lines.append(
+                f"- **Model was NOT persisted.** {model_artifact.get('error', 'unknown error')}\n\n"
+                "The metrics above therefore describe an estimator that no longer exists.\n"
+            )
+
     if post_training_leakage:
-        lines.append("## 9. Post-Training Leakage Scan\n")
+        lines.append("## 10. Post-Training Leakage Scan\n")
         lines.append(_fmt_flag_list(post_training_leakage["flags"]))
 
     if clustering_summary:

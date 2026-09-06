@@ -24,33 +24,43 @@ industrialises the wrong model.
 ## Tier 0 — Blockers
 
 All three confirmed absent by grepping the codebase, not assumed.
+**T0-1 is now done; start at T0-2.**
 
-### T0-1 · Persist the trained model and its schema (~150 lines, 4 tests)
+### ~~T0-1 · Persist the trained model and its schema~~ — **DONE**
 
-**Why first:** no `joblib`, `pickle`, or `log_model` call exists anywhere in
-`autoeng/`. The pipeline fits the winner, evaluates it, explains it, writes a
-report about it — then it goes out of scope and is garbage-collected. Every
-item below presupposes an artifact that doesn't exist.
+Built in `autoeng/registry/model_store.py`, called from `run_pipeline`
+immediately after `final_pipeline.fit` (both the classification and regression
+branches) and before report generation, so the report cites the artifact.
 
-- **Build:** model store writing the fitted pipeline via `joblib` + registering
-  with `mlflow.sklearn.log_model` (signature + input example). Alongside it a
-  `training_schema.json`: column names, dtypes, profiled semantic types, the
-  full `FeatureRoleAssignment`, target class labels, and per-feature reference
-  distributions (quantiles for numeric, category frequencies for categorical) —
-  those are what T1-3 diffs against later and are free to capture now.
-- **Where:** new `autoeng/registry/model_store.py`, called from `run_pipeline`
-  right after `final_pipeline.fit`, before report generation.
-- **Watch for:** the stacked ensemble is a `StackingClassifier`, not a
-  `Pipeline` — the store must round-trip both. Pin library versions in the
-  metadata; an unpickled estimator from a different sklearn minor version is a
-  silent correctness risk.
-- **Done when:** reloading and scoring the same held-out split reproduces the
-  in-run metrics to within `1e-9`, asserted in a test.
+- **Written per run** to `runs/models/<run_name>/`: `model.joblib` (the
+  authoritative artifact), `training_schema.json`, and an `mlflow_model/`
+  directory with signature + input example. The tracking layer copies that
+  directory into the run, producing a resolvable `runs:/<run_id>/model` URI.
+- **Schema carries** column names *and order*, dtypes, profiled semantic types,
+  the full `FeatureRoleAssignment` (reasoning included), target class labels,
+  library versions, and per-feature reference distributions — decile quantiles
+  for numeric columns, category frequencies for categorical ones, computed on
+  the **raw** training columns. Those are T1-3's drift baseline.
+- **Verified:** round-trip reproduces held-out metrics at a measured delta of
+  **0.0** (bar: 1e-9), for a `Pipeline` and a `StackingClassifier` alike.
+- **Two things worth knowing before building on it:**
+  - MLflow's default sklearn format is now **skops**, which refuses to
+    serialize any non-sklearn class — i.e. every pipeline this project builds.
+    The export is written with cloudpickle for that reason, pinned by a test.
+  - Saving failures are *reported, not raised*: the report says the model was
+    not persisted and why, rather than discarding a completed search.
+- **Not covered:** time-series and clustering runs persist nothing. Time series
+  may select a classical baseline with no fitted estimator, and clustering has
+  no model to serve. Both need a decision about what "the model" even is before
+  they can have one.
 
-### T0-2 · Decision threshold and class imbalance (~200 lines, 5 tests)
+### T0-2 · Decision threshold and class imbalance (~200 lines, 5 tests) — **NEXT**
 
 **Why:** the measurement above. ROC-AUC is threshold-free, so it stays high
 while the deployed classifier misses three-quarters of the positives.
+Now also the *only* remaining Tier 0 gap between what the report claims and
+what the saved model does — and as of T0-1 that model is a real artifact
+someone can deploy, which raises the stakes rather than lowering them.
 
 - **Build:**
   - `class_weight="balanced"` variants in the zoo, competing as ordinary
@@ -212,6 +222,12 @@ Roughly 2,300 lines and 40 tests across all fourteen items; Tier 0 alone is
 about 530 lines and closes the gap between what the report claims and what the
 model does.
 
-Current state: 61 tests passing, 8/8 on unambiguous problem-type detection,
-7.4× search speedup from successive halving — and the model still isn't saved
-anywhere.
+Current state: 68 tests passing, 8/8 on unambiguous problem-type detection,
+7.4× search speedup from successive halving, and the trained model is now
+persisted with its schema (T0-1). The remaining Tier 0 gap is the decision
+threshold: on a 3.9%-positive dataset the system still reports ROC-AUC 0.955
+while the saved model catches 7 of 29 positives.
+
+**T0-1's schema also front-loaded work for later items.** The reference
+distributions T1-3 needs are already captured, and T1-1 has a column contract
+to validate against. Neither should be rebuilt.

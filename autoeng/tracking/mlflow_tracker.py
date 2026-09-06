@@ -47,6 +47,7 @@ def log_pipeline_run(
     post_training_leakage: dict[str, Any],
     explanation: dict[str, Any],
     final_report_text: str,
+    model_artifact: dict[str, Any] | None = None,
 ) -> str:
     mlflow.set_tracking_uri(tracking_uri)
     mlflow.set_experiment(DEFAULT_EXPERIMENT)
@@ -93,6 +94,18 @@ def log_pipeline_run(
         _log_dict_artifact({"hpo_results": hpo_results}, "hpo_results.json")
         _log_dict_artifact(post_training_leakage, "post_training_leakage_report.json")
         _log_dict_artifact(explanation, "model_explanation.json")
+
+        if model_artifact:
+            _log_dict_artifact(model_artifact, "model_artifact.json")
+            # The model directory was written to disk right after fit (see
+            # autoeng/registry/model_store.py, which uses mlflow.sklearn.
+            # save_model precisely so it needs no active run). Copying it in
+            # here is what turns it into a `runs:/<run_id>/model` URI that
+            # mlflow.sklearn.load_model can resolve.
+            mlflow_model_dir = model_artifact.get("mlflow_model_dir")
+            if mlflow_model_dir and Path(mlflow_model_dir).is_dir():
+                mlflow.log_artifacts(mlflow_model_dir, artifact_path="model")
+                mlflow.set_tag("model_uri", f"runs:/{run.info.run_id}/model")
 
         with tempfile.TemporaryDirectory() as tmp:
             report_path = Path(tmp) / "human_readable_report.md"

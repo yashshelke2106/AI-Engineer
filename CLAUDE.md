@@ -14,7 +14,7 @@ everything to MLflow, and writes a report.
 python -m autoeng.cli run data/any.csv          # infer everything
 python -m autoeng.cli run data.csv --target y   # or pin the target
 python -m autoeng.cli ask <run_id> "why did you reject random_forest?"
-pytest tests/ -q                                # 61 tests, ~75s
+pytest tests/ -q                                # 68 tests, ~55s
 python scripts/calibrate_detection.py           # detection accuracy, 8/8 expected
 ```
 
@@ -61,7 +61,13 @@ hypotheses, and `--target` / `--problem-type` override them. Never make it pick
 silently. On retraining, pin the target via override rather than re-detecting —
 otherwise the system can change what it predicts mid-lifecycle.
 
-**7. No STL-as-features on the full series.**
+**7. The model store takes an *estimator*, not a Pipeline.**
+The ordinary winner is a `Pipeline`; the stacked ensemble is a bare
+`StackingClassifier` holding pipelines as base estimators. Nothing in
+`autoeng/registry/` may reach for `.named_steps` or assume `.steps` exists.
+Both shapes are pinned by round-trip tests for this reason.
+
+**8. No STL-as-features on the full series.**
 Fitting STL on the whole series and using its components at time *t* leaks the
 future into the past. It was deliberately refused. The correct version re-fits
 inside each fold (T2-2).
@@ -89,6 +95,17 @@ inside each fold (T2-2).
 - **Slice X with `roles.feature_columns`**, never "everything except the
   target". The latter lets identifier columns ride into the model, and the
   interaction featurizer will happily build features on a row-number column.
+- **MLflow's default sklearn serialization is `skops`**, which refuses to
+  serialize any non-sklearn class. Every pipeline here embeds this project's
+  own transformers, so `mlflow.sklearn.save_model` fails outright on the
+  default. `model_store.py` passes `SERIALIZATION_FORMAT_CLOUDPICKLE`. The
+  export reports failure rather than raising, so it went *silently* missing
+  until a test asserted the `MLmodel` file exists — keep that test.
+- **Model-store failures are reported, not raised.** A serialization problem
+  must not discard a completed leaderboard, HPO sweep and explanation. But the
+  report then says the model was *not* persisted, with the error. Never
+  downgrade that to a silent skip: the whole point of T0-1 is that report
+  numbers describe an artifact that exists.
 
 ## Layout
 
@@ -103,6 +120,7 @@ autoeng/
   leakage/      pre- and post-training detection
   modeling/     model_zoo, search (halving), hpo, ensemble, clustering, time_series
   explain/      explainer.py (SHAP/permutation), qa.py (grounded Q&A over MLflow)
+  registry/     model_store.py — fitted model + training_schema.json (T0-1)
   tracking/     MLflow logging + querying
   reporting/    Markdown report generation
   pipeline.py   orchestration      cli.py  entry point
@@ -123,9 +141,18 @@ autoeng/
 
 ## Current state
 
-61 tests passing. Detection 8/8 on unambiguous cases (iris is genuinely
+68 tests passing. Detection 8/8 on unambiguous cases (iris is genuinely
 ambiguous and excluded). Successive halving gives 7.4× speedup with an
-identical winner. Two known holes, both in `ROADMAP.md` Tier 0: **the trained
-model is never saved to disk**, and **there is no decision-threshold tuning** —
-on a 3.9%-positive dataset the system reports ROC-AUC 0.955 while catching 7 of
-29 positives.
+identical winner.
+
+**T0-1 is done:** classification and regression runs write
+`runs/models/<run_name>/{model.joblib, training_schema.json, mlflow_model/}`,
+the report cites them, and reloading reproduces the held-out metrics at a
+measured delta of 0.0. Time-series and clustering runs still persist nothing —
+the first may pick a classical baseline with no fitted estimator, the second
+has no model to serve.
+
+One Tier 0 hole remains: **there is no decision-threshold tuning** — on a
+3.9%-positive dataset the system reports ROC-AUC 0.955 while catching 7 of 29
+positives. That model can now be saved and deployed, which makes T0-2 more
+urgent, not less. Start there.

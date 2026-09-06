@@ -20,7 +20,7 @@ python -m autoeng.cli run data.csv --target revenue        # or tell it the targ
 python -m autoeng.cli ask <run_id> "why did you reject random_forest?"
 python -m autoeng.cli list-runs
 
-pytest tests/ -q                                           # 61 tests, ~75s
+pytest tests/ -q                                           # 68 tests, ~55s
 python scripts/calibrate_detection.py                      # detection accuracy harness
 ```
 
@@ -61,11 +61,19 @@ Supports CSV/TSV, Parquet, JSON/JSON-Lines, and Excel.
    (see the honest result in [Findings](#findings-from-testing)).
 10. **Explain** — SHAP `TreeExplainer` for tree winners, permutation
     importance otherwise; leaderboard margin over the runner-up; HPO delta.
-11. **Track** — every param, metric, and JSON artifact logged to MLflow
-    (SQLite-backed, zero external services).
-12. **Ask** — grounded Q&A answering from the logged run data, never by
+11. **Persist** — the fitted winner is saved to
+    `runs/models/<run_name>/model.joblib` alongside a `training_schema.json`
+    (column names and order, dtypes, semantic types, feature roles, target
+    class labels, library versions, and per-feature reference distributions)
+    and an MLflow model directory with signature and input example. Reloading
+    reproduces the in-run held-out metrics exactly — measured delta 0.0.
+    Classification and regression only; see [Scope](#scope--whats-not-here).
+12. **Track** — every param, metric, and JSON artifact logged to MLflow
+    (SQLite-backed, zero external services), including a resolvable
+    `runs:/<run_id>/model` URI.
+13. **Ask** — grounded Q&A answering from the logged run data, never by
     re-guessing.
-13. **Report** — one Markdown report per run assembling all of the above.
+14. **Report** — one Markdown report per run assembling all of the above.
 
 ## Target detection: the hard part
 
@@ -131,8 +139,17 @@ part:
 - **No deployment API, monitoring, drift detection, or auto-retrain loop.**
   The spec's back half is a second system (an always-on service) layered on
   this one (a one-shot training run). Building it shallowly would have meant a
-  fake drift detector and a fake retrain loop. MLflow tracking — the
-  foundation it needs — is in place.
+  fake drift detector and a fake retrain loop. Two foundations it needs are in
+  place: MLflow tracking, and a persisted model whose schema already carries
+  the training reference distributions a real drift check would diff against.
+- **Only classification and regression runs persist a model.** Time-series
+  forecasting may select a classical baseline that has no fitted estimator to
+  save, and clustering has no model to serve; both need a decision about what
+  "the model" is before they can have one, and guessing would produce an
+  artifact that loads but means nothing.
+- **No decision threshold is tuned.** The saved classifier predicts at 0.5.
+  On an imbalanced dataset that is a real gap between the reported ROC-AUC and
+  the deployed behaviour — it is `ROADMAP.md` T0-2 and it is next.
 - **The Q&A is grounded retrieval, not an LLM chat layer.** It answers by
   reading real logged numbers back via keyword routing. Point an LLM at these
   same lookups as tools for the open-ended version; the hard part (answers
@@ -175,11 +192,12 @@ autoeng/
   leakage/         pre- and post-training leakage detection
   modeling/        model zoo, budgeted CV search, HPO, stacking, clustering, time series
   explain/         SHAP/permutation explanations, grounded Q&A
+  registry/        model + training-schema persistence, reference distributions
   tracking/        MLflow logging and querying
   reporting/       Markdown report generation
   pipeline.py      end-to-end orchestration
   cli.py           command-line entry point
-tests/             61 tests: planted leaks, regressions for every shipped bug, unit tests
+tests/             68 tests: planted leaks, regressions for every shipped bug, unit tests
 scripts/           detection calibration harness
 data/              synthetic + real validation datasets
 runs/              reports + MLflow store from the validation runs
