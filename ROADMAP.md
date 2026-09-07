@@ -3,28 +3,31 @@
 Dependency-ordered. Three items block everything else; one measurement from the
 current build is why the order looks like this.
 
-## The measurement that sets the order
+## The measurement that set the order
 
-A 3.9%-positive-rate dataset run through the pipeline as it stands:
+*(Resolved by T0-2 — kept because it is why the tier is ordered this way.)*
 
-| | |
-|---|---|
-| Reported ROC-AUC | **0.955** |
-| Actual recall at the default 0.5 threshold | **0.241** |
-| Positives caught | **7 of 29** |
-| Threshold tuning in the codebase | **none** |
+A 3.9%-positive-rate dataset run through the pipeline as it stood:
 
-Nothing tunes a decision threshold, weights classes, or reports an operating
-point. The headline metric and the deployed behaviour have come apart, and the
-report shows only the flattering one. Automating retraining on top of that
-industrialises the wrong model.
+| | before T0-2 | after |
+|---|---|---|
+| Reported ROC-AUC | **0.955** | unchanged — it was never the problem |
+| Recall at the default 0.5 threshold | **0.241** | 0.483 under `f1`, 0.862 under `expected_cost` |
+| Positives caught | **7 of 29** | 14 of 29, or 25 of 29 |
+| Threshold tuning in the codebase | **none** | `autoeng/modeling/threshold.py` |
+
+Nothing tuned a decision threshold, weighted classes, or reported an operating
+point. The headline metric and the deployed behaviour had come apart, and the
+report showed only the flattering one. Automating retraining on top of that
+would have industrialised the wrong model — which is why T0-2 came before
+T1-4 and T1-5, and still should if any of this is revisited.
 
 ---
 
 ## Tier 0 — Blockers
 
 All three confirmed absent by grepping the codebase, not assumed.
-**T0-1 is now done; start at T0-2.**
+**T0-1 and T0-2 are now done; start at T0-3.**
 
 ### ~~T0-1 · Persist the trained model and its schema~~ — **DONE**
 
@@ -54,31 +57,51 @@ branches) and before report generation, so the report cites the artifact.
   no model to serve. Both need a decision about what "the model" even is before
   they can have one.
 
-### T0-2 · Decision threshold and class imbalance (~200 lines, 5 tests) — **NEXT**
+### ~~T0-2 · Decision threshold and class imbalance~~ — **DONE**
 
-**Why:** the measurement above. ROC-AUC is threshold-free, so it stays high
-while the deployed classifier misses three-quarters of the positives.
-Now also the *only* remaining Tier 0 gap between what the report claims and
-what the saved model does — and as of T0-1 that model is a real artifact
-someone can deploy, which raises the stakes rather than lowering them.
+Built in `autoeng/modeling/threshold.py`, selected in `run_pipeline` before the
+final fit, persisted into `training_schema.json` under `decision_threshold`,
+and reported in section 8 beside the ranking metrics.
 
-- **Build:**
-  - `class_weight="balanced"` variants in the zoo, competing as ordinary
-    candidates rather than replacing the unweighted ones.
-  - A threshold selector running on **out-of-fold** predicted probabilities,
-    maximising the operating metric — F1, recall subject to a precision floor,
-    or expected cost given a cost matrix (config, F1 default).
-  - Threshold saved with the model in T0-1 and applied at serving time.
-- **Report:** section 8 shows the ranking metric *and* the operating point —
-  precision, recall, F1, confusion matrix at the selected threshold.
-- **Watch for:** select on out-of-fold predictions, never the held-out test
-  split — tuning it there is the same leakage the architecture prevents
-  everywhere else, just at the last step.
-- **Done when:** on the 3.9% fixture, recall at the tuned threshold clears 0.70
-  with precision reported; confusion matrix appears in the report. Keep the
-  fixture as a regression test.
+- **The fixture this was measured against did not exist.** The 3.9% dataset
+  behind the measurement above was never committed — no dataset in `data/` was
+  more skewed than 22%, and `conftest.py` had no imbalanced fixture. It is now
+  `imbalanced_classification_df` (744 rows, 29 positives, 3.90%) and
+  `data/synthetic_imbalanced.csv`, and it reproduces the original numbers: with
+  `gradient_boosting` it lands at ROC-AUC 0.919, recall 0.241, **7 of 29**
+  positives caught at the 0.5 default.
+- **Built:** three objectives (`f1` default, `recall_at_precision`,
+  `expected_cost`), selected over every distinct out-of-fold probability;
+  `class_weight="balanced"` twins for the seven zoo estimators that accept it,
+  competing as ordinary candidates.
+- **Watch for:** anything keyed by algorithm rather than by candidate must
+  resolve through `base_model_name()`. `SCALE_SENSITIVE_MODELS`,
+  `TREE_LIKE_MODELS`, `SLOW_MODEL_ROW_LIMIT` and `SEARCH_SPACES` are all keyed
+  that way, and a `*_balanced` twin silently loses its scaler, gains outlier
+  capping, or goes untuned if it is looked up by its full name.
 
-### T0-3 · Group-aware splitting and group leakage (~180 lines, 4 tests)
+**The "done when" was internally inconsistent, and the resolution is the
+interesting part.** It asked for F1 as the default *and* recall above 0.70.
+Those cannot both hold at a 3.9% base rate: F1 is symmetric, so past roughly
+0.6 recall the precision it costs exceeds the recall it buys and F1 falls. The
+bar is reachable only by telling the system a miss costs more than a false
+alarm — which is domain knowledge it cannot infer from data. So F1 stays the
+neutral default, and the 0.70 bar moved to `expected_cost`, where it belongs:
+
+| objective (`gradient_boosting`, out-of-fold) | threshold | precision | recall | caught |
+|---|---|---|---|---|
+| default | 0.5 | 0.467 | 0.241 | 7/29 |
+| `f1` (default) | 0.121 | 0.424 | 0.483 | 14/29 |
+| `recall_at_precision` ≥0.3 | 0.026 | 0.310 | 0.621 | 18/29 |
+| `expected_cost` (FN=20×FP) | 0.004 | 0.217 | **0.862** | 25/29 |
+
+**Known weakness:** the held-out operating point is estimated from ~6 positives
+(20% of 29), so its precision and recall move in steps of ~0.17 and should not
+be read as precise. The out-of-fold selection uses all 23 training positives
+and is the sounder number. A dataset this rare wants repeated CV or a larger
+holdout; neither is in place.
+
+### T0-3 · Group-aware splitting and group leakage (~180 lines, 4 tests) — **NEXT**
 
 **Why:** no `GroupKFold`/`StratifiedGroupKFold` anywhere. Datasets with
 repeated entities (several visits per patient, sessions per user, readings per
@@ -222,12 +245,19 @@ Roughly 2,300 lines and 40 tests across all fourteen items; Tier 0 alone is
 about 530 lines and closes the gap between what the report claims and what the
 model does.
 
-Current state: 68 tests passing, 8/8 on unambiguous problem-type detection,
-7.4× search speedup from successive halving, and the trained model is now
-persisted with its schema (T0-1). The remaining Tier 0 gap is the decision
-threshold: on a 3.9%-positive dataset the system still reports ROC-AUC 0.955
-while the saved model catches 7 of 29 positives.
+Current state: 79 tests passing, 8/8 on unambiguous problem-type detection,
+7.4× search speedup from successive halving. The trained model is persisted
+with its schema (T0-1) and the decision threshold is selected out-of-fold,
+saved into that schema, and reported beside the ranking metrics (T0-2). The
+remaining Tier 0 gap is group-aware splitting (T0-3).
 
-**T0-1's schema also front-loaded work for later items.** The reference
-distributions T1-3 needs are already captured, and T1-1 has a column contract
-to validate against. Neither should be rebuilt.
+**T0-1 and T0-2 front-loaded work for later items.** The reference
+distributions T1-3 needs are already captured; T1-1 has a column contract to
+validate against *and* a threshold to apply at serving time. None of it should
+be rebuilt.
+
+**Note on search cost.** The `class_weight="balanced"` twins grew the
+classification zoo from 21 candidates to 28, and the threshold selector adds
+one extra CV pass over the winner. The test suite went from ~55s to ~105s.
+T2-4 (parallelism across candidates) is worth more now than when it was
+written.

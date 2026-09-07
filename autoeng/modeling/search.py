@@ -41,7 +41,7 @@ from sklearn.preprocessing import StandardScaler
 from autoeng.common.roles import FeatureRoleAssignment
 from autoeng.features.pipeline_builder import build_preprocessing_pipeline
 from autoeng.modeling.model_zoo import (
-    SCALE_SENSITIVE_MODELS, get_classification_models, get_regression_models,
+    SCALE_SENSITIVE_MODELS, base_model_name, get_classification_models, get_regression_models,
 )
 
 # Known-slow candidates get skipped above this many training rows rather than
@@ -115,10 +115,13 @@ def _build_pipeline_for_model(name: str, model_factory, roles: FeatureRoleAssign
                                problem_kind: str) -> Any:
     # Tree ensembles are outlier-robust by construction, so IQR capping buys
     # them nothing and can only distort genuine extreme values.
-    cap_outliers = name not in TREE_LIKE_MODELS
+    # Resolve through the base name so a class_weight="balanced" twin inherits
+    # its original's preprocessing rather than silently getting IQR capping.
+    base = base_model_name(name)
+    cap_outliers = base not in TREE_LIKE_MODELS
     pre = build_preprocessing_pipeline(roles, problem_kind=problem_kind, cap_outliers=cap_outliers)
     steps = list(pre.steps)
-    if name in SCALE_SENSITIVE_MODELS:
+    if base in SCALE_SENSITIVE_MODELS:
         steps.append(("scale", StandardScaler(with_mean=True)))
     steps.append(("model", model_factory()))
     return Pipeline(steps)
@@ -143,7 +146,7 @@ def _subsample(X: pd.DataFrame, y: pd.Series, problem_kind: str, n_rows: int):
 def _evaluate_candidate(name: str, factory, roles: FeatureRoleAssignment, problem_kind: str,
                          X: pd.DataFrame, y: pd.Series, cv, scoring: dict[str, str],
                          stage: str) -> ModelResult:
-    limit = SLOW_MODEL_ROW_LIMIT.get(name)
+    limit = SLOW_MODEL_ROW_LIMIT.get(base_model_name(name))
     if limit and len(X) > limit:
         return ModelResult(name=name, status="skipped", evaluation_stage=stage,
                            error=f"n_rows={len(X)} > {limit} row cap for this model")

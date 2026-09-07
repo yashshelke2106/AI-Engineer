@@ -24,7 +24,7 @@ import pandas as pd
 from sklearn.model_selection import KFold, StratifiedKFold, cross_val_score
 
 from autoeng.common.roles import FeatureRoleAssignment
-from autoeng.modeling.model_zoo import SCALE_SENSITIVE_MODELS
+from autoeng.modeling.model_zoo import SCALE_SENSITIVE_MODELS, base_model_name
 from autoeng.modeling.search import _build_pipeline_for_model
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -184,7 +184,9 @@ def optimize_model(
     problem_kind: Literal["classification", "regression"], primary_metric: str,
     cv_folds: int = 5, n_trials: int = 25, timeout_seconds: int = 120,
 ) -> HPOResult:
-    space_fn = SEARCH_SPACES.get(model_name)
+    # Base name, so a class_weight="balanced" twin is tuned over its original's
+    # space instead of being reported as having none.
+    space_fn = SEARCH_SPACES.get(base_model_name(model_name))
     if space_fn is None:
         return HPOResult(model_name=model_name, tuned=False, baseline_score=baseline_score, best_score=baseline_score)
 

@@ -57,6 +57,55 @@ def timeseries_df() -> pd.DataFrame:
 
 
 @pytest.fixture
+def imbalanced_classification_df() -> pd.DataFrame:
+    """
+    744 rows, 29 positives (3.90%) — the shape that breaks a 0.5 threshold.
+
+    This is the fixture T0-2 is measured against. The point of it is that the
+    signal is genuinely strong (ROC-AUC lands between 0.92 and 0.96 depending
+    on the model) while recall at the default 0.5 threshold is dismal: roughly
+    6 to 12 of the 29 positives, because a rare positive almost never pushes a
+    calibrated probability past 0.5. That gap between the ranking metric and
+    the deployed behaviour is the entire subject of T0-2.
+
+    Parameters are tuned, not arbitrary: `noise` is small relative to `signal`
+    so the features really are predictive, and the intercept is set so the
+    positive rate lands at the intended rarity rather than wherever it fell.
+    """
+    rng = np.random.default_rng(0)
+    n = 744
+    signal, intercept, noise = 2.6, -7.7, 0.25
+
+    account_age_days = rng.integers(30, 3000, n)
+    n_transactions = rng.poisson(40, n) + 1
+    avg_amount = rng.lognormal(4.0, 0.9, n).round(2)
+    region = rng.choice(["north", "south", "east", "west"], n, p=[0.35, 0.3, 0.2, 0.15])
+    device = rng.choice(["mobile", "web", "api"], n, p=[0.6, 0.3, 0.1])
+    prior_disputes = rng.poisson(0.3, n)
+
+    z = signal * (
+        -1.10 * (account_age_days - 1500) / 1000
+        + 0.95 * (np.log(avg_amount) - 4.0)
+        + 0.85 * prior_disputes
+        + 0.60 * (device == "api")
+        - 0.40 * (n_transactions - 40) / 20
+    ) + rng.normal(0, noise, n)
+    p = 1 / (1 + np.exp(-(z + intercept)))
+    is_fraud = (rng.uniform(0, 1, n) < p).astype(int)
+
+    return pd.DataFrame({
+        "account_id": [f"A{i:05d}" for i in range(n)],
+        "account_age_days": account_age_days,
+        "n_transactions": n_transactions,
+        "avg_amount": avg_amount,
+        "region": region,
+        "device_type": device,
+        "prior_disputes": prior_disputes,
+        "is_fraud": is_fraud,
+    })
+
+
+@pytest.fixture
 def sorted_by_class_df() -> pd.DataFrame:
     """Rows sorted by class — the shape that breaks unshuffled K-fold screening."""
     rng = np.random.default_rng(3)

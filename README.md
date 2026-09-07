@@ -20,7 +20,7 @@ python -m autoeng.cli run data.csv --target revenue        # or tell it the targ
 python -m autoeng.cli ask <run_id> "why did you reject random_forest?"
 python -m autoeng.cli list-runs
 
-pytest tests/ -q                                           # 68 tests, ~55s
+pytest tests/ -q                                           # 79 tests, ~105s
 python scripts/calibrate_detection.py                      # detection accuracy harness
 ```
 
@@ -47,8 +47,10 @@ Supports CSV/TSV, Parquet, JSON/JSON-Lines, and Excel.
    the target, train/test row overlap, temporal ordering violations) and
    post-training (implausibly perfect held-out metrics, cross-referenced
    against feature-importance concentration).
-7. **Search 20+ models under a budget** — 21 classification and 21 regression
-   algorithms spanning linear, distance-based, naive Bayes, trees, bagging and
+7. **Search 20+ models under a budget** — 28 classification (21 algorithms plus
+   `class_weight="balanced"` twins of the seven that accept it, competing as
+   ordinary candidates) and 21 regression algorithms spanning linear,
+   distance-based, naive Bayes, trees, bagging and
    boosting (sklearn + XGBoost + LightGBM + CatBoost). Above 3,000 rows the
    search switches to **successive halving**: everything is screened on a
    subsample with fewer folds, the top 6 are promoted to full CV, and
@@ -61,19 +63,25 @@ Supports CSV/TSV, Parquet, JSON/JSON-Lines, and Excel.
    (see the honest result in [Findings](#findings-from-testing)).
 10. **Explain** — SHAP `TreeExplainer` for tree winners, permutation
     importance otherwise; leaderboard margin over the runner-up; HPO delta.
-11. **Persist** — the fitted winner is saved to
+11. **Choose an operating point** (binary classification) — a decision
+    threshold selected on **out-of-fold** training predictions, never the
+    held-out split, maximising F1 by default or recall subject to a precision
+    floor / expected cost when told what a mistake is worth. The report shows
+    precision, recall, F1 and the confusion matrix at the selected threshold
+    *and* at the 0.5 default, because the gap between them is the point.
+12. **Persist** — the fitted winner is saved to
     `runs/models/<run_name>/model.joblib` alongside a `training_schema.json`
     (column names and order, dtypes, semantic types, feature roles, target
     class labels, library versions, and per-feature reference distributions)
     and an MLflow model directory with signature and input example. Reloading
     reproduces the in-run held-out metrics exactly — measured delta 0.0.
     Classification and regression only; see [Scope](#scope--whats-not-here).
-12. **Track** — every param, metric, and JSON artifact logged to MLflow
+13. **Track** — every param, metric, and JSON artifact logged to MLflow
     (SQLite-backed, zero external services), including a resolvable
     `runs:/<run_id>/model` URI.
-13. **Ask** — grounded Q&A answering from the logged run data, never by
+14. **Ask** — grounded Q&A answering from the logged run data, never by
     re-guessing.
-14. **Report** — one Markdown report per run assembling all of the above.
+15. **Report** — one Markdown report per run assembling all of the above.
 
 ## Target detection: the hard part
 
@@ -127,6 +135,24 @@ part:
   sibling measurement. It now targets the real `target` column and reports
   **r2=0.475**, which is the honest, published-benchmark-level result for that
   dataset. A large accuracy drop was the *sign of the fix working*.
+- **"Maximise F1" and "get recall above 0.70" turned out to be incompatible,
+  and F1 won.** The plan for threshold selection specified F1 as the default
+  objective *and* a recall bar of 0.70 on the 3.9%-positive dataset. Those
+  cannot both hold: F1 is symmetric, so past roughly 0.6 recall at that base
+  rate the precision it costs exceeds the recall it buys and F1 declines. The
+  bar is reachable only under `expected_cost` with an asymmetric price on a
+  miss — which is domain knowledge the system is not given. F1 stayed the
+  default rather than quietly swapping in an objective that assumes fraud costs
+  20× a false alarm; the 0.70 bar moved to the cost objective, where it is a
+  real capability rather than a default that flatters itself. Out-of-fold on
+  that fixture: 7 of 29 positives caught at the 0.5 default, 14 under F1, 25
+  under a 20:1 cost ratio.
+- **The imbalanced dataset the plan was written against did not exist.** The
+  measurement that ordered the whole of Tier 0 — ROC-AUC 0.955, recall 0.241,
+  7 of 29 — came from a run whose data was never committed; nothing in `data/`
+  was more skewed than 22%. It is now a fixture and a CSV, and it reproduces
+  the original numbers. A prioritisation resting on an unreproducible
+  measurement is one nobody can check.
 - **Two silent bugs found by writing tests.** LightGBM's default
   `importance_type="split"` counts how often a feature is used and stays
   diffuse even when one feature explains everything, making the concentration
@@ -147,9 +173,19 @@ part:
   save, and clustering has no model to serve; both need a decision about what
   "the model" is before they can have one, and guessing would produce an
   artifact that loads but means nothing.
-- **No decision threshold is tuned.** The saved classifier predicts at 0.5.
-  On an imbalanced dataset that is a real gap between the reported ROC-AUC and
-  the deployed behaviour — it is `ROADMAP.md` T0-2 and it is next.
+- **Thresholds are binary-classification only.** A single cut point is not a
+  meaningful object for a multiclass target, and several zoo models
+  (`RidgeClassifier`, `LinearSVC`) expose `decision_function` rather than
+  calibrated probabilities, so there is no 0–1 scale to cut. Both cases fall
+  back to 0.5 and the report says so rather than implying a choice was made.
+- **The held-out operating point is a small-sample estimate.** With 29
+  positives, a 20% holdout leaves about 6 — so held-out precision and recall
+  move in steps of roughly 0.17. The out-of-fold selection uses all 23 training
+  positives and is the sounder figure; the held-out table is a sanity check,
+  not a precise measurement.
+- **Probabilities are not calibrated.** A tuned threshold assumes the
+  probability scale means something, and boosted trees and SVMs are
+  systematically miscalibrated. `ROADMAP.md` T2-1 pairs with this.
 - **The Q&A is grounded retrieval, not an LLM chat layer.** It answers by
   reading real logged numbers back via keyword routing. Point an LLM at these
   same lookups as tools for the open-ended version; the hard part (answers
@@ -197,7 +233,7 @@ autoeng/
   reporting/       Markdown report generation
   pipeline.py      end-to-end orchestration
   cli.py           command-line entry point
-tests/             68 tests: planted leaks, regressions for every shipped bug, unit tests
+tests/             79 tests: planted leaks, regressions for every shipped bug, unit tests
 scripts/           detection calibration harness
 data/              synthetic + real validation datasets
 runs/              reports + MLflow store from the validation runs

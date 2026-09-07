@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
 
@@ -42,6 +43,10 @@ from autoeng.modeling.model_zoo import get_classification_models, get_regression
 from autoeng.modeling.search import (
     CLASSIFICATION_SCORING, REGRESSION_SCORING, _build_pipeline_for_model,
     run_classification_search, run_regression_search,
+)
+from autoeng.modeling.threshold import (
+    DEFAULT_OBJECTIVE, DEFAULT_PRECISION_FLOOR, DEFAULT_THRESHOLD,
+    operating_point, out_of_fold_probabilities, select_threshold,
 )
 from autoeng.modeling.time_series import run_time_series_search
 from autoeng.profiling.profiler import profile_dataset
@@ -63,13 +68,65 @@ class PipelineRunResult:
     leaderboard: dict[str, Any] | None = None
     held_out_metrics: dict[str, float] | None = None
     model_artifact: dict[str, Any] | None = None
+    decision_threshold: dict[str, Any] | None = None
     extra: dict[str, Any] = field(default_factory=dict)
+
+
+def _select_operating_point(
+    estimator, X_train, y_train, *, cv_folds: int, objective: str,
+    precision_floor: float, cost_false_negative: float, cost_false_positive: float,
+) -> dict[str, Any] | None:
+    """
+    Choose the decision threshold from out-of-fold predictions on the TRAINING
+    partition (CLAUDE.md #5 — never the held-out split).
+
+    Called before the final fit, on a clone, so nothing about the held-out rows
+    can reach the choice. Returns None when thresholding does not apply:
+    multiclass targets are a different problem, and several models in the zoo
+    (RidgeClassifier, LinearSVC) expose `decision_function` rather than
+    calibrated probabilities, so there is no 0-1 scale to cut.
+    """
+    if not hasattr(estimator, "predict_proba"):
+        return None
+    try:
+        proba = out_of_fold_probabilities(estimator, X_train, y_train, cv_folds=cv_folds)
+        choice = select_threshold(
+            y_train, proba, objective=objective, precision_floor=precision_floor,
+            cost_false_negative=cost_false_negative, cost_false_positive=cost_false_positive,
+        )
+        return choice.as_dict()
+    except Exception as e:  # noqa: BLE001 - falls back to the 0.5 default, reported below
+        return {
+            "threshold": DEFAULT_THRESHOLD, "objective": objective, "metrics": {},
+            "default_metrics": {}, "n_candidates": 0, "curve": [],
+            "reasoning": f"Threshold selection failed ({type(e).__name__}: {e}); "
+                         f"kept the {DEFAULT_THRESHOLD} default.",
+        }
+
+
+def _held_out_operating_point(pipeline, X_test, y_test, threshold: float) -> dict[str, Any] | None:
+    """
+    What the chosen threshold actually does on data nothing has touched.
+
+    Reported alongside the 0.5 default deliberately: the point of T0-2 is the
+    gap between them, and showing only the tuned figure would repeat the
+    original sin in the other direction.
+    """
+    if not hasattr(pipeline, "predict_proba"):
+        return None
+    proba = pipeline.predict_proba(X_test)[:, 1]
+    y = np.asarray(y_test)
+    return {
+        "at_selected_threshold": operating_point(y, proba, threshold),
+        "at_default_threshold": operating_point(y, proba, DEFAULT_THRESHOLD),
+    }
 
 
 def _persist_final_model(
     estimator, X_train, y_train, profile, roles, *,
     problem_type: str, model_name: str | None, selection_source: str,
     dataset_path: str, model_dir: Path,
+    decision_threshold: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
     Save the fitted winner plus its training schema, and return a JSON-able
@@ -87,6 +144,9 @@ def _persist_final_model(
             problem_type=problem_type, model_name=model_name,
             output_dir=model_dir, selection_source=selection_source,
             dataset_path=dataset_path,
+            # Without this the artifact predicts at 0.5 while the report quotes
+            # a tuned operating point — the two must not come apart.
+            decision_threshold=decision_threshold,
         )
         return saved.as_dict()
     except Exception as e:  # noqa: BLE001 - see docstring
@@ -161,6 +221,10 @@ def run_pipeline(
     run_name: str | None = None,
     target_override: str | None = None,
     problem_type_override: str | None = None,
+    threshold_objective: str = DEFAULT_OBJECTIVE,
+    precision_floor: float = DEFAULT_PRECISION_FLOOR,
+    cost_false_negative: float = 10.0,
+    cost_false_positive: float = 1.0,
 ) -> PipelineRunResult:
     dataset_path = str(dataset_path)
     out_dir = Path(output_dir)
@@ -198,6 +262,10 @@ def run_pipeline(
     # object) and clustering has no model to serve.
     model_artifact: dict[str, Any] | None = None
     model_dir = out_dir / "models" / run_name
+    # Binary classification only; None everywhere else means "0.5, and the
+    # report should not pretend otherwise".
+    threshold_choice: dict[str, Any] | None = None
+    held_out_operating_point: dict[str, Any] | None = None
     pre_leak_dict = {"flags": []}
     post_leak_dict = {"flags": []}
     clustering_summary = None
@@ -247,14 +315,29 @@ def run_pipeline(
             final_pipeline = _build_pipeline_for_model(final_name, factories[final_name], roles, "classification")
             if final_params:
                 final_pipeline.named_steps["model"].set_params(**final_params)
+        # Selected BEFORE the final fit, from out-of-fold predictions on the
+        # training partition only. Binary targets only — a single cut point is
+        # not a meaningful object for multiclass.
+        if n_classes == 2:
+            threshold_choice = _select_operating_point(
+                final_pipeline, X_train, y_train, cv_folds=cv_folds,
+                objective=threshold_objective, precision_floor=precision_floor,
+                cost_false_negative=cost_false_negative, cost_false_positive=cost_false_positive,
+            )
+
         final_pipeline.fit(X_train, y_train)
         model_artifact = _persist_final_model(
             final_pipeline, X_train, y_train, profile, roles,
             problem_type=chosen.problem_type.value, model_name=final_name,
             selection_source=final_source, dataset_path=dataset_path, model_dir=model_dir,
+            decision_threshold=threshold_choice,
         )
 
         held_out_metrics = _classification_metric(final_pipeline, X_test, y_test, n_classes)
+        if threshold_choice is not None:
+            held_out_operating_point = _held_out_operating_point(
+                final_pipeline, X_test, y_test, threshold_choice["threshold"],
+            )
         explanation = explain_winner(
             leaderboard.results, final_name, final_pipeline, X_test, y_test,
             leaderboard.primary_metric, hpo_improvement=hpo_improvement,
@@ -415,7 +498,8 @@ def run_pipeline(
         explanation=explanation_dict, held_out_metrics=held_out_metrics,
         clustering_summary=clustering_summary, time_series_baselines=ts_baselines,
         target_source=target_source, time_series_setup=ts_setup_dict,
-        model_artifact=model_artifact,
+        model_artifact=model_artifact, threshold_choice=threshold_choice,
+        held_out_operating_point=held_out_operating_point,
     )
 
     report_path = out_dir / f"{run_name}_report.md"
@@ -435,6 +519,8 @@ def run_pipeline(
                                               "feature_importances": [], "importance_method": "n/a", "narrative": ""},
             final_report_text=report_text,
             model_artifact=model_artifact,
+            decision_threshold={"selected": threshold_choice,
+                                "held_out": held_out_operating_point} if threshold_choice else None,
         )
     except Exception as e:  # noqa: BLE001 - tracking must never take down the run
         (out_dir / f"{run_name}_mlflow_error.txt").write_text(f"{type(e).__name__}: {e}")
@@ -443,5 +529,7 @@ def run_pipeline(
         run_id=run_id, problem_type=chosen.problem_type.value, target_column=target_column,
         report_text=report_text, report_path=str(report_path), leaderboard=leaderboard_dict,
         held_out_metrics=held_out_metrics, model_artifact=model_artifact,
-        extra={"mlflow_tracking_uri": mlflow_tracking_uri, "explanation": explanation_dict},
+        decision_threshold=threshold_choice,
+        extra={"mlflow_tracking_uri": mlflow_tracking_uri, "explanation": explanation_dict,
+               "held_out_operating_point": held_out_operating_point},
     )

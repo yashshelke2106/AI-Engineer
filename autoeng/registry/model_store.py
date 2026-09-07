@@ -274,6 +274,7 @@ def build_training_schema(
     model_name: str | None,
     selection_source: str | None = None,
     dataset_path: str | None = None,
+    decision_threshold: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Everything a later process needs to feed this estimator correctly and
     to notice when the data it is being fed has moved."""
@@ -317,6 +318,11 @@ def build_training_schema(
             "selection_source": selection_source,
             "estimator_class": f"{type(estimator).__module__}.{type(estimator).__qualname__}",
         },
+        # Top-level rather than nested under `target`: this is a serving-time
+        # policy, and T1-1 must not have to go looking for it. `predict` alone
+        # silently uses 0.5 — the artifact has to carry the number that the
+        # reported operating point was measured at, or the two come apart.
+        "decision_threshold": decision_threshold,
         # Order is part of the serving contract, not incidental.
         "feature_columns": [str(c) for c in X_train.columns],
         "columns": columns,
@@ -386,6 +392,7 @@ def save_model(
     output_dir: str | Path,
     selection_source: str | None = None,
     dataset_path: str | None = None,
+    decision_threshold: dict[str, Any] | None = None,
     write_mlflow_model: bool = True,
 ) -> SavedModel:
     """Persist a fitted estimator and its training schema into `output_dir`."""
@@ -396,6 +403,7 @@ def save_model(
         estimator, X_train, y_train, profile, roles,
         problem_type=problem_type, model_name=model_name,
         selection_source=selection_source, dataset_path=dataset_path,
+        decision_threshold=decision_threshold,
     )
 
     model_path = model_dir / MODEL_FILENAME

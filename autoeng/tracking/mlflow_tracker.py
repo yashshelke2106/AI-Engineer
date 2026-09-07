@@ -48,6 +48,7 @@ def log_pipeline_run(
     explanation: dict[str, Any],
     final_report_text: str,
     model_artifact: dict[str, Any] | None = None,
+    decision_threshold: dict[str, Any] | None = None,
 ) -> str:
     mlflow.set_tracking_uri(tracking_uri)
     mlflow.set_experiment(DEFAULT_EXPERIMENT)
@@ -94,6 +95,22 @@ def log_pipeline_run(
         _log_dict_artifact({"hpo_results": hpo_results}, "hpo_results.json")
         _log_dict_artifact(post_training_leakage, "post_training_leakage_report.json")
         _log_dict_artifact(explanation, "model_explanation.json")
+
+        if decision_threshold:
+            _log_dict_artifact(decision_threshold, "decision_threshold.json")
+            selected = decision_threshold.get("selected") or {}
+            held_out = (decision_threshold.get("held_out") or {}).get("at_selected_threshold") or {}
+            # Logged as metrics, not just an artifact, so runs can be compared
+            # and sorted on the operating point rather than only on ROC-AUC —
+            # which is the whole point of T0-2.
+            mlflow.log_metrics({
+                k: float(v) for k, v in {
+                    "decision_threshold": selected.get("threshold"),
+                    "held_out_precision": held_out.get("precision"),
+                    "held_out_recall": held_out.get("recall"),
+                    "held_out_f1": held_out.get("f1"),
+                }.items() if v is not None
+            })
 
         if model_artifact:
             _log_dict_artifact(model_artifact, "model_artifact.json")

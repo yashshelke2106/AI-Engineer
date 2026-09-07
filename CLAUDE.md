@@ -14,11 +14,11 @@ everything to MLflow, and writes a report.
 python -m autoeng.cli run data/any.csv          # infer everything
 python -m autoeng.cli run data.csv --target y   # or pin the target
 python -m autoeng.cli ask <run_id> "why did you reject random_forest?"
-pytest tests/ -q                                # 68 tests, ~55s
+pytest tests/ -q                                # 79 tests, ~105s
 python scripts/calibrate_detection.py           # detection accuracy, 8/8 expected
 ```
 
-`ROADMAP.md` has the prioritised remaining work. **Start at T0-1.**
+`ROADMAP.md` has the prioritised remaining work. **Start at T0-3.**
 
 ## Invariants — do not break these
 
@@ -51,9 +51,20 @@ constant across a whole test fold (a multi-step forecast) and scored naive at
 r2 = −1.8 on a random walk it should nearly optimally predict, flattering every
 ML model. If you touch `_evaluate_baselines`, re-check this.
 
-**5. Never fit a decision threshold on the test split.** (Relevant to T0-2.)
+**5. Never fit a decision threshold on the test split.**
 Out-of-fold predictions only. Tuning the threshold on held-out data is the same
-leakage the whole architecture prevents, arriving at the last step.
+leakage the whole architecture prevents, arriving at the last step. Implemented
+in `autoeng/modeling/threshold.py`; `out_of_fold_probabilities` exists so no
+caller has to remember this. The selection happens *before* `final_pipeline.fit`
+so the held-out rows cannot reach it even accidentally.
+
+**5a. Anything keyed by algorithm must resolve through `base_model_name()`.**
+The zoo now contains `class_weight="balanced"` twins named `<model>_balanced`.
+`SCALE_SENSITIVE_MODELS`, `TREE_LIKE_MODELS`, `SLOW_MODEL_ROW_LIMIT` and
+`SEARCH_SPACES` are keyed by algorithm, not by candidate name — look a twin up
+by its full name and it silently loses its StandardScaler, gains outlier
+capping it should not have, or reports "no tunable search space". All four
+failures are silent and produce a plausible-looking leaderboard.
 
 **6. Detection is a guess; log it as one.**
 Problem-type and target detection always record reasoning plus the runner-up
@@ -118,7 +129,7 @@ autoeng/
   features/     transformers.py + pipeline_builder.py  <- leakage safety lives here
   common/       associations.py, roles.py (single source of truth for column roles)
   leakage/      pre- and post-training detection
-  modeling/     model_zoo, search (halving), hpo, ensemble, clustering, time_series
+  modeling/     model_zoo, search (halving), hpo, ensemble, threshold, clustering, time_series
   explain/      explainer.py (SHAP/permutation), qa.py (grounded Q&A over MLflow)
   registry/     model_store.py — fitted model + training_schema.json (T0-1)
   tracking/     MLflow logging + querying
@@ -141,7 +152,7 @@ autoeng/
 
 ## Current state
 
-68 tests passing. Detection 8/8 on unambiguous cases (iris is genuinely
+79 tests passing. Detection 8/8 on unambiguous cases (iris is genuinely
 ambiguous and excluded). Successive halving gives 7.4× speedup with an
 identical winner.
 
@@ -152,7 +163,20 @@ measured delta of 0.0. Time-series and clustering runs still persist nothing —
 the first may pick a classical baseline with no fitted estimator, the second
 has no model to serve.
 
-One Tier 0 hole remains: **there is no decision-threshold tuning** — on a
-3.9%-positive dataset the system reports ROC-AUC 0.955 while catching 7 of 29
-positives. That model can now be saved and deployed, which makes T0-2 more
-urgent, not less. Start there.
+**T0-2 is done:** binary classification selects a decision threshold on
+out-of-fold training predictions, saves it into `training_schema.json`, and
+reports the operating point (precision/recall/F1/confusion matrix) beside the
+ranking metrics, against the 0.5 default. Three objectives; `f1` is the
+default. The zoo gained `class_weight="balanced"` twins — see invariant 5a
+before touching anything keyed by model name.
+
+The default objective is deliberately F1 and deliberately does *not* reach the
+recall the ROADMAP originally asked for. F1 is symmetric; clearing 0.70 recall
+at a 3.9% base rate requires `expected_cost` with an asymmetric cost, which is
+domain knowledge the system cannot infer. Do not "fix" this by making an
+asymmetric objective the default — that is the system inventing a cost
+structure nobody gave it.
+
+One Tier 0 hole remains: **no group-aware splitting** (T0-3). Datasets with
+repeated entities split one entity's rows across train and test, inflating
+every metric, and the duplicate-row check cannot see it. Start there.

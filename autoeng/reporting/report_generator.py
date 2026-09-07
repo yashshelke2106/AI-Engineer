@@ -38,6 +38,8 @@ def generate_report(
     target_source: str = "auto-detected",
     time_series_setup: dict[str, Any] | None = None,
     model_artifact: dict[str, Any] | None = None,
+    threshold_choice: dict[str, Any] | None = None,
+    held_out_operating_point: dict[str, Any] | None = None,
 ) -> str:
     chosen = problem_decision["chosen"]
     lines: list[str] = []
@@ -162,9 +164,55 @@ def generate_report(
 
     if held_out_metrics:
         lines.append("## 8. Held-Out Test Set Performance\n")
+        lines.append("**Ranking metrics** (threshold-free):\n")
         for k, v in held_out_metrics.items():
             lines.append(f"- {k}: {v:.4f}")
         lines.append("")
+
+        if threshold_choice:
+            lines.append("### Operating point\n")
+            lines.append(
+                "A ranking metric like ROC-AUC integrates over every threshold. The deployed "
+                "model has to pick one. These are the numbers it actually produces.\n"
+            )
+            lines.append(f"**Decision threshold:** `{threshold_choice['threshold']:.4f}` "
+                         f"(objective: `{threshold_choice['objective']}`)\n")
+            lines.append(threshold_choice["reasoning"] + "\n")
+
+            if held_out_operating_point:
+                lines.append("**On the held-out test set:**\n")
+                lines.append("| Threshold | Precision | Recall | F1 | TP | FP | TN | FN |")
+                lines.append("|---|---|---|---|---|---|---|---|")
+                for label, key in (("selected", "at_selected_threshold"),
+                                    ("default 0.5", "at_default_threshold")):
+                    m = held_out_operating_point.get(key)
+                    if not m:
+                        continue
+                    lines.append(
+                        f"| {label} (`{m['threshold']:.4f}`) | {m['precision']:.3f} | "
+                        f"{m['recall']:.3f} | {m['f1']:.3f} | {m['tp']} | {m['fp']} | "
+                        f"{m['tn']} | {m['fn']} |"
+                    )
+                sel = held_out_operating_point.get("at_selected_threshold")
+                dfl = held_out_operating_point.get("at_default_threshold")
+                if sel and dfl:
+                    lines.append(
+                        f"\nAt the selected threshold the model catches **{sel['tp']} of "
+                        f"{sel['tp'] + sel['fn']}** positives, against **{dfl['tp']}** at the 0.5 "
+                        f"default, for {sel['fp']} false alarms rather than {dfl['fp']}.\n"
+                    )
+            lines.append(
+                "*The threshold was selected on out-of-fold predictions from the training "
+                "partition. It was never fitted on the held-out rows above — doing so would be "
+                "the same leakage this pipeline prevents everywhere else, arriving at the last "
+                "step.*\n"
+            )
+        elif leaderboard and leaderboard.get("problem_kind") == "classification":
+            lines.append(
+                "*No decision threshold was selected — either the target is multiclass (a single "
+                "cut point is not meaningful) or the winning model exposes no calibrated "
+                "probabilities. Predictions use the 0.5 default.*\n"
+            )
 
     # Placed immediately after the held-out metrics on purpose: those numbers
     # describe this artifact, and the two belong side by side.

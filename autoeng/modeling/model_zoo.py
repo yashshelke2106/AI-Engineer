@@ -68,6 +68,24 @@ except ImportError:
 RANDOM_STATE = 42
 ModelFactory = Callable[[], Any]
 
+# Suffix marking a `class_weight="balanced"` twin of an existing candidate.
+# The twins COMPETE with their unweighted originals rather than replacing them:
+# reweighting is a hypothesis about the data, not a known improvement, and on
+# some datasets it costs more precision than the recall is worth. It should
+# have to win the same cross-validation as everything else.
+BALANCED_SUFFIX = "_balanced"
+
+
+def base_model_name(name: str) -> str:
+    """
+    Strip the balanced marker to recover the underlying algorithm.
+
+    Anything keyed by algorithm rather than by candidate — HPO search spaces,
+    the tree-like set that decides outlier capping — must resolve through this,
+    or the twins silently lose behaviour their originals have.
+    """
+    return name[: -len(BALANCED_SUFFIX)] if name.endswith(BALANCED_SUFFIX) else name
+
 
 def get_classification_models(n_classes: int = 2) -> dict[str, ModelFactory]:
     models: dict[str, ModelFactory] = {
@@ -103,6 +121,31 @@ def get_classification_models(n_classes: int = 2) -> dict[str, ModelFactory]:
         models["lightgbm"] = lambda: LGBMClassifier(n_estimators=300, random_state=RANDOM_STATE, verbosity=-1, n_jobs=-1)
     if _HAS_CATBOOST:
         models["catboost"] = lambda: CatBoostClassifier(iterations=300, random_state=RANDOM_STATE, verbose=False)
+
+    # class_weight="balanced" twins (T0-2). Only for estimators that accept the
+    # parameter; the boosters and the naive-Bayes/kNN family do not, and forcing
+    # an equivalent through sample_weight would need it threaded through every
+    # CV call site for a benefit the threshold selector already delivers more
+    # directly.
+    models.update({
+        f"{name}{BALANCED_SUFFIX}": factory
+        for name, factory in {
+            "logistic_regression": lambda: LogisticRegression(
+                max_iter=1000, class_weight="balanced", random_state=RANDOM_STATE),
+            "ridge_classifier": lambda: RidgeClassifier(
+                class_weight="balanced", random_state=RANDOM_STATE),
+            "linear_svc": lambda: LinearSVC(
+                max_iter=5000, class_weight="balanced", random_state=RANDOM_STATE),
+            "svc_rbf": lambda: SVC(
+                kernel="rbf", probability=True, class_weight="balanced", random_state=RANDOM_STATE),
+            "decision_tree": lambda: DecisionTreeClassifier(
+                class_weight="balanced", random_state=RANDOM_STATE),
+            "random_forest": lambda: RandomForestClassifier(
+                n_estimators=200, n_jobs=-1, class_weight="balanced", random_state=RANDOM_STATE),
+            "extra_trees": lambda: ExtraTreesClassifier(
+                n_estimators=200, n_jobs=-1, class_weight="balanced", random_state=RANDOM_STATE),
+        }.items()
+    })
     return models
 
 
