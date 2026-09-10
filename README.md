@@ -22,7 +22,7 @@ python -m autoeng.cli ask <run_id> "why did you reject random_forest?"
 python -m autoeng.cli list-runs
 python -m autoeng.cli serve runs/models/<run_name>         # score rows over HTTP
 
-pytest tests/ -q                                           # 130 tests, ~130s
+pytest tests/ -q                                           # 155 tests, ~170s
 python scripts/calibrate_detection.py                      # detection accuracy harness
 ```
 
@@ -104,6 +104,42 @@ Supports CSV/TSV, Parquet, JSON/JSON-Lines, and Excel.
     `labelled_frame()` joins the two into one evaluation frame — the single
     definition of "a labelled window" that drift detection and retraining
     will both read.
+19. **Detect drift** — `autoeng.cli drift runs/models/<name>` compares live
+    inputs against the training reference distributions (PSI, KS, chi-square,
+    corrected for multiple testing), the output distribution against this
+    model's own earlier predictions, and live performance against the stored
+    baseline. See [Drift detection](#drift-detection-and-what-it-refuses-to-claim).
+
+### Drift detection, and what it refuses to claim
+
+`autoeng.cli drift runs/models/<name>` runs three checks over the prediction
+log and returns one verdict. Exit code is non-zero only on `alarm`, so it can
+gate a scheduled job.
+
+| Check | Question | Needs labels |
+|---|---|---|
+| Data drift | are the inputs still shaped like training? | no |
+| Prediction drift | has the model's output distribution moved? | no |
+| Concept drift | has it actually got worse? | yes |
+
+**Drift is not degradation**, and the verdict is built around that. A feature
+the model barely uses can move enormously and change nothing; the dominant
+feature can shift slightly and break everything. Per-feature PSI is reported
+raw *and* weighted by the importances the explain stage computed, and a
+feature can be flagged individually while the verdict stays quiet. The verdict
+is deliberately not the maximum of the three: concept drift measures
+degradation directly and dominates, the others are leading indicators.
+
+Measured end to end, serving 300 rows against a real run:
+
+| Stream | Verdict | Weighted PSI | Live F1 vs baseline |
+|---|---|---|---|
+| unshifted | `ok` | 0.030 | 0.667 vs 0.609 |
+| `avg_amount` x8 | `alarm` | 3.72 | 0.177 vs 0.609 |
+
+`unknown` is kept distinct from `ok`: a window with no labels and a healthy
+model look identical if you collapse them, and they mean opposite things.
+
 ## Target detection: the hard part
 
 Picking the target column in an undescribed dataset is the bottleneck the
@@ -218,10 +254,10 @@ part:
 
 ## Scope — what's not here
 
-- **No drift detection or auto-retrain loop yet.** The inputs now exist —
-  served predictions and arriving ground truth are logged and joinable — but
-  nothing reads them. Building the detector shallowly would have meant
-  comparing a dataset to itself and calling the silence a pass.
+- **No auto-retrain loop or champion–challenger gate yet.** Drift is measured
+  (stage 19) but nothing acts on it. That ordering is deliberate: automating
+  retraining before you can tell whether the new model is actually better is
+  how a pipeline industrialises a regression on a schedule.
 - **The serving API is a contract layer, not a hardened endpoint.** No auth,
   rate limiting, or TLS.
 - **Only classification and regression runs persist a model.** Time-series
@@ -288,11 +324,12 @@ autoeng/
   registry/        model + training-schema persistence, reference distributions
   serving/         FastAPI: schema validation + threshold-aware prediction,
                    append-only prediction/outcome log
+  monitoring/      data / prediction / concept drift, weighted by importance
   tracking/        MLflow logging and querying
   reporting/       Markdown report generation
   pipeline.py      end-to-end orchestration
   cli.py           command-line entry point
-tests/             130 tests: planted leaks, regressions for every shipped bug, unit tests
+tests/             155 tests: planted leaks, regressions for every shipped bug, unit tests
 scripts/           detection calibration harness
 data/              synthetic + real validation datasets
 runs/              reports + MLflow store from the validation runs

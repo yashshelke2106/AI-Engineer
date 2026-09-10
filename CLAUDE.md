@@ -14,11 +14,11 @@ everything to MLflow, and writes a report.
 python -m autoeng.cli run data/any.csv          # infer everything
 python -m autoeng.cli run data.csv --target y   # or pin the target
 python -m autoeng.cli ask <run_id> "why did you reject random_forest?"
-pytest tests/ -q                                # 130 tests, ~130s
+pytest tests/ -q                                # 155 tests, ~170s
 python scripts/calibrate_detection.py           # detection accuracy, 10/10 expected
 ```
 
-`ROADMAP.md` has the prioritised remaining work. **T1-2 is done; start at T1-3.**
+`ROADMAP.md` has the prioritised remaining work. **T1-3 is done; start at T1-4.**
 
 ## Invariants — do not break these
 
@@ -100,6 +100,29 @@ an error. Outcomes are append-only because labels get revised, and overwriting
 erases that they were — the join takes the latest per request.
 `labelled_frame()` is the single definition of "a labelled window" that both
 T1-3 and T1-4 consume; do not add a second one.
+
+**7d. Drift is not degradation, and the code must keep saying so.**
+A feature the model barely uses can move enormously and change nothing; the
+dominant feature can shift slightly and break everything. Per-feature PSI is
+reported raw AND weighted by importance, and the overall verdict uses the
+weighted view. A feature flagged individually while the report stays quiet is
+correct behaviour, not a bug — there is a test asserting exactly that. The
+verdict is deliberately NOT the max of the three checks: concept drift
+measures degradation directly and dominates; data and prediction drift are
+leading indicators.
+
+**7e. UNKNOWN is not OK.** No labels arriving and a healthy model look
+identical if you collapse them, and they mean opposite things. Concept drift
+below `MIN_LABELS_FOR_CONCEPT` returns UNKNOWN, and the CLI exits non-zero
+only on ALARM.
+
+**7f. Importances must be folded onto RAW columns before weighting.**
+SHAP explains the transformed matrix (`city_Pune`, `city_Delhi`); drift is
+measured on `city`. Weighting raw-column drift by transformed-name importances
+makes the most-used categorical look unused and discounts its drift to zero.
+`raw_column_importances()` does the fold, normalising over ALL supplied
+importance so unattributable mass (derived interactions) is lost rather than
+inflating the columns that did match.
 
 **8. Groups, when detected, apply to EVERY split.**
 Held-out partition, search folds, the halving screen's subsample (which samples
@@ -184,6 +207,7 @@ autoeng/
   registry/     model_store.py — fitted model + training_schema.json (T0-1)
   serving/      validation.py (contract) + predictor.py (threshold) + app.py (T1-1)
                 store.py — append-only prediction/outcome log (T1-2)
+  monitoring/   drift.py (PSI/KS/chi2, importance-weighted) + report.py (T1-3)
   tracking/     MLflow logging + querying
   reporting/    Markdown report generation
   pipeline.py   orchestration      cli.py  entry point
@@ -204,7 +228,7 @@ autoeng/
 
 ## Current state
 
-130 tests passing. Detection 10/10 on unambiguous cases (iris is genuinely
+155 tests passing. Detection 10/10 on unambiguous cases (iris is genuinely
 ambiguous and excluded). Successive halving gives 7.4× speedup with an
 identical winner.
 
@@ -232,7 +256,7 @@ structure nobody gave it.
 **T0-3 is done:** repeated-entity keys are detected, excluded from features,
 and honoured by every split. See invariants 8 and 8a.
 
-**Tier 0, T1-1 and T1-2 are complete.** Next is T1-3 (drift detection), which
-now has something real to read: `PredictionStore.labelled_frame()` for concept
-drift and `prediction_frame()` for data drift, against the reference
-distributions T0-1 captured.
+**Tier 0 and T1-1 through T1-3 are complete.** Next is T1-4 (retrain
+orchestration). Note rule 1 in `ROADMAP.md` before starting it, and pin the
+target via `--target` on a retrain rather than re-detecting — otherwise the
+system can silently change what it predicts mid-lifecycle (invariant 6).

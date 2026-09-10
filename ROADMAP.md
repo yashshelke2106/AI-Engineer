@@ -27,7 +27,7 @@ T1-4 and T1-5, and still should if any of this is revisited.
 ## Tier 0 — Blockers
 
 All three confirmed absent by grepping the codebase, not assumed.
-**Tier 0 is complete. T1-1 and T1-2 are done; start at T1-3.**
+**Tier 0 is complete. T1-1, T1-2 and T1-3 are done; start at T1-4.**
 
 ### ~~T0-1 · Persist the trained model and its schema~~ — **DONE**
 
@@ -243,7 +243,7 @@ computed in the explain stage, and report weighted alongside raw.
 quiet across a long window; a shift confined to a near-zero-importance feature
 is reported without alarming.
 
-### T1-4 · Retrain orchestration (~150 lines, 3 tests)
+### T1-4 · Retrain orchestration (~150 lines, 3 tests) — **NEXT**
 
 Trigger on schedule or a T1-3 alarm; re-run `run_pipeline` over the accumulated
 window (original training data + newly labelled outcomes).
@@ -311,7 +311,7 @@ Roughly 2,300 lines and 40 tests across all fourteen items; Tier 0 alone is
 about 530 lines and closes the gap between what the report claims and what the
 model does.
 
-Current state: 130 tests passing, 10/10 on unambiguous problem-type detection,
+Current state: 155 tests passing, 10/10 on unambiguous problem-type detection,
 7.4× search speedup from successive halving. The trained model is persisted
 with its schema (T0-1) and the decision threshold is selected out-of-fold,
 saved into that schema, and reported beside the ranking metrics (T0-2), and

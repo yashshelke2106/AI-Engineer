@@ -452,6 +452,26 @@ def check_library_versions(recorded: dict[str, str]) -> list[str]:
     return messages
 
 
+def update_training_schema(schema_path: str | Path, updates: dict[str, Any]) -> dict[str, Any]:
+    """
+    Add fields to an already-written schema.
+
+    The model is persisted immediately after `fit` so the artifact exists even
+    if a later stage fails — but feature importances and held-out metrics are
+    only known after the explain and evaluation stages have run. Rather than
+    delay the save (and risk having no artifact at all), the schema is enriched
+    in place afterwards.
+
+    Additive by design: existing keys are overwritten, nothing is dropped, and
+    a failure here leaves the original file intact rather than truncating it.
+    """
+    path = Path(schema_path)
+    schema = json.loads(path.read_text(encoding="utf-8"))
+    schema.update(updates)
+    path.write_text(json.dumps(schema, indent=2, default=str), encoding="utf-8")
+    return schema
+
+
 def load_training_schema(schema_path: str | Path) -> dict[str, Any]:
     return json.loads(Path(schema_path).read_text(encoding="utf-8"))
 

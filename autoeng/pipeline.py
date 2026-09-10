@@ -51,7 +51,8 @@ from autoeng.modeling.threshold import (
 )
 from autoeng.modeling.time_series import run_time_series_search
 from autoeng.profiling.profiler import profile_dataset
-from autoeng.registry.model_store import save_model
+from autoeng.monitoring.drift import raw_column_importances
+from autoeng.registry.model_store import save_model, update_training_schema
 from autoeng.reporting.report_generator import generate_report
 from autoeng.tracking.mlflow_tracker import log_pipeline_run
 
@@ -180,6 +181,58 @@ def _holdout_split(X, y, problem_kind: str, groups=None):
     train_idx, test_idx = next(iter(splitter.split(X, y, groups=groups)))
     return (X.iloc[train_idx], X.iloc[test_idx], y.iloc[train_idx], y.iloc[test_idx],
             groups[train_idx])
+
+
+def _enrich_schema_after_evaluation(
+    model_artifact: dict[str, Any] | None, explanation: dict[str, Any] | None,
+    held_out_metrics: dict[str, float] | None, threshold_choice: dict[str, Any] | None,
+    feature_columns: list[str],
+) -> dict[str, Any] | None:
+    """
+    Write what only the explain and evaluation stages know back into the saved
+    schema: feature importances (for T1-3's drift weighting) and a performance
+    baseline (for T1-3's concept drift and T1-5's champion comparison).
+
+    Importances are folded onto RAW input columns first. SHAP explains the
+    transformed matrix, so a categorical arrives as `city_Pune`, `city_Delhi`;
+    drift is measured on `city`. Storing the transformed names would make the
+    model's most-used categorical look unused and discount its drift to zero.
+
+    The baseline prefers the out-of-fold operating point over the held-out one:
+    on a rare-positive dataset the holdout can contain a handful of positives,
+    and cross-validated estimates over the whole training partition are the
+    steadier reference to detect a real drop against.
+    """
+    if not model_artifact or model_artifact.get("status") != "saved":
+        return model_artifact
+
+    updates: dict[str, Any] = {}
+    importances = (explanation or {}).get("feature_importances") or []
+    if importances:
+        updates["feature_importances"] = raw_column_importances(importances, feature_columns)
+        updates["importance_method"] = (explanation or {}).get("importance_method")
+
+    baseline = dict((threshold_choice or {}).get("metrics") or {})
+    baseline_source = "out-of-fold operating point on the training partition"
+    if not baseline and held_out_metrics:
+        baseline, baseline_source = dict(held_out_metrics), "held-out test split"
+    if baseline:
+        updates["baseline_metrics"] = baseline
+        updates["baseline_source"] = baseline_source
+
+    if not updates:
+        return model_artifact
+    try:
+        update_training_schema(model_artifact["schema_path"], updates)
+        model_artifact = dict(model_artifact)
+        model_artifact["enriched_with"] = sorted(updates)
+    except Exception as e:  # noqa: BLE001 - the model itself is already safely on disk
+        model_artifact = dict(model_artifact)
+        model_artifact.setdefault("warnings", []).append(
+            f"Schema enrichment failed ({type(e).__name__}: {e}); drift weighting will "
+            f"fall back to uniform."
+        )
+    return model_artifact
 
 
 def _regression_metric_from_r2(pipeline, X_test, y_test) -> dict[str, float]:
@@ -573,6 +626,11 @@ def run_pipeline(
                 ),
             }
             held_out_metrics = {"silhouette": top.metrics["silhouette"]}
+
+    model_artifact = _enrich_schema_after_evaluation(
+        model_artifact, explanation_dict, held_out_metrics, threshold_choice,
+        roles.feature_columns,
+    )
 
     profile_summary = profile.as_dict()
     role_dict = {

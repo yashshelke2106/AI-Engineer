@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
 
 from autoeng.explain.qa import answer_question
 from autoeng.pipeline import run_pipeline
@@ -69,6 +70,18 @@ def main(argv: list[str] | None = None) -> int:
     serve_p.add_argument("--host", default="127.0.0.1")
     serve_p.add_argument("--port", type=int, default=8000)
 
+    drift_p = sub.add_parser(
+        "drift", help="Check a served model for data, prediction and concept drift.")
+    drift_p.add_argument("model_dir", help="A directory written by a run: runs/models/<run_name>.")
+    drift_p.add_argument("--log", default=None,
+                         help="Prediction log (default: predictions.db inside the model dir).")
+    drift_p.add_argument("--since-days", type=float, default=None,
+                         help="Only consider predictions from the last N days.")
+    drift_p.add_argument("--model-version", default=None,
+                         help="Restrict to one model version; drift across a deploy boundary "
+                              "mixes two models and attributes it to neither.")
+    drift_p.add_argument("--json", action="store_true", help="Emit JSON instead of Markdown.")
+
     list_p = sub.add_parser("list-runs", help="List past runs.")
     list_p.add_argument("--runs-dir", default="./runs")
 
@@ -109,6 +122,29 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  POST /predict  one row (422 names any column that is missing)")
         uvicorn.run(application, host=args.host, port=args.port)
         return 0
+
+    if args.command == "drift":
+        import json as _json
+        from datetime import datetime, timedelta, timezone
+
+        from autoeng.monitoring.drift import DriftSeverity
+        from autoeng.monitoring.report import run_drift_report
+        from autoeng.registry.model_store import SCHEMA_FILENAME, load_training_schema
+        from autoeng.serving.store import PredictionStore
+
+        model_dir = Path(args.model_dir)
+        schema = load_training_schema(model_dir / SCHEMA_FILENAME)
+        store = PredictionStore(args.log or (model_dir / "predictions.db"))
+        since = (datetime.now(timezone.utc) - timedelta(days=args.since_days)
+                 if args.since_days else None)
+        report = run_drift_report(store, schema, since=since, model_version=args.model_version)
+
+        print(_json.dumps(report.as_dict(), indent=2, default=str) if args.json
+              else report.as_markdown())
+        # Non-zero on alarm so this can gate a scheduled job. INVESTIGATE and
+        # UNKNOWN do not fail: one is not decisive, and the other means the
+        # check could not run — neither is evidence the model is broken.
+        return 1 if report.severity == DriftSeverity.ALARM else 0
 
     if args.command == "ask":
         uri = f"sqlite:///{args.runs_dir}/mlflow.db"
