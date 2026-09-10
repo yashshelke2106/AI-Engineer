@@ -38,9 +38,12 @@ from pydantic import BaseModel, Field
 
 from autoeng.registry.model_store import MODEL_FILENAME, SCHEMA_FILENAME, load_model
 from autoeng.serving.predictor import predict_frame, threshold_from_schema
+from autoeng.serving.store import PredictionStore, UnknownRequestError, new_request_id
 from autoeng.serving.validation import validate_payload
 
 MODEL_DIR_ENV = "AUTOENG_MODEL_DIR"
+STORE_PATH_ENV = "AUTOENG_PREDICTION_LOG"
+DEFAULT_STORE_FILENAME = "predictions.db"
 
 
 class PredictRequest(BaseModel):
@@ -53,6 +56,29 @@ class PredictRequest(BaseModel):
 class BatchPredictRequest(BaseModel):
     rows: list[dict[str, Any]] = Field(..., description="Records, each keyed by training column name.")
     allow_unknown: bool = False
+
+
+class OutcomeRequest(BaseModel):
+    request_id: str = Field(..., description="The request_id returned by /predict.")
+    actual: Any = Field(..., description="The ground truth that eventually arrived.")
+    source: str | None = Field(None, description="Where this label came from, for auditing.")
+
+
+class BatchOutcomeRequest(BaseModel):
+    outcomes: list[OutcomeRequest]
+
+
+def _model_version(schema: dict[str, Any]) -> str:
+    """
+    A stable identifier for the artifact serving traffic.
+
+    Predictions are logged against it so T1-5 can compare a champion's
+    behaviour with a challenger's, and so a drift alarm can be attributed to
+    the model that actually produced the predictions rather than to whatever is
+    deployed at the moment someone looks.
+    """
+    model = schema.get("model") or {}
+    return f"{model.get('name', 'unknown')}@{schema.get('created_utc', 'unknown')}"
 
 
 def _serving_contract(schema: dict[str, Any]) -> dict[str, Any]:
@@ -85,7 +111,11 @@ def _serving_contract(schema: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def create_app(model_dir: str | Path | None = None) -> FastAPI:
+def create_app(
+    model_dir: str | Path | None = None,
+    store_path: str | Path | None = None,
+    log_predictions: bool = True,
+) -> FastAPI:
     """
     Build an app bound to one model directory.
 
@@ -113,6 +143,17 @@ def create_app(model_dir: str | Path | None = None) -> FastAPI:
     app.state.model_dir = str(resolved)
     app.state.version_warnings = loaded.warnings
 
+    # Logging is ON by default. A serving API that keeps no record of what it
+    # predicted cannot be measured for drift later, and the moment to start
+    # collecting is the first request — not the day someone wants the data.
+    store = None
+    if log_predictions:
+        store_path = Path(store_path or os.environ.get(STORE_PATH_ENV) or
+                          (resolved / DEFAULT_STORE_FILENAME))
+        store = PredictionStore(store_path)
+    app.state.store = store
+    version = _model_version(schema)
+
     def _score(rows: list[dict[str, Any]], allow_unknown: bool) -> dict[str, Any]:
         result = validate_payload(rows, schema, allow_unknown=allow_unknown)
         if not result.ok:
@@ -125,6 +166,24 @@ def create_app(model_dir: str | Path | None = None) -> FastAPI:
         batch = predict_frame(estimator, result.frame, schema)
         payload = batch.as_dict()
         payload["warnings"] = result.warnings
+
+        for row, prediction in zip(rows, payload["predictions"]):
+            request_id = new_request_id()
+            prediction["request_id"] = request_id
+            if store is None:
+                continue
+            try:
+                store.log_prediction(
+                    payload=row, prediction=prediction["prediction"], request_id=request_id,
+                    probability=prediction["probability"], threshold=prediction["threshold"],
+                    decision_rule=prediction["decision_rule"],
+                    model_version=version, model_name=(schema.get("model") or {}).get("name"),
+                )
+            except Exception as e:  # noqa: BLE001
+                # A logging failure must not deny a caller their prediction —
+                # but it must not pass unnoticed either, or the drift baseline
+                # silently develops holes.
+                payload["warnings"].append(f"Prediction was not logged ({type(e).__name__}: {e}).")
         return payload
 
     @app.get("/health")
@@ -139,11 +198,43 @@ def create_app(model_dir: str | Path | None = None) -> FastAPI:
             # Surfaced rather than swallowed: an estimator unpickled under a
             # different scikit-learn minor can score differently with no error.
             "version_warnings": app.state.version_warnings,
+            "model_version": version,
+            "prediction_log": (store.counts() | {"path": str(store.path)}) if store else None,
         }
 
     @app.get("/model")
     def model() -> dict[str, Any]:
         return _serving_contract(schema)
+
+    @app.post("/outcomes")
+    def record_outcome(request: OutcomeRequest) -> dict[str, Any]:
+        """Attach ground truth to a served prediction, joined on request_id."""
+        if store is None:
+            raise HTTPException(status_code=409, detail={
+                "message": "Prediction logging is disabled, so there is nothing to attach to.",
+            })
+        try:
+            store.record_outcome(request.request_id, request.actual, source=request.source)
+        except UnknownRequestError as e:
+            # 404, not a silent accept: a label with nothing to join to shows up
+            # much later as an evaluation set that is quietly too small.
+            raise HTTPException(status_code=404, detail={"message": str(e)}) from e
+        return {"request_id": request.request_id, "recorded": True, "counts": store.counts()}
+
+    @app.post("/outcomes/batch")
+    def record_outcomes(request: BatchOutcomeRequest) -> dict[str, Any]:
+        if store is None:
+            raise HTTPException(status_code=409, detail={
+                "message": "Prediction logging is disabled, so there is nothing to attach to.",
+            })
+        recorded, unknown = [], []
+        for outcome in request.outcomes:
+            try:
+                store.record_outcome(outcome.request_id, outcome.actual, source=outcome.source)
+                recorded.append(outcome.request_id)
+            except UnknownRequestError:
+                unknown.append(outcome.request_id)
+        return {"recorded": recorded, "unknown_request_ids": unknown, "counts": store.counts()}
 
     @app.post("/predict")
     def predict(request: PredictRequest) -> dict[str, Any]:

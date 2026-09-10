@@ -22,7 +22,7 @@ python -m autoeng.cli ask <run_id> "why did you reject random_forest?"
 python -m autoeng.cli list-runs
 python -m autoeng.cli serve runs/models/<run_name>         # score rows over HTTP
 
-pytest tests/ -q                                           # 109 tests, ~130s
+pytest tests/ -q                                           # 130 tests, ~130s
 python scripts/calibrate_detection.py                      # detection accuracy harness
 ```
 
@@ -98,6 +98,12 @@ Supports CSV/TSV, Parquet, JSON/JSON-Lines, and Excel.
     `predict()`'s 0.5, so the deployed operating point is the one the report
     measured.
 
+18. **Log and label** — every served prediction is written to an append-only
+    SQLite log with its raw payload, and `/predict` returns a `request_id` the
+    caller quotes to `POST /outcomes` when ground truth arrives.
+    `labelled_frame()` joins the two into one evaluation frame — the single
+    definition of "a labelled window" that drift detection and retraining
+    will both read.
 ## Target detection: the hard part
 
 Picking the target column in an undescribed dataset is the bottleneck the
@@ -212,12 +218,10 @@ part:
 
 ## Scope — what's not here
 
-- **No monitoring, drift detection, or auto-retrain loop.** A serving API
-  exists (stage 17), but nothing logs what it predicts — so there is no drift
-  baseline and no arriving ground truth. Building the rest shallowly would
-  have meant a fake drift detector comparing a dataset to itself. The
-  foundations are in place: MLflow tracking, and a persisted schema carrying
-  the training reference distributions a real drift check would diff against.
+- **No drift detection or auto-retrain loop yet.** The inputs now exist —
+  served predictions and arriving ground truth are logged and joinable — but
+  nothing reads them. Building the detector shallowly would have meant
+  comparing a dataset to itself and calling the silence a pass.
 - **The serving API is a contract layer, not a hardened endpoint.** No auth,
   rate limiting, or TLS.
 - **Only classification and regression runs persist a model.** Time-series
@@ -282,12 +286,13 @@ autoeng/
   modeling/        model zoo, budgeted CV search, HPO, stacking, clustering, time series
   explain/         SHAP/permutation explanations, grounded Q&A
   registry/        model + training-schema persistence, reference distributions
-  serving/         FastAPI: schema validation + threshold-aware prediction
+  serving/         FastAPI: schema validation + threshold-aware prediction,
+                   append-only prediction/outcome log
   tracking/        MLflow logging and querying
   reporting/       Markdown report generation
   pipeline.py      end-to-end orchestration
   cli.py           command-line entry point
-tests/             109 tests: planted leaks, regressions for every shipped bug, unit tests
+tests/             130 tests: planted leaks, regressions for every shipped bug, unit tests
 scripts/           detection calibration harness
 data/              synthetic + real validation datasets
 runs/              reports + MLflow store from the validation runs

@@ -27,7 +27,7 @@ T1-4 and T1-5, and still should if any of this is revisited.
 ## Tier 0 — Blockers
 
 All three confirmed absent by grepping the codebase, not assumed.
-**Tier 0 is complete. T1-1 is done; start at T1-2.**
+**Tier 0 is complete. T1-1 and T1-2 are done; start at T1-3.**
 
 ### ~~T0-1 · Persist the trained model and its schema~~ — **DONE**
 
@@ -184,25 +184,47 @@ feature returns 422 naming the column.
 not a hardened public endpoint. Predictions are not logged anywhere yet; that
 is T1-2, and until it exists there is no drift baseline.
 
-### T1-2 · Prediction and outcome store (~200 lines, 5 tests) — **NEXT**
+### ~~T1-2 · Prediction and outcome store~~ — **DONE**
 
-**The step most implementations skip, and the one everything after needs.**
-Without stored predictions there's no drift baseline. Without ground truth
-arriving later there's no concept-drift measurement and no retraining data.
-Skipping it is how a demo ends up "auto-retraining" forever on the original
-static file.
+`autoeng/serving/store.py`. SQLite (WAL, so a drift check reading the log does
+not block serving), two append-only tables, and one join.
 
-- **Build:** append-only log (SQLite or date-partitioned Parquet):
-  `request_id`, timestamp, model version, raw feature payload, prediction,
-  probability, threshold applied. Plus `POST /outcomes` to attach the true
-  label later, joined on `request_id`.
-- **Design note:** log the *raw* payload as received, not the transformed
-  matrix. Drift must be measured in the space data arrives in, and a stored
-  transformed matrix is unreadable the moment the pipeline changes.
-- **Done when:** predictions and outcomes join into a labelled evaluation frame
-  through one function — that function feeds both T1-3 and T1-4.
+**`PredictionStore.labelled_frame()` is the function T1-3 and T1-4 both
+consume.** Defining it once is what stops them disagreeing about what a
+labelled window is. `prediction_frame()` is its unlabelled sibling for *data*
+drift, which needs no ground truth at all.
 
-### T1-3 · Drift detection, weighted by importance (~300 lines, 7 tests)
+Verified end to end on a real run: 120 rows served through `/predict`, ground
+truth attached through `/outcomes`, and the join returned a 120-row frame
+carrying every raw feature plus prediction, probability, threshold and actual —
+enough to compute the live operating point directly.
+
+- **`/predict` returns a `request_id`.** Without it a caller has nothing to
+  quote when the label arrives, and the log can never be joined to anything.
+- **Raw payload, never the design matrix.** Drift is measured in the space
+  data arrives in, and a stored matrix stops being comparable the moment the
+  pipeline changes. It also means the log can be replayed into a retrained
+  pipeline, which a matrix could not be.
+- **Outcomes are append-only too**, which is the less obvious half. Labels get
+  revised — a chargeback reversed, a diagnosis corrected — and overwriting
+  erases the fact that they were, which is itself a signal and occasionally
+  the explanation for a model that appears to have degraded. Both rows are
+  kept; the join takes the latest per request.
+- **An outcome for an unserved `request_id` is a 404**, not a silent accept.
+  Accepting it creates a label with nothing to join to, which surfaces much
+  later as an evaluation window quietly smaller than the labels collected.
+- **A 422 is never logged** — it never reached the model, so logging it would
+  put unscored rows in the drift baseline.
+- **Logging defaults ON**, beside the model. The moment to start collecting is
+  the first request, not the day someone wants the data. A logging failure
+  degrades to a warning on the response rather than denying the prediction —
+  but it is never silent, or the baseline develops holes nobody sees.
+- **Predictions carry a `model_version`** (`<name>@<trained_at>`) so a drift
+  alarm attributes to the model that produced the predictions rather than to
+  whatever is deployed when someone looks — and so T1-5 can compare champion
+  against challenger over the same window.
+
+### T1-3 · Drift detection, weighted by importance (~300 lines, 7 tests) — **NEXT**
 
 - **Data drift:** PSI per feature against the T0-1 reference distributions
   (investigate >0.1, alarm >0.2), KS for continuous and chi-square for
@@ -289,7 +311,7 @@ Roughly 2,300 lines and 40 tests across all fourteen items; Tier 0 alone is
 about 530 lines and closes the gap between what the report claims and what the
 model does.
 
-Current state: 109 tests passing, 10/10 on unambiguous problem-type detection,
+Current state: 130 tests passing, 10/10 on unambiguous problem-type detection,
 7.4× search speedup from successive halving. The trained model is persisted
 with its schema (T0-1) and the decision threshold is selected out-of-fold,
 saved into that schema, and reported beside the ranking metrics (T0-2), and

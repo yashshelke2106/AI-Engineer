@@ -14,11 +14,11 @@ everything to MLflow, and writes a report.
 python -m autoeng.cli run data/any.csv          # infer everything
 python -m autoeng.cli run data.csv --target y   # or pin the target
 python -m autoeng.cli ask <run_id> "why did you reject random_forest?"
-pytest tests/ -q                                # 109 tests, ~130s
+pytest tests/ -q                                # 130 tests, ~130s
 python scripts/calibrate_detection.py           # detection accuracy, 10/10 expected
 ```
 
-`ROADMAP.md` has the prioritised remaining work. **T1-1 is done; start at T1-2.**
+`ROADMAP.md` has the prioritised remaining work. **T1-2 is done; start at T1-3.**
 
 ## Invariants — do not break these
 
@@ -92,6 +92,14 @@ violation; null value = data.
 threshold, or the deployed model does something different from everything the
 report claims about it — invisibly, since both return plausible labels. Read
 the positive class off `estimator.classes_`, never schema order.
+
+**7c. The prediction log is append-only, and that includes outcomes.**
+A prediction records what was served at a moment; rewriting it destroys the
+only evidence of what the model actually did, so a duplicate `request_id` is
+an error. Outcomes are append-only because labels get revised, and overwriting
+erases that they were — the join takes the latest per request.
+`labelled_frame()` is the single definition of "a labelled window" that both
+T1-3 and T1-4 consume; do not add a second one.
 
 **8. Groups, when detected, apply to EVERY split.**
 Held-out partition, search folds, the halving screen's subsample (which samples
@@ -175,6 +183,7 @@ autoeng/
   explain/      explainer.py (SHAP/permutation), qa.py (grounded Q&A over MLflow)
   registry/     model_store.py — fitted model + training_schema.json (T0-1)
   serving/      validation.py (contract) + predictor.py (threshold) + app.py (T1-1)
+                store.py — append-only prediction/outcome log (T1-2)
   tracking/     MLflow logging + querying
   reporting/    Markdown report generation
   pipeline.py   orchestration      cli.py  entry point
@@ -195,7 +204,7 @@ autoeng/
 
 ## Current state
 
-109 tests passing. Detection 10/10 on unambiguous cases (iris is genuinely
+130 tests passing. Detection 10/10 on unambiguous cases (iris is genuinely
 ambiguous and excluded). Successive halving gives 7.4× speedup with an
 identical winner.
 
@@ -223,6 +232,7 @@ structure nobody gave it.
 **T0-3 is done:** repeated-entity keys are detected, excluded from features,
 and honoured by every split. See invariants 8 and 8a.
 
-**Tier 0 and T1-1 are complete.** Next is T1-2 (prediction and outcome
-store) — without stored predictions there is no drift baseline, and T1-3
-cannot be built on top of nothing.
+**Tier 0, T1-1 and T1-2 are complete.** Next is T1-3 (drift detection), which
+now has something real to read: `PredictionStore.labelled_frame()` for concept
+drift and `prediction_frame()` for data drift, against the reference
+distributions T0-1 captured.
