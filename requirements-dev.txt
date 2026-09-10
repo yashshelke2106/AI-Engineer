@@ -3,3 +3,5 @@
 -r requirements.txt
 
 pytest==9.0.3
+# TestClient needs an HTTP client even though the app is never bound to a port.
+httpx==0.28.1

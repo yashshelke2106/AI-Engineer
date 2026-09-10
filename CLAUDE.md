@@ -14,11 +14,11 @@ everything to MLflow, and writes a report.
 python -m autoeng.cli run data/any.csv          # infer everything
 python -m autoeng.cli run data.csv --target y   # or pin the target
 python -m autoeng.cli ask <run_id> "why did you reject random_forest?"
-pytest tests/ -q                                # 94 tests, ~80s
+pytest tests/ -q                                # 109 tests, ~130s
 python scripts/calibrate_detection.py           # detection accuracy, 10/10 expected
 ```
 
-`ROADMAP.md` has the prioritised remaining work. **Tier 0 is done; start at T1-1.**
+`ROADMAP.md` has the prioritised remaining work. **T1-1 is done; start at T1-2.**
 
 ## Invariants — do not break these
 
@@ -77,6 +77,21 @@ The ordinary winner is a `Pipeline`; the stacked ensemble is a bare
 `StackingClassifier` holding pipelines as base estimators. Nothing in
 `autoeng/registry/` may reach for `.named_steps` or assume `.steps` exists.
 Both shapes are pinned by round-trip tests for this reason.
+
+**7a. Serving must never invent a feature value.**
+A payload missing a column is a 422 naming it, never a median. The pipeline
+has an imputer and using it here returns a confident, plausible, fabricated
+prediction with nothing in the response saying so — the most comfortable wrong
+behaviour available. A *null* value is different and is accepted: that is
+ordinary missing data the imputer exists for. Absent column = contract
+violation; null value = data.
+
+**7b. Serving applies the stored threshold, not `estimator.predict()`.**
+`predict()` uses 0.5 unconditionally. For a binary target with a threshold in
+`training_schema.json`, the label comes from `predict_proba` against that
+threshold, or the deployed model does something different from everything the
+report claims about it — invisibly, since both return plausible labels. Read
+the positive class off `estimator.classes_`, never schema order.
 
 **8. Groups, when detected, apply to EVERY split.**
 Held-out partition, search folds, the halving screen's subsample (which samples
@@ -159,6 +174,7 @@ autoeng/
   detection/    + group_detector.py (repeated-entity keys)
   explain/      explainer.py (SHAP/permutation), qa.py (grounded Q&A over MLflow)
   registry/     model_store.py — fitted model + training_schema.json (T0-1)
+  serving/      validation.py (contract) + predictor.py (threshold) + app.py (T1-1)
   tracking/     MLflow logging + querying
   reporting/    Markdown report generation
   pipeline.py   orchestration      cli.py  entry point
@@ -179,7 +195,7 @@ autoeng/
 
 ## Current state
 
-94 tests passing. Detection 10/10 on unambiguous cases (iris is genuinely
+109 tests passing. Detection 10/10 on unambiguous cases (iris is genuinely
 ambiguous and excluded). Successive halving gives 7.4× speedup with an
 identical winner.
 
@@ -207,5 +223,6 @@ structure nobody gave it.
 **T0-3 is done:** repeated-entity keys are detected, excluded from features,
 and honoured by every split. See invariants 8 and 8a.
 
-**Tier 0 is complete.** Next is T1-1 (serving API), which consumes the T0-1
-schema for payload validation and the T0-2 threshold at prediction time.
+**Tier 0 and T1-1 are complete.** Next is T1-2 (prediction and outcome
+store) — without stored predictions there is no drift baseline, and T1-3
+cannot be built on top of nothing.

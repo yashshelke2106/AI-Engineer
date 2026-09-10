@@ -27,7 +27,7 @@ T1-4 and T1-5, and still should if any of this is revisited.
 ## Tier 0 — Blockers
 
 All three confirmed absent by grepping the codebase, not assumed.
-**Tier 0 is complete; start at T1-1.**
+**Tier 0 is complete. T1-1 is done; start at T1-2.**
 
 ### ~~T0-1 · Persist the trained model and its schema~~ — **DONE**
 
@@ -145,21 +145,46 @@ That perfect score is the failure mode this item removes.
 
 A strict chain: each one's output is the next one's input.
 
-### T1-1 · Serving API with schema validation (~250 lines, 6 tests)
+### ~~T1-1 · Serving API with schema validation~~ — **DONE**
 
-FastAPI in `autoeng/serving/app.py`: `POST /predict`, `POST /predict/batch`,
-`GET /health`, `GET /model`. Loads through the T0-1 registry, validates every
-payload against `training_schema.json`.
+`autoeng/serving/`: `validation.py` (the contract), `predictor.py` (the
+decision rule), `app.py` (the HTTP surface). `python -m autoeng.cli serve
+runs/models/<run_name>`, or `uvicorn autoeng.serving.app:app` with
+`AUTOENG_MODEL_DIR` set.
 
-**The hard part:** validation must be strict and legible. A missing required
-feature returns 422 naming it — never a silent median imputation, which
-produces a confident, wrong, untraceable prediction. Unknown columns rejected
-or explicitly ignored with a warning; dtypes coerced by the training rules.
+Both "done when" clauses are asserted in `tests/test_serving.py`: a served
+probability matches the in-process one to 1e-12, and a payload missing a
+feature returns 422 naming the column.
 
-**Done when:** a row scored through the API exactly matches the same row scored
-in-process; a request missing one feature returns 422 naming it.
+- **The distinction that carries the design:** a column *absent from the
+  payload* is a contract violation and is rejected; a column *present and
+  null* is ordinary missing data the pipeline's imputer already handles, so it
+  is accepted — with a warning if training never saw a null there, which
+  usually means an upstream join started failing. Rejecting nulls would make
+  the API stricter than the model; imputing absences would make it a liar.
+- **Coercion failures are errors, not NaN.** `pd.to_numeric(errors="coerce")`
+  turns `"N/A"` into a NaN that the imputer replaces with a median — the same
+  invented-value problem arriving through a different door.
+- **Column order comes from the schema, never from payload key order.** A
+  frame built from dict keys inherits insertion order, and a positional
+  mismatch scores the wrong columns silently. Asserted by sending a row with
+  its keys reversed.
+- **T0-2's threshold is applied here, and this is the integration that makes
+  T0-2 real.** `estimator.predict()` uses 0.5 unconditionally; for binary
+  targets with a stored threshold the label comes from `predict_proba` against
+  it instead. A test pins a row where the two disagree. The positive label is
+  read off `estimator.classes_`, not schema order, since a mismatch there
+  would invert every prediction silently.
+- **Unknown columns are rejected by default**, ignorable with
+  `allow_unknown=true`. A caller sending an untrained field is either on the
+  wrong endpoint or ahead of a deploy; discarding it hides the mismatch.
+- **A missing model directory fails at startup**, not per request.
 
-### T1-2 · Prediction and outcome store (~200 lines, 5 tests)
+**Not covered:** no auth, rate limiting, or TLS — this is the contract layer,
+not a hardened public endpoint. Predictions are not logged anywhere yet; that
+is T1-2, and until it exists there is no drift baseline.
+
+### T1-2 · Prediction and outcome store (~200 lines, 5 tests) — **NEXT**
 
 **The step most implementations skip, and the one everything after needs.**
 Without stored predictions there's no drift baseline. Without ground truth
@@ -264,7 +289,7 @@ Roughly 2,300 lines and 40 tests across all fourteen items; Tier 0 alone is
 about 530 lines and closes the gap between what the report claims and what the
 model does.
 
-Current state: 91 tests passing, 10/10 on unambiguous problem-type detection,
+Current state: 109 tests passing, 10/10 on unambiguous problem-type detection,
 7.4× search speedup from successive halving. The trained model is persisted
 with its schema (T0-1) and the decision threshold is selected out-of-fold,
 saved into that schema, and reported beside the ranking metrics (T0-2), and

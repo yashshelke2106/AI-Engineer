@@ -36,3 +36,8 @@ joblib==1.5.3
 # Used explicitly: MLflow's default sklearn format (skops) refuses this
 # project's custom transformers, so model export pins cloudpickle instead.
 cloudpickle==3.1.2
+
+# Serving (T1-1). Kept in the runtime requirements because the API is part of
+# the deliverable, not a dev tool.
+fastapi==0.139.0
+uvicorn==0.49.0

@@ -62,6 +62,13 @@ def main(argv: list[str] | None = None) -> int:
     ask_p.add_argument("question")
     ask_p.add_argument("--runs-dir", default="./runs")
 
+    serve_p = sub.add_parser(
+        "serve", help="Serve a persisted model over HTTP under its training contract.")
+    serve_p.add_argument("model_dir",
+                         help="A directory written by a run: runs/models/<run_name>.")
+    serve_p.add_argument("--host", default="127.0.0.1")
+    serve_p.add_argument("--port", type=int, default=8000)
+
     list_p = sub.add_parser("list-runs", help="List past runs.")
     list_p.add_argument("--runs-dir", default="./runs")
 
@@ -87,6 +94,20 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Decision threshold: {result.decision_threshold['threshold']:.4f} "
                   f"({result.decision_threshold['objective']})")
         print(f"Report written to: {result.report_path}")
+        return 0
+
+    if args.command == "serve":
+        import uvicorn
+
+        from autoeng.serving.app import create_app
+
+        # Built before uvicorn starts so a missing or unreadable model fails
+        # here, with a message, rather than as a 500 on the first request.
+        application = create_app(args.model_dir)
+        print(f"Serving {args.model_dir} on http://{args.host}:{args.port}")
+        print(f"  GET  /model    the feature contract callers must satisfy")
+        print(f"  POST /predict  one row (422 names any column that is missing)")
+        uvicorn.run(application, host=args.host, port=args.port)
         return 0
 
     if args.command == "ask":
