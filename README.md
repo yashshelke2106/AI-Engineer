@@ -20,7 +20,7 @@ python -m autoeng.cli run data.csv --target revenue        # or tell it the targ
 python -m autoeng.cli ask <run_id> "why did you reject random_forest?"
 python -m autoeng.cli list-runs
 
-pytest tests/ -q                                           # 79 tests, ~105s
+pytest tests/ -q                                           # 91 tests, ~75s
 python scripts/calibrate_detection.py                      # detection accuracy harness
 ```
 
@@ -37,17 +37,22 @@ Supports CSV/TSV, Parquet, JSON/JSON-Lines, and Excel.
    (see [Target detection](#target-detection-the-hard-part) below). Every
    decision is logged with its reasoning and the runner-up hypotheses.
    Override with `--target` / `--problem-type` when you know better.
-4. **Clean** — duplicate rows and constant columns dropped dataset-wide (safe
+4. **Detect repeated entities** — if rows describe visits per patient,
+   sessions per user or readings per device, that key is found and every split
+   (held-out partition, search folds, tuning folds, threshold selection) keeps
+   an entity on one side. The key is excluded from features. Override with
+   `--group-column` / `--no-groups`.
+5. **Clean** — duplicate rows and constant columns dropped dataset-wide (safe
    pre-split); imputation and IQR outlier capping are `fit`/`transform`
    pipeline steps, so their statistics come from the training fold only.
-5. **Engineer features** — datetime decomposition, text length/word-count
+6. **Engineer features** — datetime decomposition, text length/word-count
    stats, numeric interactions pruned by mutual information, and
    cardinality-appropriate categorical encoding (one-hot / `TargetEncoder`).
-6. **Scan for leakage** — pre-training (features suspiciously correlated with
-   the target, train/test row overlap, temporal ordering violations) and
-   post-training (implausibly perfect held-out metrics, cross-referenced
-   against feature-importance concentration).
-7. **Search 20+ models under a budget** — 28 classification (21 algorithms plus
+7. **Scan for leakage** — pre-training (features suspiciously correlated with
+   the target, train/test row overlap, temporal ordering violations, entities
+   spanning the split) and post-training (implausibly perfect held-out metrics,
+   cross-referenced against feature-importance concentration).
+8. **Search 20+ models under a budget** — 28 classification (21 algorithms plus
    `class_weight="balanced"` twins of the seven that accept it, competing as
    ordinary candidates) and 21 regression algorithms spanning linear,
    distance-based, naive Bayes, trees, bagging and
@@ -57,31 +62,31 @@ Supports CSV/TSV, Parquet, JSON/JSON-Lines, and Excel.
    eliminated candidates stay on the leaderboard marked `screened_out` with
    the score that eliminated them. Measured on 12k rows: **7.4× faster
    (300s → 40s) with an identical winner.**
-8. **Tune** — Optuna (TPE) over the top-N candidates with a defined space.
-9. **Stack** — a cross-fitted stacked ensemble of the top base pipelines is
+9. **Tune** — Optuna (TPE) over the top-N candidates with a defined space.
+10. **Stack** — a cross-fitted stacked ensemble of the top base pipelines is
    built and evaluated on the same CV, competing as one more candidate
    (see the honest result in [Findings](#findings-from-testing)).
-10. **Explain** — SHAP `TreeExplainer` for tree winners, permutation
+11. **Explain** — SHAP `TreeExplainer` for tree winners, permutation
     importance otherwise; leaderboard margin over the runner-up; HPO delta.
-11. **Choose an operating point** (binary classification) — a decision
+12. **Choose an operating point** (binary classification) — a decision
     threshold selected on **out-of-fold** training predictions, never the
     held-out split, maximising F1 by default or recall subject to a precision
     floor / expected cost when told what a mistake is worth. The report shows
     precision, recall, F1 and the confusion matrix at the selected threshold
     *and* at the 0.5 default, because the gap between them is the point.
-12. **Persist** — the fitted winner is saved to
+13. **Persist** — the fitted winner is saved to
     `runs/models/<run_name>/model.joblib` alongside a `training_schema.json`
     (column names and order, dtypes, semantic types, feature roles, target
     class labels, library versions, and per-feature reference distributions)
     and an MLflow model directory with signature and input example. Reloading
     reproduces the in-run held-out metrics exactly — measured delta 0.0.
     Classification and regression only; see [Scope](#scope--whats-not-here).
-13. **Track** — every param, metric, and JSON artifact logged to MLflow
+14. **Track** — every param, metric, and JSON artifact logged to MLflow
     (SQLite-backed, zero external services), including a resolvable
     `runs:/<run_id>/model` URI.
-14. **Ask** — grounded Q&A answering from the logged run data, never by
+15. **Ask** — grounded Q&A answering from the logged run data, never by
     re-guessing.
-15. **Report** — one Markdown report per run assembling all of the above.
+16. **Report** — one Markdown report per run assembling all of the above.
 
 ## Target detection: the hard part
 
@@ -108,8 +113,8 @@ confidence floor alone, and a dataset with opaque names works exactly as
 before on the other two signals.
 
 Detection accuracy is measured, not asserted — `scripts/calibrate_detection.py`
-scores detection against human-intent answers on all ten datasets: **9/9 on
-the unambiguous cases, 1 genuinely ambiguous.**
+scores detection against human-intent answers on all eleven datasets: **10/10
+on the unambiguous cases, 1 genuinely ambiguous.**
 
 The sharpest case for needing all three signals is the 3.9%-positive fraud
 dataset. Shape alone gets it **wrong**: the entropy/balance term ranks
@@ -161,6 +166,24 @@ part:
   was more skewed than 22%. It is now a fixture and a CSV, and it reproduces
   the original numbers. A prioritisation resting on an unreproducible
   measurement is one nobody can check.
+- **Entity-level labels alone do not cause group leakage — stable per-entity
+  attributes do.** The obvious story is that repeated entities leak because
+  their rows share a label. Measured, that alone moves ROC-AUC by about 0.06.
+  The gap only becomes severe once a feature is *constant per entity* and lets
+  the model recognise which entity a row belongs to: adding one non-causal
+  fingerprint column took the same fixture from 0.06 to 0.29. So the datasets
+  most at risk are the ordinary ones carrying demographics or device
+  attributes, not the exotic ones. End to end the pipeline reports ROC-AUC
+  **1.000** on that fixture with `--no-groups` and **0.730** with grouping on.
+- **Turning off a safety check used to turn off its warning.** The first
+  version of `--no-groups` returned "no group column" immediately, so the
+  `group_overlap` leakage flag went silent — producing a perfect-looking model
+  with nothing said about why. Detection now always runs; only the *splitting*
+  is disabled. Disabling a check should make the danger louder.
+- **Every report written on Windows was mis-encoded.** `Path.write_text()`
+  defaults to the platform codepage, not UTF-8, and the reports contain em
+  dashes. They were being written as cp1252 and could not be decoded by a
+  UTF-8 reader. Found by corrupting three source files the same way.
 - **Two silent bugs found by writing tests.** LightGBM's default
   `importance_type="split"` counts how often a feature is used and stays
   diffuse even when one feature explains everything, making the concentration
@@ -229,7 +252,8 @@ part:
 autoeng/
   ingestion/       raw file loading, zero schema assumptions
   profiling/       column semantic typing, target-candidate scoring
-  detection/       problem-type inference, fit-and-check validator, name prior
+  detection/       problem-type inference, fit-and-check validator, name prior,
+                   repeated-entity group keys
   cleaning/        dataset-level structural clean + fit/transform imputer
   features/        datetime/text/interaction transformers, pipeline builder
   common/          shared association metrics, feature-role assignment
@@ -241,7 +265,7 @@ autoeng/
   reporting/       Markdown report generation
   pipeline.py      end-to-end orchestration
   cli.py           command-line entry point
-tests/             79 tests: planted leaks, regressions for every shipped bug, unit tests
+tests/             91 tests: planted leaks, regressions for every shipped bug, unit tests
 scripts/           detection calibration harness
 data/              synthetic + real validation datasets
 runs/              reports + MLflow store from the validation runs

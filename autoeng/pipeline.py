@@ -25,15 +25,16 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GroupShuffleSplit, StratifiedGroupKFold, train_test_split
 
 from autoeng.cleaning.structural import clean_structural
 from autoeng.common.roles import assign_feature_roles
+from autoeng.detection.group_detector import detect_group_column, group_values
 from autoeng.detection.problem_detector import ProblemType, decision_from_override, detect_problem_type
 from autoeng.explain.explainer import explain_winner
 from autoeng.ingestion.loader import load_raw_dataset
 from autoeng.leakage.detector import (
-    check_temporal_split, check_train_test_row_overlap, merge_reports,
+    check_group_overlap, check_temporal_split, check_train_test_row_overlap, merge_reports,
     scan_post_training, scan_pre_training,
 )
 from autoeng.modeling.clustering_search import run_clustering_search, rank_clustering_results, select_k
@@ -69,12 +70,13 @@ class PipelineRunResult:
     held_out_metrics: dict[str, float] | None = None
     model_artifact: dict[str, Any] | None = None
     decision_threshold: dict[str, Any] | None = None
+    group_decision: dict[str, Any] | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
 
 def _select_operating_point(
     estimator, X_train, y_train, *, cv_folds: int, objective: str,
-    precision_floor: float, cost_false_negative: float, cost_false_positive: float,
+    precision_floor: float, cost_false_negative: float, cost_false_positive: float, groups=None,
 ) -> dict[str, Any] | None:
     """
     Choose the decision threshold from out-of-fold predictions on the TRAINING
@@ -89,7 +91,7 @@ def _select_operating_point(
     if not hasattr(estimator, "predict_proba"):
         return None
     try:
-        proba = out_of_fold_probabilities(estimator, X_train, y_train, cv_folds=cv_folds)
+        proba = out_of_fold_probabilities(estimator, X_train, y_train, cv_folds=cv_folds, groups=groups)
         choice = select_threshold(
             y_train, proba, objective=objective, precision_floor=precision_floor,
             cost_false_negative=cost_false_negative, cost_false_positive=cost_false_positive,
@@ -151,6 +153,33 @@ def _persist_final_model(
         return saved.as_dict()
     except Exception as e:  # noqa: BLE001 - see docstring
         return {"status": "failed", "error": f"{type(e).__name__}: {e}"}
+
+
+def _holdout_split(X, y, problem_kind: str, groups=None):
+    """
+    Carve off the held-out test split.
+
+    With groups, whole entities move together — otherwise the final evaluation
+    is scored on customers the model already trained on, which is the same leak
+    grouped CV removes from the leaderboard, surviving into the one number the
+    report leads with. Returns (X_train, X_test, y_train, y_test, groups_train).
+    """
+    if groups is None:
+        stratify = y if problem_kind == "classification" else None
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=HOLDOUT_FRACTION, random_state=RANDOM_STATE, stratify=stratify,
+        )
+        return X_train, X_test, y_train, y_test, None
+
+    groups = np.asarray(groups)
+    splitter = (
+        StratifiedGroupKFold(n_splits=int(round(1 / HOLDOUT_FRACTION)), shuffle=True, random_state=RANDOM_STATE)
+        if problem_kind == "classification"
+        else GroupShuffleSplit(n_splits=1, test_size=HOLDOUT_FRACTION, random_state=RANDOM_STATE)
+    )
+    train_idx, test_idx = next(iter(splitter.split(X, y, groups=groups)))
+    return (X.iloc[train_idx], X.iloc[test_idx], y.iloc[train_idx], y.iloc[test_idx],
+            groups[train_idx])
 
 
 def _regression_metric_from_r2(pipeline, X_test, y_test) -> dict[str, float]:
@@ -221,6 +250,8 @@ def run_pipeline(
     run_name: str | None = None,
     target_override: str | None = None,
     problem_type_override: str | None = None,
+    group_column_override: str | None = None,
+    use_groups: bool = True,
     threshold_objective: str = DEFAULT_OBJECTIVE,
     precision_floor: float = DEFAULT_PRECISION_FLOOR,
     cost_false_negative: float = 10.0,
@@ -251,7 +282,23 @@ def run_pipeline(
 
     chosen = decision.chosen
     target_column, time_column = chosen.target_column, chosen.time_column
-    roles = assign_feature_roles(profile, target_column=target_column, time_column=time_column)
+
+    # Group detection needs roles to know what the target and time axis are, and
+    # roles need the group column to exclude it from features, so roles are
+    # built twice — cheap, and clearer than threading a placeholder through.
+    provisional_roles = assign_feature_roles(profile, target_column=target_column, time_column=time_column)
+    group_decision = detect_group_column(
+        clean_df, profile, provisional_roles,
+        override=group_column_override, disabled=not use_groups,
+    )
+    group_column = group_decision.column
+    # The overlap scan uses what was DETECTED, not what is applied, so
+    # --no-groups still reports the leak it is causing.
+    detected_group_column = group_decision.detected_column
+    roles = assign_feature_roles(profile, target_column=target_column, time_column=time_column,
+                                 group_column=group_column)
+
+    all_groups = group_values(clean_df, group_decision)
 
     leaderboard_dict = None
     hpo_results_list: list[dict[str, Any]] = []
@@ -277,15 +324,21 @@ def run_pipeline(
         X_full = clean_df[roles.feature_columns]
         n_classes = y_full.nunique()
 
-        X_train, X_test, y_train, y_test = train_test_split(
-            X_full, y_full, test_size=HOLDOUT_FRACTION, random_state=RANDOM_STATE, stratify=y_full,
+        X_train, X_test, y_train, y_test, groups_train = _holdout_split(
+            X_full, y_full, "classification", groups=all_groups,
         )
         pre_leak = scan_pre_training(clean_df.loc[X_train.index], profile, target_column, roles.feature_columns)
         overlap = check_train_test_row_overlap(clean_df.loc[X_train.index], clean_df.loc[X_test.index])
         pre_leak = merge_reports(pre_leak, overlap)
+        # Runs whether or not grouping was applied: if an entity key was found
+        # but grouping is off, this is exactly where that shows up.
+        pre_leak = merge_reports(pre_leak, check_group_overlap(
+            clean_df.loc[X_train.index], clean_df.loc[X_test.index], detected_group_column,
+        ))
         pre_leak_dict = pre_leak.as_dict()
 
-        leaderboard = run_classification_search(X_train, y_train, roles, n_classes=n_classes, cv_folds=cv_folds)
+        leaderboard = run_classification_search(X_train, y_train, roles, n_classes=n_classes,
+                                                 cv_folds=cv_folds, groups=groups_train)
         leaderboard_dict = leaderboard.as_dict()
         ranked = leaderboard.ranked()
         winner_name = ranked[0].name if ranked else None
@@ -293,7 +346,7 @@ def run_pipeline(
         factories = get_classification_models(n_classes=n_classes)
         hpo_outcomes = optimize_top_candidates(
             leaderboard.results, factories, X_train, y_train, roles, "classification",
-            leaderboard.primary_metric, top_n=hpo_top_n, n_trials=hpo_trials,
+            leaderboard.primary_metric, top_n=hpo_top_n, n_trials=hpo_trials, groups=groups_train,
         )
         hpo_results_list = [o.as_dict() for o in hpo_outcomes]
 
@@ -301,6 +354,7 @@ def run_pipeline(
             leaderboard.results, factories, X_train, y_train, roles, "classification",
             leaderboard.primary_metric, CLASSIFICATION_SCORING if n_classes == 2
             else {"accuracy": "accuracy", "f1_macro": "f1_macro"}, cv_folds=cv_folds,
+            groups=groups_train,
         )
         if stack_result is not None:
             leaderboard.results.append(stack_result)
@@ -323,6 +377,7 @@ def run_pipeline(
                 final_pipeline, X_train, y_train, cv_folds=cv_folds,
                 objective=threshold_objective, precision_floor=precision_floor,
                 cost_false_negative=cost_false_negative, cost_false_positive=cost_false_positive,
+                groups=groups_train,
             )
 
         final_pipeline.fit(X_train, y_train)
@@ -353,15 +408,19 @@ def run_pipeline(
         y_full = clean_df[target_column]
         X_full = clean_df[roles.feature_columns]
 
-        X_train, X_test, y_train, y_test = train_test_split(
-            X_full, y_full, test_size=HOLDOUT_FRACTION, random_state=RANDOM_STATE,
+        X_train, X_test, y_train, y_test, groups_train = _holdout_split(
+            X_full, y_full, "regression", groups=all_groups,
         )
         pre_leak = scan_pre_training(clean_df.loc[X_train.index], profile, target_column, roles.feature_columns)
         overlap = check_train_test_row_overlap(clean_df.loc[X_train.index], clean_df.loc[X_test.index])
         pre_leak = merge_reports(pre_leak, overlap)
+        pre_leak = merge_reports(pre_leak, check_group_overlap(
+            clean_df.loc[X_train.index], clean_df.loc[X_test.index], detected_group_column,
+        ))
         pre_leak_dict = pre_leak.as_dict()
 
-        leaderboard = run_regression_search(X_train, y_train, roles, cv_folds=cv_folds)
+        leaderboard = run_regression_search(X_train, y_train, roles, cv_folds=cv_folds,
+                                             groups=groups_train)
         leaderboard_dict = leaderboard.as_dict()
         ranked = leaderboard.ranked()
         winner_name = ranked[0].name if ranked else None
@@ -369,13 +428,14 @@ def run_pipeline(
         factories = get_regression_models()
         hpo_outcomes = optimize_top_candidates(
             leaderboard.results, factories, X_train, y_train, roles, "regression",
-            leaderboard.primary_metric, top_n=hpo_top_n, n_trials=hpo_trials,
+            leaderboard.primary_metric, top_n=hpo_top_n, n_trials=hpo_trials, groups=groups_train,
         )
         hpo_results_list = [o.as_dict() for o in hpo_outcomes]
 
         stack_result = evaluate_stacked_ensemble(
             leaderboard.results, factories, X_train, y_train, roles, "regression",
             leaderboard.primary_metric, REGRESSION_SCORING, cv_folds=cv_folds,
+            groups=groups_train,
         )
         if stack_result is not None:
             leaderboard.results.append(stack_result)
@@ -487,7 +547,7 @@ def run_pipeline(
         "low_card_categorical_columns": roles.low_card_categorical_columns,
         "high_card_categorical_columns": roles.high_card_categorical_columns,
         "datetime_columns": roles.datetime_columns, "text_columns": roles.text_columns,
-        "excluded_columns": roles.excluded_columns,
+        "excluded_columns": roles.excluded_columns, "group_column": roles.group_column,
     }
 
     report_text = generate_report(
@@ -500,10 +560,15 @@ def run_pipeline(
         target_source=target_source, time_series_setup=ts_setup_dict,
         model_artifact=model_artifact, threshold_choice=threshold_choice,
         held_out_operating_point=held_out_operating_point,
+        group_decision=group_decision.as_dict(),
     )
 
     report_path = out_dir / f"{run_name}_report.md"
-    report_path.write_text(report_text)
+    # Explicit UTF-8: the report contains em dashes and arrows, and the
+    # platform default on Windows is cp1252, which writes them as bytes no
+    # UTF-8 reader can decode. Every report written on Windows before this
+    # was silently mis-encoded.
+    report_path.write_text(report_text, encoding="utf-8")
 
     run_id = None
     try:
@@ -521,15 +586,18 @@ def run_pipeline(
             model_artifact=model_artifact,
             decision_threshold={"selected": threshold_choice,
                                 "held_out": held_out_operating_point} if threshold_choice else None,
+            group_decision=group_decision.as_dict(),
         )
     except Exception as e:  # noqa: BLE001 - tracking must never take down the run
-        (out_dir / f"{run_name}_mlflow_error.txt").write_text(f"{type(e).__name__}: {e}")
+        (out_dir / f"{run_name}_mlflow_error.txt").write_text(
+            f"{type(e).__name__}: {e}", encoding="utf-8")
 
     return PipelineRunResult(
         run_id=run_id, problem_type=chosen.problem_type.value, target_column=target_column,
         report_text=report_text, report_path=str(report_path), leaderboard=leaderboard_dict,
         held_out_metrics=held_out_metrics, model_artifact=model_artifact,
         decision_threshold=threshold_choice,
+        group_decision=group_decision.as_dict(),
         extra={"mlflow_tracking_uri": mlflow_tracking_uri, "explanation": explanation_dict,
                "held_out_operating_point": held_out_operating_point},
     )

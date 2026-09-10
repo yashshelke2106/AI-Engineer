@@ -77,7 +77,7 @@ def evaluate_stacked_ensemble(
     X: pd.DataFrame, y: pd.Series, roles: FeatureRoleAssignment,
     problem_kind: Literal["classification", "regression"],
     primary_metric: str, scoring: dict[str, str], cv_folds: int = 5,
-    n_base_models: int = DEFAULT_N_BASE_MODELS,
+    n_base_models: int = DEFAULT_N_BASE_MODELS, groups=None,
 ) -> ModelResult | None:
     """
     Returns a ModelResult for the stack, scored on the same outer CV as every
@@ -95,12 +95,13 @@ def evaluate_stacked_ensemble(
     if stack is None:
         return None
 
-    cv = _make_cv(problem_kind, cv_folds)
+    cv = _make_cv(problem_kind, cv_folds, grouped=groups is not None)
     try:
         t0 = time.time()
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            cv_res = cross_validate(stack, X, y, cv=cv, scoring=scoring, n_jobs=1, error_score="raise")
+            cv_res = cross_validate(stack, X, y, cv=cv, groups=groups, scoring=scoring,
+                                    n_jobs=1, error_score="raise")
         elapsed = time.time() - t0
         metrics = {k.replace("test_", ""): float(np.mean(v)) for k, v in cv_res.items() if k.startswith("test_")}
         return ModelResult(

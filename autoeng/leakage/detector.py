@@ -148,6 +148,45 @@ def check_train_test_row_overlap(train_df: pd.DataFrame, test_df: pd.DataFrame) 
     return LeakageReport(flags=flags)
 
 
+def check_group_overlap(train_df: pd.DataFrame, test_df: pd.DataFrame, group_column: str | None) -> LeakageReport:
+    """
+    Flag entities whose rows appear on both sides of a split.
+
+    This is the leak `check_train_test_row_overlap` structurally cannot see:
+    the rows differ, so nothing is duplicated, but they describe the same
+    patient / customer / device. The model recognises the entity in the test
+    fold rather than generalising to it, and every metric inflates.
+    """
+    flags: list[LeakageFlag] = []
+    if not group_column or group_column not in train_df.columns or group_column not in test_df.columns:
+        return LeakageReport(flags=flags)
+
+    train_groups = set(train_df[group_column].dropna().unique())
+    test_groups = set(test_df[group_column].dropna().unique())
+    shared = train_groups & test_groups
+    if shared:
+        n_rows_affected = int(test_df[group_column].isin(shared).sum())
+        flags.append(LeakageFlag(
+            severity="critical",
+            kind="group_overlap",
+            columns=[group_column],
+            description=(
+                f"{len(shared)} of {len(test_groups)} '{group_column}' value(s) appear in both the "
+                f"train and test split, covering {n_rows_affected} test row(s). The rows are not "
+                "duplicates, so the row-overlap check cannot see this — but they describe the same "
+                "entity, and the model can recognise it rather than generalise to it."
+            ),
+            evidence={
+                "group_column": group_column,
+                "n_shared_groups": len(shared),
+                "n_test_groups": len(test_groups),
+                "n_affected_test_rows": n_rows_affected,
+                "examples": [str(g) for g in list(shared)[:5]],
+            },
+        ))
+    return LeakageReport(flags=flags)
+
+
 def check_temporal_split(train_df: pd.DataFrame, test_df: pd.DataFrame, time_column: str) -> LeakageReport:
     flags: list[LeakageFlag] = []
     try:

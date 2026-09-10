@@ -21,11 +21,11 @@ from typing import Any, Callable, Literal
 import numpy as np
 import optuna
 import pandas as pd
-from sklearn.model_selection import KFold, StratifiedKFold, cross_val_score
+from sklearn.model_selection import cross_val_score
 
 from autoeng.common.roles import FeatureRoleAssignment
 from autoeng.modeling.model_zoo import SCALE_SENSITIVE_MODELS, base_model_name
-from autoeng.modeling.search import _build_pipeline_for_model
+from autoeng.modeling.search import _build_pipeline_for_model, _make_cv
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
@@ -168,12 +168,15 @@ class HPOResult:
 
 
 def _make_scorer_and_cv(problem_kind: Literal["classification", "regression"], primary_metric: str,
-                         cv_folds: int, y: pd.Series):
+                         cv_folds: int, y: pd.Series, grouped: bool = False):
+    # Reuse search's splitter so tuning is scored under exactly the same folds
+    # the leaderboard used — including grouped ones. Tuning against row-wise
+    # folds while the leaderboard used grouped folds would compare an inflated
+    # tuned score with an honest untuned one, and tuning would "win" every time.
+    cv = _make_cv(problem_kind, cv_folds, grouped=grouped)
     if problem_kind == "classification":
-        cv = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=42)
         scoring = "roc_auc" if primary_metric == "roc_auc" else primary_metric
     else:
-        cv = KFold(n_splits=cv_folds, shuffle=True, random_state=42)
         scoring = "r2"
     return cv, scoring
 
@@ -182,7 +185,7 @@ def optimize_model(
     model_name: str, model_factory: Callable[[], Any], baseline_score: float,
     X: pd.DataFrame, y: pd.Series, roles: FeatureRoleAssignment,
     problem_kind: Literal["classification", "regression"], primary_metric: str,
-    cv_folds: int = 5, n_trials: int = 25, timeout_seconds: int = 120,
+    cv_folds: int = 5, n_trials: int = 25, timeout_seconds: int = 120, groups=None,
 ) -> HPOResult:
     # Base name, so a class_weight="balanced" twin is tuned over its original's
     # space instead of being reported as having none.
@@ -190,7 +193,8 @@ def optimize_model(
     if space_fn is None:
         return HPOResult(model_name=model_name, tuned=False, baseline_score=baseline_score, best_score=baseline_score)
 
-    cv, scoring = _make_scorer_and_cv(problem_kind, primary_metric, cv_folds, y)
+    cv, scoring = _make_scorer_and_cv(problem_kind, primary_metric, cv_folds, y,
+                                      grouped=groups is not None)
     trial_history: list[dict[str, Any]] = []
 
     def objective(trial: "optuna.trial.Trial") -> float:
@@ -204,7 +208,8 @@ def optimize_model(
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
-                scores = cross_val_score(pipe, X, y, cv=cv, scoring=scoring, n_jobs=1, error_score=np.nan)
+                scores = cross_val_score(pipe, X, y, cv=cv, groups=groups, scoring=scoring,
+                                         n_jobs=1, error_score=np.nan)
             score = float(np.nanmean(scores))
         except Exception:
             score = float("-inf")
@@ -236,7 +241,7 @@ def optimize_top_candidates(
     leaderboard_results, model_factories: dict[str, Callable[[], Any]],
     X: pd.DataFrame, y: pd.Series, roles: FeatureRoleAssignment,
     problem_kind: Literal["classification", "regression"], primary_metric: str,
-    top_n: int = 3, n_trials: int = 25,
+    top_n: int = 3, n_trials: int = 25, groups=None,
 ) -> list[HPOResult]:
     ok_results = sorted(
         [r for r in leaderboard_results if r.status == "ok"],
@@ -250,7 +255,7 @@ def optimize_top_candidates(
             continue
         outcome = optimize_model(
             r.name, factory, r.metrics.get(primary_metric, float("-inf")),
-            X, y, roles, problem_kind, primary_metric, n_trials=n_trials,
+            X, y, roles, problem_kind, primary_metric, n_trials=n_trials, groups=groups,
         )
         outcomes.append(outcome)
     return outcomes

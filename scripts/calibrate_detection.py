@@ -39,6 +39,10 @@ EXPECTATIONS = [
     # it. This is the clearest case in the harness for why detection needs all
     # three signals, so it is worth keeping even though it passes.
     ("synthetic_imbalanced.csv", "binary_classification", "is_fraud"),
+    # Repeated-entity case: 150 customers x 5 visits. Detection must pick the
+    # entity-level label over `home_region`, a balanced categorical that scores
+    # well on shape alone. Group detection itself is exercised by tests/test_groups.py.
+    ("synthetic_grouped.csv", "binary_classification", "converted"),
     ("real_iris_unlabeled.csv", "?", "?"),
 ]
 

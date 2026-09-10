@@ -36,7 +36,7 @@ from typing import Any, Literal
 import numpy as np
 import pandas as pd
 from sklearn.base import clone
-from sklearn.model_selection import StratifiedKFold, cross_val_predict
+from sklearn.model_selection import StratifiedGroupKFold, StratifiedKFold, cross_val_predict
 
 DEFAULT_THRESHOLD = 0.5
 DEFAULT_OBJECTIVE = "f1"
@@ -75,7 +75,8 @@ class ThresholdChoice:
         }
 
 
-def out_of_fold_probabilities(estimator, X: pd.DataFrame, y: pd.Series, cv_folds: int = 5) -> np.ndarray:
+def out_of_fold_probabilities(estimator, X: pd.DataFrame, y: pd.Series, cv_folds: int = 5,
+                               groups=None) -> np.ndarray:
     """
     Positive-class probabilities where every row is scored by a model that did
     not see it — the only predictions a threshold may be selected on.
@@ -84,9 +85,15 @@ def out_of_fold_probabilities(estimator, X: pd.DataFrame, y: pd.Series, cv_folds
     disturbed. Stratified folds keep rare positives present in every split,
     which matters far more here than in ordinary CV: with 29 positives across
     5 folds, an unstratified split can hand a fold zero of them.
+
+    With `groups`, folds are split by entity as well — a threshold tuned on
+    out-of-fold predictions that were themselves inflated by group leakage
+    would be tuned against the wrong probability distribution.
     """
-    cv = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=42)
-    proba = cross_val_predict(clone(estimator), X, y, cv=cv, method="predict_proba", n_jobs=1)
+    cv = (StratifiedGroupKFold(n_splits=cv_folds, shuffle=True, random_state=42) if groups is not None
+          else StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=42))
+    proba = cross_val_predict(clone(estimator), X, y, cv=cv, groups=groups,
+                              method="predict_proba", n_jobs=1)
     return np.asarray(proba)[:, 1]
 
 

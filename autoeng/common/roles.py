@@ -41,9 +41,10 @@ class FeatureRoleAssignment:
     high_card_categorical_columns: list[str]
     datetime_columns: list[str]
     text_columns: list[str]
-    excluded_columns: list[str]           # identifiers, constants, target, time axis
+    excluded_columns: list[str]           # identifiers, constants, target, time axis, group key
     target_column: str | None
     time_column: str | None
+    group_column: str | None = None
     reasoning: dict[str, str] = field(default_factory=dict)
 
     @property
@@ -68,6 +69,7 @@ def assign_feature_roles(
     profile: DatasetProfile,
     target_column: str | None,
     time_column: str | None = None,
+    group_column: str | None = None,
 ) -> FeatureRoleAssignment:
     numeric_cols, categorical_cols, datetime_cols, text_cols, excluded = [], [], [], [], []
     low_card_cols, high_card_cols = [], []
@@ -79,6 +81,17 @@ def assign_feature_roles(
             continue
         if name == time_column:
             reasoning[name] = "Excluded from the plain feature set: reserved as the time axis (decomposed separately)."
+            continue
+        if name == group_column:
+            # A group key identifies an entity, so as a feature it is an
+            # identifier — and target-encoding it against an entity-level label
+            # is about the most direct leak available.
+            excluded.append(name)
+            reasoning[name] = (
+                "Excluded: this is the grouping key used to keep an entity's rows on one "
+                "side of every split. As a feature it would identify the entity rather "
+                "than describe it."
+            )
             continue
         if col.is_constant:
             excluded.append(name)
@@ -121,5 +134,6 @@ def assign_feature_roles(
         excluded_columns=excluded,
         target_column=target_column,
         time_column=time_column,
+        group_column=group_column,
         reasoning=reasoning,
     )

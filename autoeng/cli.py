@@ -38,6 +38,25 @@ def main(argv: list[str] | None = None) -> int:
                        help="Override the inferred problem type. Usually unnecessary — supplying "
                             "--target alone lets the type be inferred from that column's shape.")
 
+    run_p.add_argument("--group-column", default=None,
+                       help="Treat this column as a repeated-entity key (patient, customer, device) "
+                            "and keep an entity's rows on one side of every split. Overrides "
+                            "auto-detection.")
+    run_p.add_argument("--no-groups", action="store_true",
+                       help="Disable group-aware splitting entirely and treat every row as "
+                            "independent, even if a repeated-entity key is detected.")
+    run_p.add_argument("--threshold-objective", default="f1",
+                       choices=["f1", "recall_at_precision", "expected_cost"],
+                       help="What the decision threshold optimises for binary classification. "
+                            "f1 is symmetric; the other two need you to say what a mistake costs.")
+    run_p.add_argument("--precision-floor", type=float, default=0.5,
+                       help="With --threshold-objective recall_at_precision: the minimum precision "
+                            "an operating point must reach.")
+    run_p.add_argument("--cost-false-negative", type=float, default=10.0,
+                       help="With --threshold-objective expected_cost: the price of a missed positive.")
+    run_p.add_argument("--cost-false-positive", type=float, default=1.0,
+                       help="With --threshold-objective expected_cost: the price of a false alarm.")
+
     ask_p = sub.add_parser("ask", help="Ask a question about a past run, grounded in its logged experiment history.")
     ask_p.add_argument("run_id")
     ask_p.add_argument("question")
@@ -53,10 +72,20 @@ def main(argv: list[str] | None = None) -> int:
             args.dataset_path, output_dir=args.output_dir, cv_folds=args.cv_folds,
             hpo_trials=args.hpo_trials, hpo_top_n=args.hpo_top_n,
             target_override=args.target, problem_type_override=args.problem_type,
+            group_column_override=args.group_column, use_groups=not args.no_groups,
+            threshold_objective=args.threshold_objective, precision_floor=args.precision_floor,
+            cost_false_negative=args.cost_false_negative,
+            cost_false_positive=args.cost_false_positive,
         )
         print(f"\nRun ID: {result.run_id}")
         print(f"Problem type: {result.problem_type} (target: {result.target_column})")
         print(f"Held-out metrics: {result.held_out_metrics}")
+        if result.group_decision and result.group_decision.get("column"):
+            print(f"Grouped by: {result.group_decision['column']} "
+                  f"({result.group_decision['source']})")
+        if result.decision_threshold:
+            print(f"Decision threshold: {result.decision_threshold['threshold']:.4f} "
+                  f"({result.decision_threshold['objective']})")
         print(f"Report written to: {result.report_path}")
         return 0
 

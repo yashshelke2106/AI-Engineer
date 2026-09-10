@@ -34,7 +34,9 @@ from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import KFold, StratifiedKFold, cross_validate, train_test_split
+from sklearn.model_selection import (
+    GroupKFold, KFold, StratifiedGroupKFold, StratifiedKFold, cross_validate, train_test_split,
+)
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
@@ -68,6 +70,10 @@ CLASSIFICATION_SCORING = {
     "f1_macro": "f1_macro",
 }
 REGRESSION_SCORING = {"r2": "r2", "neg_rmse": "neg_root_mean_squared_error", "neg_mae": "neg_mean_absolute_error"}
+
+# Grouped CV needs enough entities to fill every fold; below this a screening
+# subsample would leave folds with almost no groups.
+MIN_GROUPS_FOR_CV = 10
 
 TREE_LIKE_MODELS = {
     "random_forest", "extra_trees", "decision_tree", "gradient_boosting",
@@ -127,25 +133,57 @@ def _build_pipeline_for_model(name: str, model_factory, roles: FeatureRoleAssign
     return Pipeline(steps)
 
 
-def _make_cv(problem_kind: str, n_splits: int):
+def _make_cv(problem_kind: str, n_splits: int, grouped: bool = False):
+    """
+    Fold splitter. When `grouped`, whole entities move together so no entity is
+    ever scored by a model that trained on its other rows.
+
+    StratifiedGroupKFold cannot always honour both constraints exactly — it
+    balances classes as well as whole groups allow — which is the correct
+    trade: an approximately balanced fold is a nuisance, an entity spanning the
+    split is a leak.
+    """
+    if grouped:
+        if problem_kind == "classification":
+            return StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=42)
+        return GroupKFold(n_splits=n_splits, shuffle=True, random_state=42)
     if problem_kind == "classification":
         return StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
     return KFold(n_splits=n_splits, shuffle=True, random_state=42)
 
 
-def _subsample(X: pd.DataFrame, y: pd.Series, problem_kind: str, n_rows: int):
+def _subsample(X: pd.DataFrame, y: pd.Series, problem_kind: str, n_rows: int, groups=None):
+    """
+    Take a screening subsample.
+
+    With groups, sample whole ENTITIES rather than rows: a row-wise subsample
+    would scatter an entity's rows across the screening folds and reintroduce
+    exactly the leakage grouping exists to prevent — at the stage that decides
+    which candidates survive.
+    """
     if len(X) <= n_rows:
-        return X, y
-    stratify = y if problem_kind == "classification" and y.value_counts().min() >= 2 else None
-    X_small, _, y_small, _ = train_test_split(
-        X, y, train_size=n_rows, random_state=42, stratify=stratify,
-    )
-    return X_small, y_small
+        return X, y, groups
+
+    if groups is None:
+        stratify = y if problem_kind == "classification" and y.value_counts().min() >= 2 else None
+        X_small, _, y_small, _ = train_test_split(
+            X, y, train_size=n_rows, random_state=42, stratify=stratify,
+        )
+        return X_small, y_small, None
+
+    groups = np.asarray(groups)
+    unique = pd.unique(groups)
+    rng = np.random.default_rng(42)
+    keep_fraction = n_rows / len(X)
+    n_keep = max(int(round(len(unique) * keep_fraction)), MIN_GROUPS_FOR_CV)
+    keep = set(rng.choice(unique, size=min(n_keep, len(unique)), replace=False).tolist())
+    mask = np.array([g in keep for g in groups])
+    return X[mask], y[mask], groups[mask]
 
 
 def _evaluate_candidate(name: str, factory, roles: FeatureRoleAssignment, problem_kind: str,
                          X: pd.DataFrame, y: pd.Series, cv, scoring: dict[str, str],
-                         stage: str) -> ModelResult:
+                         stage: str, groups=None) -> ModelResult:
     limit = SLOW_MODEL_ROW_LIMIT.get(base_model_name(name))
     if limit and len(X) > limit:
         return ModelResult(name=name, status="skipped", evaluation_stage=stage,
@@ -155,7 +193,8 @@ def _evaluate_candidate(name: str, factory, roles: FeatureRoleAssignment, proble
         t0 = time.time()
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            cv_res = cross_validate(pipe, X, y, cv=cv, scoring=scoring, n_jobs=1, error_score="raise")
+            cv_res = cross_validate(pipe, X, y, cv=cv, groups=groups, scoring=scoring,
+                                    n_jobs=1, error_score="raise")
         elapsed = time.time() - t0
         metrics = {k.replace("test_", ""): float(np.mean(v)) for k, v in cv_res.items() if k.startswith("test_")}
         return ModelResult(name=name, status="ok", metrics=metrics, fit_time_seconds=elapsed,
@@ -168,27 +207,29 @@ def _evaluate_candidate(name: str, factory, roles: FeatureRoleAssignment, proble
 def _run_search(
     X: pd.DataFrame, y: pd.Series, roles: FeatureRoleAssignment, problem_kind: str,
     models: dict[str, Any], scoring: dict[str, str], primary_metric: str,
-    cv_folds: int, budget: Literal["auto", "full"],
+    cv_folds: int, budget: Literal["auto", "full"], groups=None,
 ) -> Leaderboard:
     use_halving = budget == "auto" and len(X) > HALVING_MIN_ROWS
-    full_cv = _make_cv(problem_kind, cv_folds)
+    grouped = groups is not None
+    full_cv = _make_cv(problem_kind, cv_folds, grouped=grouped)
 
     if not use_halving:
         note = (f"Full {cv_folds}-fold CV on all {len(models)} candidates "
                 f"({len(X)} rows — below the {HALVING_MIN_ROWS}-row halving threshold).")
         results = [
-            _evaluate_candidate(name, factory, roles, problem_kind, X, y, full_cv, scoring, "full")
+            _evaluate_candidate(name, factory, roles, problem_kind, X, y, full_cv, scoring,
+                                 "full", groups=groups)
             for name, factory in models.items()
         ]
         return Leaderboard(problem_kind=problem_kind, primary_metric=primary_metric,
                            results=results, budget_note=note)
 
     # Stage 1 — cheap screen of everything.
-    X_screen, y_screen = _subsample(X, y, problem_kind, SCREENING_ROWS)
-    screen_cv = _make_cv(problem_kind, SCREENING_FOLDS)
+    X_screen, y_screen, groups_screen = _subsample(X, y, problem_kind, SCREENING_ROWS, groups)
+    screen_cv = _make_cv(problem_kind, SCREENING_FOLDS, grouped=grouped)
     screened = {
         name: _evaluate_candidate(name, factory, roles, problem_kind, X_screen, y_screen,
-                                   screen_cv, scoring, "screening")
+                                   screen_cv, scoring, "screening", groups=groups_screen)
         for name, factory in models.items()
     }
 
@@ -203,7 +244,7 @@ def _run_search(
     for name, factory in models.items():
         if name in survivors:
             promoted = _evaluate_candidate(name, factory, roles, problem_kind, X, y,
-                                            full_cv, scoring, "full")
+                                            full_cv, scoring, "full", groups=groups)
             promoted.fit_time_seconds += screened[name].fit_time_seconds
             results.append(promoted)
             continue
@@ -229,17 +270,19 @@ def _run_search(
 
 def run_classification_search(
     X: pd.DataFrame, y: pd.Series, roles: FeatureRoleAssignment,
-    n_classes: int, cv_folds: int = 5, budget: Literal["auto", "full"] = "auto",
+    n_classes: int, cv_folds: int = 5, budget: Literal["auto", "full"] = "auto", groups=None,
 ) -> Leaderboard:
     models = get_classification_models(n_classes=n_classes)
     primary_metric = "roc_auc" if n_classes == 2 else "f1_macro"
     scoring = CLASSIFICATION_SCORING if n_classes == 2 else {"accuracy": "accuracy", "f1_macro": "f1_macro"}
-    return _run_search(X, y, roles, "classification", models, scoring, primary_metric, cv_folds, budget)
+    return _run_search(X, y, roles, "classification", models, scoring, primary_metric,
+                       cv_folds, budget, groups=groups)
 
 
 def run_regression_search(
     X: pd.DataFrame, y: pd.Series, roles: FeatureRoleAssignment, cv_folds: int = 5,
-    budget: Literal["auto", "full"] = "auto",
+    budget: Literal["auto", "full"] = "auto", groups=None,
 ) -> Leaderboard:
     models = get_regression_models()
-    return _run_search(X, y, roles, "regression", models, REGRESSION_SCORING, "r2", cv_folds, budget)
+    return _run_search(X, y, roles, "regression", models, REGRESSION_SCORING, "r2",
+                       cv_folds, budget, groups=groups)

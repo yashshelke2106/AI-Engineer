@@ -27,7 +27,7 @@ T1-4 and T1-5, and still should if any of this is revisited.
 ## Tier 0 — Blockers
 
 All three confirmed absent by grepping the codebase, not assumed.
-**T0-1 and T0-2 are now done; start at T0-3.**
+**Tier 0 is complete; start at T1-1.**
 
 ### ~~T0-1 · Persist the trained model and its schema~~ — **DONE**
 
@@ -101,24 +101,43 @@ be read as precise. The out-of-fold selection uses all 23 training positives
 and is the sounder number. A dataset this rare wants repeated CV or a larger
 holdout; neither is in place.
 
-### T0-3 · Group-aware splitting and group leakage (~180 lines, 4 tests) — **NEXT**
+### ~~T0-3 · Group-aware splitting and group leakage~~ — **DONE**
 
-**Why:** no `GroupKFold`/`StratifiedGroupKFold` anywhere. Datasets with
-repeated entities (several visits per patient, sessions per user, readings per
-device) currently split one entity's rows across train and test. The duplicate-
-row check won't catch it — the rows genuinely differ. Every metric inflates and
-the leakage scan sees nothing.
+Built in `autoeng/detection/group_detector.py`. `groups` is threaded through
+every split in the run: the held-out partition, model-search folds (including
+the halving screen, which subsamples whole entities), HPO folds, the stacked
+ensemble, and the threshold selector's out-of-fold predictions.
 
-- **Build:** detect candidate group keys in the profiler (values repeating a
-  consistent number of times; cardinality high but well below row count —
-  identifier-shaped but *not* unique). Use `StratifiedGroupKFold` /
-  `GroupKFold` when found, thread `groups` through search and HPO CV, add a
-  `group_overlap` leakage flag.
-- **Escape hatch:** `--group-column` / `--no-groups`, same reasoning as
-  `--target`.
-- **Done when:** a fixture with 5 rows per customer and customer-level signal
-  shows a materially lower AUC under grouped CV than plain K-fold — that gap is
-  the leakage — and the detector flags it.
+**Measured on `data/synthetic_grouped.csv` (150 customers x 5 visits), through
+the real pipeline:**
+
+| | best CV ROC-AUC | held-out ROC-AUC | `group_overlap` |
+|---|---|---|---|
+| grouped (default) | 0.651 | 0.730 | none |
+| `--no-groups` | **1.000** | **1.000** | CRITICAL, 96/96 customers span the split |
+
+That perfect score is the failure mode this item removes.
+
+- **What actually makes it exploitable.** An entity-level label alone is not
+  enough — with only noisy per-visit readings the gap is about 0.06. It takes a
+  *stable per-entity attribute* (`device_fingerprint` in the fixture: constant
+  per customer, causes nothing) for the model to recognise who a row belongs
+  to. That is what real entity data carries, and it is what turns a shared
+  label into memorisation.
+- **The group key is excluded from features.** It identifies the entity rather
+  than describing it, and target-encoding a customer id against a
+  customer-level label is the most direct leak available.
+- **Disabling grouping does not disable the warning.** `--no-groups` still runs
+  detection and still flags the overlap. An earlier version returned
+  `column=None` immediately, which meant the flag went silent exactly when it
+  mattered most — the run above would have reported ROC-AUC 1.000 with nothing
+  said. `GroupDecision` now carries `column` (what splitting uses) and
+  `detected_column` (what was found) separately for this reason.
+- **False positives are the real risk**, not misses: grouping on an ordinary
+  categorical holds out a slice of the feature space per fold. `home_region`
+  (5 values, perfectly consistent sizes) is a deliberate decoy in the fixture
+  and must be rejected — the group-count floor is what separates the two.
+- **Escape hatches:** `--group-column`, `--no-groups`.
 
 ---
 
@@ -245,13 +264,14 @@ Roughly 2,300 lines and 40 tests across all fourteen items; Tier 0 alone is
 about 530 lines and closes the gap between what the report claims and what the
 model does.
 
-Current state: 79 tests passing, 9/9 on unambiguous problem-type detection,
+Current state: 91 tests passing, 10/10 on unambiguous problem-type detection,
 7.4× search speedup from successive halving. The trained model is persisted
 with its schema (T0-1) and the decision threshold is selected out-of-fold,
-saved into that schema, and reported beside the ranking metrics (T0-2). The
-remaining Tier 0 gap is group-aware splitting (T0-3).
+saved into that schema, and reported beside the ranking metrics (T0-2), and
+every split is entity-aware where a repeated-entity key exists (T0-3).
+**Tier 0 is complete.**
 
-**T0-1 and T0-2 front-loaded work for later items.** The reference
+**Tier 0 front-loaded work for later items.** The reference
 distributions T1-3 needs are already captured; T1-1 has a column contract to
 validate against *and* a threshold to apply at serving time. None of it should
 be rebuilt.

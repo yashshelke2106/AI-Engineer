@@ -40,6 +40,7 @@ def generate_report(
     model_artifact: dict[str, Any] | None = None,
     threshold_choice: dict[str, Any] | None = None,
     held_out_operating_point: dict[str, Any] | None = None,
+    group_decision: dict[str, Any] | None = None,
 ) -> str:
     chosen = problem_decision["chosen"]
     lines: list[str] = []
@@ -85,6 +86,29 @@ def generate_report(
     lines.append(f"- Datetime features (decomposed): {role_assignment['datetime_columns'] or '(none)'}")
     lines.append(f"- Text features (length/word-count stats): {role_assignment['text_columns'] or '(none)'}")
     lines.append(f"- Excluded (identifiers/constants): {role_assignment['excluded_columns'] or '(none)'}\n")
+
+    if group_decision:
+        lines.append("### Grouping (repeated entities)\n")
+        if group_decision.get("column"):
+            lines.append(
+                f"Rows are grouped by `{group_decision['column']}` "
+                f"(source: {group_decision.get('source', 'auto-detected')}, "
+                f"confidence {group_decision.get('confidence', 0):.2f}). Every split - the held-out "
+                f"partition, model-search folds, tuning folds and the threshold's out-of-fold "
+                f"predictions - keeps an entity's rows on one side.\n"
+            )
+        else:
+            lines.append("Rows are treated as independent; no repeated-entity key was found.\n")
+        lines.extend(f"- {r}" for r in group_decision.get("reasoning", []))
+        others = [c for c in group_decision.get("candidates", [])
+                  if c["column"] != group_decision.get("column")]
+        if others:
+            lines.append("\n**Other columns considered:**")
+            lines.extend(
+                f"- `{c['column']}` - {c['n_groups']} groups, {c['mean_group_size']} rows each "
+                f"(score {c['score']:.2f})" for c in others
+            )
+        lines.append("")
 
     lines.append("## 4. Pre-Training Leakage Scan\n")
     lines.append(_fmt_flag_list(pre_training_leakage["flags"]) if pre_training_leakage else "Not applicable for this problem type.\n")

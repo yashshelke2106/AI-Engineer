@@ -409,7 +409,7 @@ def save_model(
     model_path = model_dir / MODEL_FILENAME
     joblib.dump(estimator, model_path)
     schema_path = model_dir / SCHEMA_FILENAME
-    schema_path.write_text(json.dumps(schema, indent=2, default=str))
+    schema_path.write_text(json.dumps(schema, indent=2, default=str), encoding="utf-8")
 
     mlflow_dir, export_error = (None, None)
     if write_mlflow_model:
@@ -453,7 +453,7 @@ def check_library_versions(recorded: dict[str, str]) -> list[str]:
 
 
 def load_training_schema(schema_path: str | Path) -> dict[str, Any]:
-    return json.loads(Path(schema_path).read_text())
+    return json.loads(Path(schema_path).read_text(encoding="utf-8"))
 
 
 def load_model(model_path: str | Path, schema_path: str | Path | None = None) -> LoadedModel:

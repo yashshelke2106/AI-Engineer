@@ -14,11 +14,11 @@ everything to MLflow, and writes a report.
 python -m autoeng.cli run data/any.csv          # infer everything
 python -m autoeng.cli run data.csv --target y   # or pin the target
 python -m autoeng.cli ask <run_id> "why did you reject random_forest?"
-pytest tests/ -q                                # 79 tests, ~105s
-python scripts/calibrate_detection.py           # detection accuracy, 9/9 expected
+pytest tests/ -q                                # 91 tests, ~75s
+python scripts/calibrate_detection.py           # detection accuracy, 10/10 expected
 ```
 
-`ROADMAP.md` has the prioritised remaining work. **Start at T0-3.**
+`ROADMAP.md` has the prioritised remaining work. **Tier 0 is done; start at T1-1.**
 
 ## Invariants — do not break these
 
@@ -78,7 +78,22 @@ The ordinary winner is a `Pipeline`; the stacked ensemble is a bare
 `autoeng/registry/` may reach for `.named_steps` or assume `.steps` exists.
 Both shapes are pinned by round-trip tests for this reason.
 
-**8. No STL-as-features on the full series.**
+**8. Groups, when detected, apply to EVERY split.**
+Held-out partition, search folds, the halving screen's subsample (which samples
+whole entities, not rows), HPO folds, the stack, and the threshold selector's
+out-of-fold predictions. A single ungrouped split anywhere reintroduces the
+whole leak — and it will look like an improvement, not a bug. The group key is
+also excluded from features: it identifies the entity rather than describing
+it. Measured on `data/synthetic_grouped.csv`: 1.000 ROC-AUC ungrouped against
+0.730 grouped.
+
+**8a. Turning a safety check off must not turn its warning off.**
+`--no-groups` still runs detection and still raises the `group_overlap` flag.
+An earlier version returned early with `column=None`, so the flag went silent
+exactly when it mattered. `GroupDecision.column` is what splitting uses;
+`GroupDecision.detected_column` is what was found. Read the right one.
+
+**9. No STL-as-features on the full series.**
 Fitting STL on the whole series and using its components at time *t* leaks the
 future into the past. It was deliberately refused. The correct version re-fits
 inside each fold (T2-2).
@@ -112,6 +127,11 @@ inside each fold (T2-2).
   default. `model_store.py` passes `SERIALIZATION_FORMAT_CLOUDPICKLE`. The
   export reports failure rather than raising, so it went *silently* missing
   until a test asserted the `MLmodel` file exists — keep that test.
+- **`Path.write_text()` / `read_text()` default to cp1252 on Windows**, not
+  UTF-8. Reports contain em dashes, so every report written on Windows was
+  silently mis-encoded and unreadable by a UTF-8 reader. Every text I/O call in
+  `autoeng/` now passes `encoding="utf-8"` explicitly — keep it that way, and
+  do the same in any script that rewrites source files.
 - **Model-store failures are reported, not raised.** A serialization problem
   must not discard a completed leaderboard, HPO sweep and explanation. But the
   report then says the model was *not* persisted, with the error. Never
@@ -130,6 +150,7 @@ autoeng/
   common/       associations.py, roles.py (single source of truth for column roles)
   leakage/      pre- and post-training detection
   modeling/     model_zoo, search (halving), hpo, ensemble, threshold, clustering, time_series
+  detection/    + group_detector.py (repeated-entity keys)
   explain/      explainer.py (SHAP/permutation), qa.py (grounded Q&A over MLflow)
   registry/     model_store.py — fitted model + training_schema.json (T0-1)
   tracking/     MLflow logging + querying
@@ -145,14 +166,14 @@ autoeng/
   something asserted the right answer.
 - **Tune thresholds against measurements, not intuition.** Detection constants
   were calibrated by running `scripts/calibrate_detection.py` across nine
-  datasets. If you change scoring weights, re-run it; 9/9 is the bar.
+  datasets. If you change scoring weights, re-run it; 10/10 is the bar.
 - One bad candidate must never take down a search — catch per candidate, record
   the exception on the result, continue.
 - Comments explain *why*, especially where a non-obvious choice prevents a bug.
 
 ## Current state
 
-79 tests passing. Detection 9/9 on unambiguous cases (iris is genuinely
+91 tests passing. Detection 10/10 on unambiguous cases (iris is genuinely
 ambiguous and excluded). Successive halving gives 7.4× speedup with an
 identical winner.
 
@@ -177,6 +198,8 @@ domain knowledge the system cannot infer. Do not "fix" this by making an
 asymmetric objective the default — that is the system inventing a cost
 structure nobody gave it.
 
-One Tier 0 hole remains: **no group-aware splitting** (T0-3). Datasets with
-repeated entities split one entity's rows across train and test, inflating
-every metric, and the duplicate-row check cannot see it. Start there.
+**T0-3 is done:** repeated-entity keys are detected, excluded from features,
+and honoured by every split. See invariants 8 and 8a.
+
+**Tier 0 is complete.** Next is T1-1 (serving API), which consumes the T0-1
+schema for payload validation and the T0-2 threshold at prediction time.

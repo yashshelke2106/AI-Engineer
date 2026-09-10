@@ -106,6 +106,62 @@ def imbalanced_classification_df() -> pd.DataFrame:
 
 
 @pytest.fixture
+def grouped_leakage_df() -> pd.DataFrame:
+    """
+    750 rows, 150 customers, 5 visits each — the shape that makes plain K-fold
+    lie. Measured through the project's own pipeline: **ROC-AUC 0.976 under
+    row-wise K-fold, 0.682 under GroupKFold.** That 0.29 is the leak.
+
+    The label is decided at the CUSTOMER level, so a customer's five rows carry
+    an identical answer. Split by row and the model sees four of them in
+    training and is asked about the fifth.
+
+    **The stable per-customer attributes are what make that exploitable, and
+    they are the part worth understanding.** An entity-level label alone is not
+    enough: with only noisy per-visit readings the gap is around 0.06, because
+    nothing tells the model which rows belong together. `device_fingerprint`
+    and `home_region` are constant per customer and do not cause the outcome at
+    all — they identify who the row belongs to. That is what converts an
+    entity-level label into memorisation, and it is exactly what real entity
+    data carries: device ids, demographics, account attributes, home location.
+
+    The duplicate-row check cannot see any of this — the rows genuinely differ.
+    What is shared is the entity, and nothing in the pipeline knew entities
+    existed.
+
+    `home_region` is also a deliberate decoy for the group detector: it repeats
+    consistently, but with only 5 distinct values it is an ordinary categorical
+    and must be rejected. Grouping on it would hold out a fifth of the feature
+    space per fold.
+
+    The label is only *partly* determined by the trait (Bernoulli on a logistic
+    of it), so the honest ceiling stays modest and the memorisation gap stays
+    wide.
+    """
+    rng = np.random.default_rng(7)
+    n_customers, visits = 150, 5
+
+    trait = rng.normal(0, 1, n_customers)          # drives the outcome
+    fingerprint = rng.normal(0, 1, n_customers)    # identifies the customer, causes nothing
+    home_region = rng.choice(["north", "south", "east", "west", "central"], n_customers)
+    converted = (rng.uniform(0, 1, n_customers) < 1 / (1 + np.exp(-1.0 * trait))).astype(int)
+
+    rows = []
+    for c in range(n_customers):
+        for v in range(visits):
+            rows.append({
+                "customer_id": f"C{c:04d}",
+                "home_region": home_region[c],
+                "device_fingerprint": round(fingerprint[c] + rng.normal(0, 0.01), 4),
+                "measure_a": round(trait[c] + rng.normal(0, 0.01), 4),
+                "measure_b": round(trait[c] * 0.4 + rng.normal(0, 0.9), 4),
+                "measure_c": round(rng.normal(0, 1.0), 4),
+                "converted": int(converted[c]),
+            })
+    return pd.DataFrame(rows)
+
+
+@pytest.fixture
 def sorted_by_class_df() -> pd.DataFrame:
     """Rows sorted by class — the shape that breaks unshuffled K-fold screening."""
     rng = np.random.default_rng(3)

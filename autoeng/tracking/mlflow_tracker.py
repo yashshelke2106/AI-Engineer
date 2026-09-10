@@ -28,7 +28,7 @@ DEFAULT_EXPERIMENT = "autonomous_ml_engineer"
 def _log_dict_artifact(payload: dict[str, Any], filename: str) -> None:
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / filename
-        path.write_text(json.dumps(payload, indent=2, default=str))
+        path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
         mlflow.log_artifact(str(path))
 
 
@@ -49,6 +49,7 @@ def log_pipeline_run(
     final_report_text: str,
     model_artifact: dict[str, Any] | None = None,
     decision_threshold: dict[str, Any] | None = None,
+    group_decision: dict[str, Any] | None = None,
 ) -> str:
     mlflow.set_tracking_uri(tracking_uri)
     mlflow.set_experiment(DEFAULT_EXPERIMENT)
@@ -96,6 +97,10 @@ def log_pipeline_run(
         _log_dict_artifact(post_training_leakage, "post_training_leakage_report.json")
         _log_dict_artifact(explanation, "model_explanation.json")
 
+        if group_decision:
+            _log_dict_artifact(group_decision, "group_decision.json")
+            mlflow.set_tag("group_column", group_decision.get("column") or "none")
+
         if decision_threshold:
             _log_dict_artifact(decision_threshold, "decision_threshold.json")
             selected = decision_threshold.get("selected") or {}
@@ -126,7 +131,7 @@ def log_pipeline_run(
 
         with tempfile.TemporaryDirectory() as tmp:
             report_path = Path(tmp) / "human_readable_report.md"
-            report_path.write_text(final_report_text)
+            report_path.write_text(final_report_text, encoding="utf-8")
             mlflow.log_artifact(str(report_path))
 
         return run.info.run_id
@@ -160,7 +165,7 @@ def get_run_artifact(tracking_uri: str, run_id: str, artifact_name: str) -> dict
             local_path = client.download_artifacts(run_id, artifact_name, tmp)
         except Exception:
             return None
-        text = Path(local_path).read_text()
+        text = Path(local_path).read_text(encoding="utf-8")
         if artifact_name.endswith(".json"):
             return json.loads(text)
         return text
