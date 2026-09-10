@@ -245,7 +245,7 @@ Roughly 2,300 lines and 40 tests across all fourteen items; Tier 0 alone is
 about 530 lines and closes the gap between what the report claims and what the
 model does.
 
-Current state: 79 tests passing, 8/8 on unambiguous problem-type detection,
+Current state: 79 tests passing, 9/9 on unambiguous problem-type detection,
 7.4× search speedup from successive halving. The trained model is persisted
 with its schema (T0-1) and the decision threshold is selected out-of-fold,
 saved into that schema, and reported beside the ranking metrics (T0-2). The

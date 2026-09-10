@@ -108,8 +108,16 @@ confidence floor alone, and a dataset with opaque names works exactly as
 before on the other two signals.
 
 Detection accuracy is measured, not asserted — `scripts/calibrate_detection.py`
-scores detection against human-intent answers on all nine datasets: **8/8 on
+scores detection against human-intent answers on all ten datasets: **9/9 on
 the unambiguous cases, 1 genuinely ambiguous.**
+
+The sharpest case for needing all three signals is the 3.9%-positive fraud
+dataset. Shape alone gets it **wrong**: the entropy/balance term ranks
+`is_fraud` fourth (0.54), behind `region` (0.98) and `device_type` (0.88),
+because a 96/4 split looks degenerate next to a balanced categorical.
+Fit-and-check and the name prior overrule it — `region` is balanced noise and
+`is_fraud` is both predictable and named like a label — and detection lands on
+the right column with 0.88 confidence.
 
 ## Findings from testing
 

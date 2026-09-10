@@ -15,7 +15,7 @@ python -m autoeng.cli run data/any.csv          # infer everything
 python -m autoeng.cli run data.csv --target y   # or pin the target
 python -m autoeng.cli ask <run_id> "why did you reject random_forest?"
 pytest tests/ -q                                # 79 tests, ~105s
-python scripts/calibrate_detection.py           # detection accuracy, 8/8 expected
+python scripts/calibrate_detection.py           # detection accuracy, 9/9 expected
 ```
 
 `ROADMAP.md` has the prioritised remaining work. **Start at T0-3.**
@@ -145,14 +145,14 @@ autoeng/
   something asserted the right answer.
 - **Tune thresholds against measurements, not intuition.** Detection constants
   were calibrated by running `scripts/calibrate_detection.py` across nine
-  datasets. If you change scoring weights, re-run it; 8/8 is the bar.
+  datasets. If you change scoring weights, re-run it; 9/9 is the bar.
 - One bad candidate must never take down a search — catch per candidate, record
   the exception on the result, continue.
 - Comments explain *why*, especially where a non-obvious choice prevents a bug.
 
 ## Current state
 
-79 tests passing. Detection 8/8 on unambiguous cases (iris is genuinely
+79 tests passing. Detection 9/9 on unambiguous cases (iris is genuinely
 ambiguous and excluded). Successive halving gives 7.4× speedup with an
 identical winner.
 

@@ -32,6 +32,13 @@ EXPECTATIONS = [
     ("real_wine.csv", "multiclass_classification", "target"),
     ("real_diabetes.csv", "regression", "target"),
     ("real_co2_timeseries.csv", "time_series_forecasting", "co2_ppm"),
+    # Rare-positive case (3.9%). The shape signal alone gets this WRONG — the
+    # entropy/balance term in _score_target_candidate ranks `is_fraud` fourth,
+    # behind `region` and `device_type`, because a 96/4 split looks degenerate
+    # next to a balanced categorical. Fit-and-check and the name prior overrule
+    # it. This is the clearest case in the harness for why detection needs all
+    # three signals, so it is worth keeping even though it passes.
+    ("synthetic_imbalanced.csv", "binary_classification", "is_fraud"),
     ("real_iris_unlabeled.csv", "?", "?"),
 ]
 
