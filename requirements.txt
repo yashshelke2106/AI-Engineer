@@ -1,14 +1,38 @@
-pandas>=2.2
-numpy>=1.26
-scikit-learn>=1.5
-scipy>=1.13
-xgboost>=2.0
-lightgbm>=4.3
-catboost>=1.2
-optuna>=3.6
-mlflow>=2.14
-shap>=0.45
-statsmodels>=0.14
-category_encoders>=2.6
-pyarrow>=16.0
-joblib>=1.4
+# Exact pins, deliberately.
+#
+# This project writes a pickled estimator to disk (autoeng/registry/) and
+# records the versions it was fit under in training_schema.json, warning on
+# mismatch at load. Range constraints make that warning meaningless: two
+# machines both satisfying `numpy>=1.26` can install 1.26 and 2.2, and every
+# artifact one produces warns against the other for no real reason. A warning
+# that fires constantly is a warning nobody reads.
+#
+# It is not hypothetical. During development `pip install mlflow` silently
+# lifted numpy from 1.26.4 to 2.2.6 mid-session; both satisfied the old
+# `numpy>=1.26` line.
+#
+# These are the versions the 91-test suite passes on. To move one, change it
+# here, run `pytest tests/ -q` and `python scripts/calibrate_detection.py`
+# (10/10 is the bar), and commit the pin with the result.
+
+pandas==2.3.3
+numpy==2.2.6
+scikit-learn==1.8.0
+scipy==1.14.1
+
+# Gradient boosting implementations. Each contributes candidates to the zoo and
+# is optional at import time (see model_zoo.py) but expected in a full install.
+xgboost==3.2.0
+lightgbm==4.6.0
+catboost==1.2.8
+
+optuna==4.9.0
+mlflow==3.16.0
+shap==0.52.0
+statsmodels==0.14.6
+category_encoders==2.10.0
+pyarrow==23.0.1
+joblib==1.5.3
+# Used explicitly: MLflow's default sklearn format (skops) refuses this
+# project's custom transformers, so model export pins cloudpickle instead.
+cloudpickle==3.1.2

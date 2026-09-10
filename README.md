@@ -13,14 +13,15 @@ spec shallowly. See [Scope](#scope--whats-not-here).
 ## Quickstart
 
 ```bash
-pip install -r requirements.txt
+python -m venv .venv && .venv/Scripts/activate    # Windows; use .venv/bin/activate elsewhere
+pip install -r requirements-dev.txt               # runtime pins + pytest
 
 python -m autoeng.cli run path/to/any_dataset.csv          # infer everything
 python -m autoeng.cli run data.csv --target revenue        # or tell it the target
 python -m autoeng.cli ask <run_id> "why did you reject random_forest?"
 python -m autoeng.cli list-runs
 
-pytest tests/ -q                                           # 91 tests, ~75s
+pytest tests/ -q                                           # 94 tests, ~80s
 python scripts/calibrate_detection.py                      # detection accuracy harness
 ```
 
@@ -265,7 +266,7 @@ autoeng/
   reporting/       Markdown report generation
   pipeline.py      end-to-end orchestration
   cli.py           command-line entry point
-tests/             91 tests: planted leaks, regressions for every shipped bug, unit tests
+tests/             94 tests: planted leaks, regressions for every shipped bug, unit tests
 scripts/           detection calibration harness
 data/              synthetic + real validation datasets
 runs/              reports + MLflow store from the validation runs

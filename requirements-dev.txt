@@ -1,0 +1,5 @@
+# Development-only. Kept out of requirements.txt so a serving install does not
+# pull a test runner into the deployment image.
+-r requirements.txt
+
+pytest==9.0.3

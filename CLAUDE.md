@@ -14,7 +14,7 @@ everything to MLflow, and writes a report.
 python -m autoeng.cli run data/any.csv          # infer everything
 python -m autoeng.cli run data.csv --target y   # or pin the target
 python -m autoeng.cli ask <run_id> "why did you reject random_forest?"
-pytest tests/ -q                                # 91 tests, ~75s
+pytest tests/ -q                                # 94 tests, ~80s
 python scripts/calibrate_detection.py           # detection accuracy, 10/10 expected
 ```
 
@@ -132,6 +132,12 @@ inside each fold (T2-2).
   silently mis-encoded and unreadable by a UTF-8 reader. Every text I/O call in
   `autoeng/` now passes `encoding="utf-8"` explicitly — keep it that way, and
   do the same in any script that rewrites source files.
+- **Dependencies are pinned exactly, and that is load-bearing.** T0-1 records
+  library versions in every artifact and warns on mismatch at load; range
+  constraints make that warning fire between two legitimate installs and so
+  train people to ignore it. `pip install mlflow` once lifted numpy from
+  1.26.4 to 2.2.6 mid-session under the old `numpy>=1.26`. To move a pin:
+  change it, run the suite and `calibrate_detection.py`, commit the result.
 - **Model-store failures are reported, not raised.** A serialization problem
   must not discard a completed leaderboard, HPO sweep and explanation. But the
   report then says the model was *not* persisted, with the error. Never
@@ -173,7 +179,7 @@ autoeng/
 
 ## Current state
 
-91 tests passing. Detection 10/10 on unambiguous cases (iris is genuinely
+94 tests passing. Detection 10/10 on unambiguous cases (iris is genuinely
 ambiguous and excluded). Successive halving gives 7.4× speedup with an
 identical winner.
 

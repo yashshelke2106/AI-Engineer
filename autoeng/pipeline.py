@@ -193,6 +193,35 @@ def _regression_metric_from_r2(pipeline, X_test, y_test) -> dict[str, float]:
     }
 
 
+class NoViableModelError(RuntimeError):
+    """
+    Every candidate failed, so there is no model to fit.
+
+    Raised instead of letting `factories[None]` produce a bare `KeyError: None`,
+    which discards the only useful information available: each candidate
+    recorded its own exception on the leaderboard, and those errors ARE the
+    explanation. A total search failure is rare, but it is exactly when the
+    reason matters most.
+    """
+
+    @classmethod
+    def from_leaderboard(cls, leaderboard) -> "NoViableModelError":
+        reasons = [
+            f"  - {r.name} ({r.status}): {r.error}"
+            for r in leaderboard.results if r.error
+        ]
+        joined = '\n'.join(reasons[:10])
+        detail = ('\n' + joined) if reasons else (
+            " No candidates were evaluated at all — the model zoo produced nothing "
+            "to try, which usually means the feature set was empty after role assignment."
+        )
+        return cls(
+            f"No model could be fitted: all {len(leaderboard.results)} candidates failed, "
+            f"and neither hyperparameter tuning nor the stacked ensemble produced a usable "
+            f"alternative.{detail}"
+        )
+
+
 def _select_final_model(ranked, hpo_outcomes, stack_result, primary_metric: str):
     """
     Pick the single best option across three sources, all scored on the same
@@ -363,6 +392,8 @@ def run_pipeline(
         final_name, final_params, final_source, _, hpo_improvement = _select_final_model(
             ranked, hpo_outcomes, stack_result, leaderboard.primary_metric,
         )
+        if final_name is None:
+            raise NoViableModelError.from_leaderboard(leaderboard)
         if final_name == STACK_MODEL_NAME:
             final_pipeline = stack_result.pipeline
         else:
@@ -444,6 +475,8 @@ def run_pipeline(
         final_name, final_params, final_source, _, hpo_improvement = _select_final_model(
             ranked, hpo_outcomes, stack_result, leaderboard.primary_metric,
         )
+        if final_name is None:
+            raise NoViableModelError.from_leaderboard(leaderboard)
         if final_name == STACK_MODEL_NAME:
             final_pipeline = stack_result.pipeline
         else:
