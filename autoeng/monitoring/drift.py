@@ -35,11 +35,18 @@ stays quiet, and that is the correct behaviour, not a bug.
 ## Two honest limitations
 
 *The KS test is approximate here.* A proper two-sample KS needs the training
-sample, and what T0-1 stores is decile quantiles — deliberately, since keeping
-the training data alongside every artifact is not viable. The reference CDF is
-reconstructed piecewise-linearly from those deciles, which is accurate in the
-bulk and crude in the tails. PSI is computed from the same bins and is the
-primary signal; KS is corroboration, not the verdict.
+sample, and what T0-1 stores is decile quantiles plus the empirical CDF at each
+— deliberately, since keeping the training data alongside every artifact is not
+viable. The reference CDF is interpolated through those points, which is
+accurate in the bulk and crude in the tails. PSI is computed from the same bins
+and is the primary signal; KS is corroboration, not the verdict.
+
+*A reference is a sample, and PSI inherits its noise.* The bins give the
+training range's tails their order-statistic mass and tied edges their CDF
+mass (`_numeric_bins`), which removes the two biases that made small and
+zero-inflated references alarm on unchanged data. What remains is honest
+sampling error of roughly (bins - 1) / n per feature, which no binning can
+remove from a small reference.
 
 *p-values are corrected across features.* Testing six features every window
 produces a "significant" result by chance soon enough. Benjamini-Hochberg
@@ -176,41 +183,79 @@ def population_stability_index(
     return float(np.sum((obs - ref) * np.log(obs / ref)))
 
 
-def _reference_edges(reference: dict[str, Any]) -> np.ndarray | None:
+def _numeric_bins(reference: dict[str, Any]) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None, str]:
+    """
+    Bin edges, the reference CDF at each edge, and the reference mass per bin.
+
+    Bins are right-closed, (e[i-1], e[i]], plus one open bin at or below the
+    first edge and one above the last, so a live value's bin agrees with the
+    CDF's own definition, F(e) = P(X <= e).
+
+    Two things the masses must not assume, each measured as a failure:
+
+      - **That nothing lies beyond the training range.** A sample of n leaves
+        about 1/(n+1) of its distribution beyond each extreme. Zero mass there
+        (floored at PSI_EPSILON) scored ordinary values at ~14x their share: a
+        600-row, 120-customer champion read PSI 0.237, ALARM, on its own
+        distribution. The tails now carry the order-statistic expectation.
+      - **That deciles hold 10% each.** Tied quantiles break that: a column that
+        is 70% zeros read 0.964 unshifted and 0.020 after its zero share fell to
+        20%. The masses now come from the empirical CDF stored at each edge.
+
+    Returns (None, None, None, reason) when the column cannot be binned honestly.
+    """
     quantiles = reference.get("quantiles") or {}
-    if len(quantiles) < 3:
-        return None
-    edges = np.array([v for _, v in sorted(quantiles.items(), key=lambda kv: float(kv[0]))],
-                     dtype=float)
-    # Ties collapse bins; a constant-ish training column has no usable bins.
-    edges = np.unique(edges)
-    return edges if len(edges) >= 3 else None
+    if not quantiles:
+        return None, None, None, "no usable reference quantiles for this column"
+    ordered = sorted(quantiles.items(), key=lambda kv: float(kv[0]))
+    values = [float(v) for _, v in ordered]
+    if len(set(values)) < 2:
+        return None, None, None, "the training column was constant, so there are no bins to compare"
+    cdf = reference.get("cdf") or {}
+    if not cdf and len(set(values)) < len(values):
+        return None, None, None, (
+            "its reference quantiles are tied (a repeated value, such as a run of zeros), and this "
+            "artifact predates the stored CDF that gives a tied edge its true mass. Scoring it would "
+            "report drift on an unchanged column; re-train to refresh the reference"
+        )
+
+    at_edge: dict[float, float] = {}
+    for key, value in ordered:
+        # Without a stored CDF (an older artifact, untied) the quantile level is
+        # the CDF, which is exact for a continuous column.
+        mass_below = float(cdf.get(key, float(key)))
+        at_edge[float(value)] = max(at_edge.get(float(value), 0.0), mass_below)
+    edges = np.array(sorted(at_edge), dtype=float)
+    cumulative = np.array([at_edge[e] for e in edges], dtype=float)
+    cumulative[-1] = 1.0  # everything observed in training is at or below its maximum
+
+    masses = np.diff(np.concatenate([[0.0], cumulative, [1.0]]))
+    n = int(reference.get("n_observed") or 0)
+    tail = 1.0 / (n + 1) if n > 0 else 0.0
+    masses = masses * (1.0 - 2.0 * tail)
+    masses[0] += tail
+    masses[-1] += tail
+    return edges, cumulative, masses, ""
 
 
-def _numeric_drift(values: pd.Series, reference: dict[str, Any], column: str) -> tuple[float, float | None, float | None, str]:
-    edges = _reference_edges(reference)
+def _numeric_drift(values: pd.Series, reference: dict[str, Any], column: str) -> tuple[float | None, float | None, float | None, str]:
+    """PSI (None when the column cannot be measured honestly), KS statistic and p-value, detail."""
+    edges, cumulative, masses, reason = _numeric_bins(reference)
+    if edges is None:
+        return None, None, None, reason
     observed = pd.to_numeric(values, errors="coerce").dropna()
-    if edges is None or observed.empty:
-        return 0.0, None, None, "no usable reference quantiles for this column"
+    if observed.empty:
+        return None, None, None, "no non-null values in the window"
 
-    # Open-ended outer bins so values beyond the training range are counted as
-    # drift rather than dropped — running off the end of the training range is
-    # among the most informative things a live feature can do.
-    binned = np.clip(np.searchsorted(edges, observed, side="right"), 0, len(edges))
+    binned = np.searchsorted(edges, observed.to_numpy(dtype=float), side="left")
     obs_counts = np.bincount(binned, minlength=len(edges) + 1).astype(float)
-    # The reference is uniform across its own deciles by construction, with
-    # nothing outside the observed training range.
-    ref_counts = np.zeros(len(edges) + 1, dtype=float)
-    ref_counts[1:len(edges)] = 1.0 / (len(edges) - 1)
+    psi = population_stability_index(masses, obs_counts / obs_counts.sum())
 
-    psi = population_stability_index(ref_counts, obs_counts / obs_counts.sum())
-
-    # KS against a piecewise-linear CDF rebuilt from the stored deciles. See
-    # the module docstring: approximate in the tails, corroboration not verdict.
-    probabilities = np.linspace(0.0, 1.0, len(edges))
+    # KS against a piecewise-linear CDF through the stored edges. See the module
+    # docstring: approximate in the tails, corroboration not verdict.
     try:
         result = stats.ks_1samp(
-            observed, lambda x: np.interp(x, edges, probabilities, left=0.0, right=1.0),
+            observed, lambda x: np.interp(x, edges, cumulative, left=0.0, right=1.0),
         )
         statistic, p_value = float(result.statistic), float(result.pvalue)
     except Exception:  # noqa: BLE001 - KS is corroboration; PSI stands alone
@@ -366,6 +411,11 @@ def check_data_drift(
             psi, statistic, p_value, detail = _categorical_drift(observed[column], reference, column)
         elif kind == "numeric":
             psi, statistic, p_value, detail = _numeric_drift(observed[column], reference, column)
+            if psi is None:
+                # Reported as unmeasured, never as a zero: a zero reads as
+                # "did not move", which nobody checked.
+                notes.append(f"'{column}' is not measured: {detail}.")
+                continue
         else:
             # datetime / text references exist but have no settled drift
             # measure here; reported as unmeasured rather than silently zero.

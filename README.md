@@ -24,7 +24,7 @@ python -m autoeng.cli serve runs/models/<run_name>         # score rows over HTT
 python -m autoeng.cli drift runs/models/<run_name>         # data / prediction / concept drift
 python -m autoeng.cli gate <champion> <challenger> --models-root runs/production --apply
 
-pytest tests/ -q                                           # 238 tests, ~220s
+pytest tests/ -q                                           # 245 tests, ~220s
 python scripts/calibrate_detection.py                      # detection accuracy harness
 ```
 
@@ -141,12 +141,19 @@ feature can be flagged individually while the verdict stays quiet. The verdict
 is deliberately not the maximum of the three: concept drift measures
 degradation directly and dominates, the others are leading indicators.
 
-Measured end to end, serving 300 rows against a real run:
+Measured end to end, serving 300 fresh rows from the dataset's generator
+against a real run (595 reference rows):
 
 | Stream | Verdict | Weighted PSI | Live F1 vs baseline |
 |---|---|---|---|
-| unshifted | `ok` | 0.030 | 0.667 vs 0.609 |
-| `avg_amount` x8 | `alarm` | 3.72 | 0.177 vs 0.609 |
+| unshifted | `ok` | 0.082 | 0.684 vs 0.609 |
+| `avg_amount` x8 | `alarm` | 3.04 | 0.308 vs 0.609 |
+
+Over 200 no-drift 300-row windows it reads `ok` 99% of the time (1%
+`investigate`, never `alarm`). That rate needed a binning fix: the training
+range's tails were given zero reference mass and tied quantiles equal masses,
+which read 6.5% `investigate` here and alarmed on 88.5% of no-drift windows
+against a 600-row grouped reference.
 
 `unknown` is kept distinct from `ok`: a window with no labels and a healthy
 model look identical if you collapse them, and they mean opposite things.
@@ -433,7 +440,7 @@ autoeng/
   reporting/       Markdown report generation
   pipeline.py      end-to-end orchestration
   cli.py           command-line entry point
-tests/             238 tests: planted leaks, regressions for every shipped bug, unit tests
+tests/             245 tests: planted leaks, regressions for every shipped bug, unit tests
 scripts/           detection calibration harness
 data/              synthetic + real validation datasets
 runs/              reports + MLflow store from the validation runs

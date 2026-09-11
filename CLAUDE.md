@@ -14,7 +14,7 @@ everything to MLflow, and writes a report.
 python -m autoeng.cli run data/any.csv          # infer everything
 python -m autoeng.cli run data.csv --target y   # or pin the target
 python -m autoeng.cli ask <run_id> "why did you reject random_forest?"
-pytest tests/ -q                                # 238 tests, ~220s
+pytest tests/ -q                                # 245 tests, ~220s
 python scripts/calibrate_detection.py           # detection accuracy, 10/10 expected
 ```
 
@@ -248,6 +248,18 @@ inside each fold (T2-2).
   type, and a baseline sharing no live metric is UNKNOWN. Fixing only one of
   the two creates a permanent false alarm: test string labels and regression
   whenever either is touched.
+- **PSI thresholds assume the reference is exact, and two binning choices made
+  it wrong.** The open bins beyond the training min/max carried zero reference
+  mass, so ordinary live values there scored ~14x their share: a 600-row
+  champion read weighted PSI 0.237, ALARM, on its own distribution, and alarmed
+  on 88.5% of no-drift 300-row windows. Tied quantiles (a run of zeros) were
+  given equal bin masses: 0.964 on an unshifted column, 0.020 after its zero
+  share fell from 70% to 20%. References now store the empirical CDF at each
+  quantile and the tails carry 1/(n+1); an older artifact with tied quantiles is
+  reported unmeasured rather than scored. Both bugs were invisible on the
+  2,000-row test fixtures — test drift changes on a small reference and a
+  zero-inflated column too. What is left is honest sampling noise, which fixed
+  thresholds still over-read on small references and entity-clustered windows.
 - **A guard against one failure reopened another.** Content exclusion needs to
   know whether an identical feature vector is the same observation. The first
   guard judged that by how often training rows repeated, but recurring
@@ -303,7 +315,7 @@ autoeng/
 
 ## Current state
 
-238 tests passing. Detection 10/10 on unambiguous cases (iris is genuinely
+245 tests passing. Detection 10/10 on unambiguous cases (iris is genuinely
 ambiguous and excluded). Successive halving gives 7.4× speedup with an
 identical winner.
 

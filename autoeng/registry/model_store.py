@@ -174,6 +174,11 @@ def _numeric_reference(series: pd.Series) -> dict[str, Any]:
     # Keys are formatted rather than raw floats so the JSON round-trips to the
     # same edges; consumers sort by float(key).
     ref["quantiles"] = {f"{q:.2f}": float(observed.quantile(q)) for q in REFERENCE_QUANTILES}
+    # The empirical CDF at each stored quantile. Quantiles alone cannot say how
+    # much mass sits AT a repeated value: a column that is 70% zeros stores 0.0
+    # at seven levels, and drift has to know F(0) is 0.7 rather than guess 0.6.
+    values = observed.to_numpy(dtype=float)
+    ref["cdf"] = {key: float(np.mean(values <= edge)) for key, edge in ref["quantiles"].items()}
     ref["min"] = float(observed.min())
     ref["max"] = float(observed.max())
     ref["mean"] = float(observed.mean())
