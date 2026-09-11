@@ -60,6 +60,7 @@ import numpy as np
 import pandas as pd
 
 from autoeng.common.roles import FeatureRoleAssignment
+from autoeng.common.sampling import effective_sample_size
 from autoeng.profiling.profiler import DatasetProfile, SemanticType
 
 SCHEMA_VERSION = 1
@@ -160,12 +161,20 @@ def _library_versions() -> dict[str, str]:
     return {lib: v for lib in TRACKED_LIBRARIES if (v := _version_or_none(lib)) is not None}
 
 
-def _numeric_reference(series: pd.Series) -> dict[str, Any]:
+def _n_effective(series: pd.Series, groups: Any) -> float:
+    """Independent observations behind the reference. Drift reads PSI against
+    the sampling noise of BOTH samples, and on grouped data a customer's five
+    visits are one observation of anything constant per customer."""
+    return effective_sample_size(series, groups)
+
+
+def _numeric_reference(series: pd.Series, groups: Any = None) -> dict[str, Any]:
     numeric = pd.to_numeric(series, errors="coerce")
     observed = numeric.dropna()
     ref: dict[str, Any] = {
         "kind": "numeric",
         "n_observed": int(len(observed)),
+        "n_effective": _n_effective(numeric, groups),
         "missing_ratio": float(series.isna().mean()) if len(series) else 0.0,
         "quantiles": {},
     }
@@ -186,11 +195,12 @@ def _numeric_reference(series: pd.Series) -> dict[str, Any]:
     return ref
 
 
-def _categorical_reference(series: pd.Series) -> dict[str, Any]:
+def _categorical_reference(series: pd.Series, groups: Any = None) -> dict[str, Any]:
     observed = series.dropna()
     ref: dict[str, Any] = {
         "kind": "categorical",
         "n_observed": int(len(observed)),
+        "n_effective": _n_effective(series, groups),
         "n_unique": int(observed.nunique()),
         "missing_ratio": float(series.isna().mean()) if len(series) else 0.0,
         "frequencies": {},
@@ -241,14 +251,14 @@ def _text_reference(series: pd.Series) -> dict[str, Any]:
     return ref
 
 
-def _column_reference(series: pd.Series, semantic_type: SemanticType) -> dict[str, Any]:
+def _column_reference(series: pd.Series, semantic_type: SemanticType, groups: Any = None) -> dict[str, Any]:
     if semantic_type == SemanticType.DATETIME:
         return _datetime_reference(series)
     if semantic_type == SemanticType.TEXT_FREE:
         return _text_reference(series)
     if semantic_type in CATEGORICAL_REFERENCE_TYPES:
-        return _categorical_reference(series)
-    return _numeric_reference(series)
+        return _categorical_reference(series, groups)
+    return _numeric_reference(series, groups)
 
 
 def _roles_as_dict(roles: FeatureRoleAssignment) -> dict[str, Any]:
@@ -283,9 +293,13 @@ def build_training_schema(
     selection_source: str | None = None,
     dataset_path: str | None = None,
     decision_threshold: dict[str, Any] | None = None,
+    groups: Any = None,
 ) -> dict[str, Any]:
     """Everything a later process needs to feed this estimator correctly and
-    to notice when the data it is being fed has moved."""
+    to notice when the data it is being fed has moved.
+
+    `groups` (the entity of each training row, when the run is grouped) sizes
+    each reference in independent observations rather than rows."""
     columns: dict[str, Any] = {}
     for name in X_train.columns:
         col_profile = profile.columns.get(name)
@@ -295,7 +309,7 @@ def build_training_schema(
             "semantic_type": semantic_type.value,
             "role": roles.column_roles.get(name, "other"),
             "nullable": bool(X_train[name].isna().any()),
-            "reference": _column_reference(X_train[name], semantic_type),
+            "reference": _column_reference(X_train[name], semantic_type, groups),
         }
 
     # Pipeline delegates classes_ to its final step and regressors have none,
@@ -313,7 +327,7 @@ def build_training_schema(
         target["semantic_type"] = target_semantic.value
         # Prediction drift (T1-3) needs a baseline for the output distribution,
         # and the training target is the honest one.
-        target["reference"] = _column_reference(y_train, target_semantic)
+        target["reference"] = _column_reference(y_train, target_semantic, groups)
 
     return {
         "schema_version": SCHEMA_VERSION,
@@ -402,6 +416,7 @@ def save_model(
     dataset_path: str | None = None,
     decision_threshold: dict[str, Any] | None = None,
     write_mlflow_model: bool = True,
+    groups: Any = None,
 ) -> SavedModel:
     """Persist a fitted estimator and its training schema into `output_dir`."""
     model_dir = Path(output_dir)
@@ -411,7 +426,7 @@ def save_model(
         estimator, X_train, y_train, profile, roles,
         problem_type=problem_type, model_name=model_name,
         selection_source=selection_source, dataset_path=dataset_path,
-        decision_threshold=decision_threshold,
+        decision_threshold=decision_threshold, groups=groups,
     )
 
     model_path = model_dir / MODEL_FILENAME

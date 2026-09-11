@@ -156,7 +156,7 @@ class TestRendering:
     def test_markdown_shows_raw_and_weighted_side_by_side(self, store, schema):
         _serve(store, 300, seed=10, amount_mu=5.4)
         markdown = run_drift_report(store, schema).as_markdown()
-        assert "| Feature | PSI | Importance | Weighted | Severity |" in markdown
+        assert "| Feature | PSI | Noise floor | Importance | Weighted | Severity |" in markdown
         assert "Drift is not degradation" in markdown
 
     def test_report_is_json_serialisable(self, store, schema):

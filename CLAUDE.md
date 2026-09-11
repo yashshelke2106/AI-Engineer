@@ -14,7 +14,7 @@ everything to MLflow, and writes a report.
 python -m autoeng.cli run data/any.csv          # infer everything
 python -m autoeng.cli run data.csv --target y   # or pin the target
 python -m autoeng.cli ask <run_id> "why did you reject random_forest?"
-pytest tests/ -q                                # 245 tests, ~220s
+pytest tests/ -q                                # 256 tests, ~220s
 python scripts/calibrate_detection.py           # detection accuracy, 10/10 expected
 ```
 
@@ -109,7 +109,13 @@ weighted view. A feature flagged individually while the report stays quiet is
 correct behaviour, not a bug — there is a test asserting exactly that. The
 verdict is deliberately NOT the max of the three checks: concept drift
 measures degradation directly and dominates; data and prediction drift are
-leading indicators.
+leading indicators. Severity reads PSI beyond its sampling noise
+(`noise_floor`: chi2 95% x (1/n_ref + 1/n_window)), never raw PSI against fixed
+thresholds, and every n is an EFFECTIVE sample size
+(`autoeng/common/sampling.py`): entities, not rows, for anything constant per
+entity. Raw thresholds alarmed on 88% of no-drift 60-customer windows against a
+120-customer reference. References store `n_effective`; windows take it from
+the entity key. Without either the report says drift may be over-read.
 
 **7e. UNKNOWN is not OK.** No labels arriving and a healthy model look
 identical if you collapse them, and they mean opposite things. Concept drift
@@ -258,8 +264,11 @@ inside each fold (T2-2).
   quantile and the tails carry 1/(n+1); an older artifact with tied quantiles is
   reported unmeasured rather than scored. Both bugs were invisible on the
   2,000-row test fixtures — test drift changes on a small reference and a
-  zero-inflated column too. What is left is honest sampling noise, which fixed
-  thresholds still over-read on small references and entity-clustered windows.
+  zero-inflated column too. What was left was honest sampling noise, which
+  fixed thresholds over-read on small references and entity-clustered windows;
+  see 7d for the noise floor. Observed bins also take a half pseudo-count on
+  the effective sample size: a 1e-6 floor charged ~1.15 PSI per empty bin in a
+  30-customer window.
 - **A guard against one failure reopened another.** Content exclusion needs to
   know whether an identical feature vector is the same observation. The first
   guard judged that by how often training rows repeated, but recurring
@@ -315,7 +324,7 @@ autoeng/
 
 ## Current state
 
-245 tests passing. Detection 10/10 on unambiguous cases (iris is genuinely
+256 tests passing. Detection 10/10 on unambiguous cases (iris is genuinely
 ambiguous and excluded). Successive halving gives 7.4× speedup with an
 identical winner.
 

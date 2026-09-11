@@ -133,6 +133,7 @@ def _persist_final_model(
     problem_type: str, model_name: str | None, selection_source: str,
     dataset_path: str, model_dir: Path,
     decision_threshold: dict[str, Any] | None = None,
+    groups=None,
 ) -> dict[str, Any]:
     """
     Save the fitted winner plus its training schema, and return a JSON-able
@@ -153,6 +154,8 @@ def _persist_final_model(
             # Without this the artifact predicts at 0.5 while the report quotes
             # a tuned operating point — the two must not come apart.
             decision_threshold=decision_threshold,
+            # Sizes the drift references in entities rather than rows.
+            groups=groups,
         )
         return saved.as_dict()
     except Exception as e:  # noqa: BLE001 - see docstring
@@ -501,7 +504,7 @@ def run_pipeline(
             final_pipeline, X_train, y_train, profile, roles,
             problem_type=chosen.problem_type.value, model_name=final_name,
             selection_source=final_source, dataset_path=dataset_path, model_dir=model_dir,
-            decision_threshold=threshold_choice,
+            decision_threshold=threshold_choice, groups=groups_train,
         )
 
         model_artifact = _freeze_holdout_into_artifact(
@@ -577,6 +580,7 @@ def run_pipeline(
             final_pipeline, X_train, y_train, profile, roles,
             problem_type=chosen.problem_type.value, model_name=final_name,
             selection_source=final_source, dataset_path=dataset_path, model_dir=model_dir,
+            groups=groups_train,
         )
 
         model_artifact = _freeze_holdout_into_artifact(

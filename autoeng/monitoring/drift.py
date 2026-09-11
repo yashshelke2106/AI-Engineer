@@ -45,8 +45,14 @@ and is the primary signal; KS is corroboration, not the verdict.
 training range's tails their order-statistic mass and tied edges their CDF
 mass (`_numeric_bins`), which removes the two biases that made small and
 zero-inflated references alarm on unchanged data. What remains is honest
-sampling error of roughly (bins - 1) / n per feature, which no binning can
-remove from a small reference.
+sampling error: two samples of one distribution score about
+(1/n_reference + 1/n_window) * chi2(bins - 1), never zero. Severity therefore
+counts only PSI beyond the 95% point of that noise (`noise_floor`), with n
+counted in independent observations — on grouped data, entities rather than
+rows (`autoeng/common/sampling.py`). Against a 600-row, 120-customer reference
+the fixed thresholds alone alarmed on 88% of no-drift windows of 60 customers;
+the floor keeps them quiet while a 1 sd shift in the dominant feature still
+alarms every time. Raw PSI is reported beside it.
 
 *p-values are corrected across features.* Testing six features every window
 produces a "significant" result by chance soon enough. Benjamini-Hochberg
@@ -63,6 +69,8 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 
+from autoeng.common.sampling import effective_sample_size
+
 # Conventional PSI reading: below 0.1 the distributions are equivalent for
 # practical purposes, 0.1-0.2 is worth a look, above 0.2 is a real shift.
 PSI_INVESTIGATE = 0.10
@@ -71,6 +79,8 @@ PSI_ALARM = 0.20
 # side is otherwise infinite — and an infinity from one unseen category would
 # swamp every real signal in the aggregate.
 PSI_EPSILON = 1e-6
+# Severity counts PSI beyond this quantile of its no-drift sampling distribution.
+NOISE_QUANTILE = 0.95
 # Below this many labelled rows, concept drift is UNKNOWN rather than OK.
 MIN_LABELS_FOR_CONCEPT = 30
 # Below this many rows a window is too small to read anything from.
@@ -109,6 +119,12 @@ class FeatureDrift:
     p_value: float | None = None
     p_value_adjusted: float | None = None
     detail: str = ""
+    # PSI two samples of the same distribution would reach 5% of the time, and
+    # how far this one goes beyond it. Severity is read from the excess.
+    noise_floor: float = 0.0
+    excess_psi: float = 0.0
+    n_effective: float | None = None
+    n_effective_reference: float | None = None
 
     def as_dict(self) -> dict[str, Any]:
         d = dict(self.__dict__)
@@ -125,11 +141,14 @@ class DataDriftReport:
     n_rows: int = 0
     summary: str = ""
     notes: list[str] = field(default_factory=list)
+    # The importance-weighted PSI beyond sampling noise; the verdict reads this.
+    weighted_excess_psi: float = 0.0
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "severity": self.severity.value,
             "weighted_psi": self.weighted_psi,
+            "weighted_excess_psi": self.weighted_excess_psi,
             "max_psi": self.max_psi,
             "n_rows": self.n_rows,
             "summary": self.summary,
@@ -160,6 +179,7 @@ class SimpleDriftReport:
 def population_stability_index(
     reference: dict[Any, float] | Sequence[float],
     observed: dict[Any, float] | Sequence[float],
+    n_observed: float | None = None,
 ) -> float:
     """
     PSI between two discrete distributions given as proportions.
@@ -167,6 +187,11 @@ def population_stability_index(
     Both sides are floored at PSI_EPSILON and renormalised: the measure takes a
     log ratio, so a bin that is empty on one side is otherwise infinite, and a
     single unseen category would drown out every real signal in the aggregate.
+
+    With `n_observed` (independent observations behind the observed side), its
+    proportions get a Jeffreys pseudo-count of one half per bin instead. An
+    empty bin in 30 observations is weak evidence of an empty bin; the floor
+    charged it about 1.15 of PSI, as if it were certain.
     """
     if isinstance(reference, dict) or isinstance(observed, dict):
         keys = sorted(set(dict(reference)) | set(dict(observed)), key=str)
@@ -177,10 +202,27 @@ def population_stability_index(
         obs = np.asarray(observed, dtype=float)
 
     ref = np.clip(ref, PSI_EPSILON, None)
-    obs = np.clip(obs, PSI_EPSILON, None)
     ref = ref / ref.sum()
-    obs = obs / obs.sum()
+    if n_observed is not None and n_observed > 0 and obs.sum() > 0:
+        obs = (obs / obs.sum() * n_observed + 0.5) / (n_observed + 0.5 * len(obs))
+    else:
+        obs = np.clip(obs, PSI_EPSILON, None)
+        obs = obs / obs.sum()
     return float(np.sum((obs - ref) * np.log(obs / ref)))
+
+
+def noise_floor(n_bins: int, n_reference: float | None, n_observed: float | None) -> float:
+    """
+    The PSI two samples of one distribution exceed only 5% of the time.
+
+    PSI is the symmetric KL divergence, and between samples of sizes n1 and n2
+    from the same distribution it is asymptotically (1/n1 + 1/n2) * chi2(k - 1).
+    The n's must be independent observations: see `effective_sample_size`.
+    """
+    if n_bins < 2:
+        return 0.0
+    inverse = sum(1.0 / n for n in (n_reference, n_observed) if n and n > 0)
+    return float(stats.chi2.ppf(NOISE_QUANTILE, n_bins - 1) * inverse)
 
 
 def _numeric_bins(reference: dict[str, Any]) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None, str]:
@@ -238,18 +280,20 @@ def _numeric_bins(reference: dict[str, Any]) -> tuple[np.ndarray | None, np.ndar
     return edges, cumulative, masses, ""
 
 
-def _numeric_drift(values: pd.Series, reference: dict[str, Any], column: str) -> tuple[float | None, float | None, float | None, str]:
-    """PSI (None when the column cannot be measured honestly), KS statistic and p-value, detail."""
+def _numeric_drift(
+    values: pd.Series, reference: dict[str, Any], column: str, n_effective: float | None = None,
+) -> tuple[float | None, float | None, float | None, str, int]:
+    """PSI (None when the column cannot be measured honestly), KS statistic and p-value, detail, bins."""
     edges, cumulative, masses, reason = _numeric_bins(reference)
     if edges is None:
-        return None, None, None, reason
+        return None, None, None, reason, 0
     observed = pd.to_numeric(values, errors="coerce").dropna()
     if observed.empty:
-        return None, None, None, "no non-null values in the window"
+        return None, None, None, "no non-null values in the window", 0
 
     binned = np.searchsorted(edges, observed.to_numpy(dtype=float), side="left")
     obs_counts = np.bincount(binned, minlength=len(edges) + 1).astype(float)
-    psi = population_stability_index(masses, obs_counts / obs_counts.sum())
+    psi = population_stability_index(masses, obs_counts / obs_counts.sum(), n_observed=n_effective)
 
     # KS against a piecewise-linear CDF through the stored edges. See the module
     # docstring: approximate in the tails, corroboration not verdict.
@@ -266,17 +310,21 @@ def _numeric_drift(values: pd.Series, reference: dict[str, Any], column: str) ->
               f"{reference.get('quantiles', {}).get('0.50', float('nan'))}")
     if outside:
         detail += f"; {outside} value(s) outside the training range"
-    return psi, statistic, p_value, detail
+    return psi, statistic, p_value, detail, len(masses)
 
 
-def _categorical_drift(values: pd.Series, reference: dict[str, Any], column: str) -> tuple[float, float | None, float | None, str]:
+def _categorical_drift(
+    values: pd.Series, reference: dict[str, Any], column: str, n_effective: float | None = None,
+) -> tuple[float | None, float | None, float | None, str, int]:
     ref_freq = reference.get("frequencies") or {}
     observed = values.dropna().astype(str)
-    if not ref_freq or observed.empty:
-        return 0.0, None, None, "no reference frequencies for this column"
+    if not ref_freq:
+        return None, None, None, "no reference frequencies for this column", 0
+    if observed.empty:
+        return None, None, None, "no non-null values in the window", 0
 
     obs_freq = observed.value_counts(normalize=True).to_dict()
-    psi = population_stability_index(ref_freq, obs_freq)
+    psi = population_stability_index(ref_freq, obs_freq, n_observed=n_effective)
 
     keys = sorted(set(ref_freq) | set(obs_freq))
     expected = np.array([max(ref_freq.get(k, 0.0), PSI_EPSILON) for k in keys], dtype=float)
@@ -292,7 +340,7 @@ def _categorical_drift(values: pd.Series, reference: dict[str, Any], column: str
     detail = f"{len(obs_freq)} categories observed against {len(ref_freq)} in training"
     if unseen:
         detail += f"; unseen in training: {', '.join(unseen[:5])}"
-    return psi, statistic, p_value, detail
+    return psi, statistic, p_value, detail, len(keys)
 
 
 def _benjamini_hochberg(p_values: list[float | None], alpha: float = FDR_ALPHA) -> list[float | None]:
@@ -369,8 +417,14 @@ def check_data_drift(
     observed: pd.DataFrame,
     schema: dict[str, Any],
     importances: dict[str, float] | None = None,
+    groups: Any = None,
 ) -> DataDriftReport:
-    """Compare live feature distributions against the training references."""
+    """
+    Compare live feature distributions against the training references.
+
+    `groups` is the entity of each observed row. Left out, it is read from the
+    model's group column when the window's payloads carried it.
+    """
     feature_columns = [c for c in (schema.get("feature_columns") or []) if c in observed.columns]
     column_meta = schema.get("columns") or {}
     notes: list[str] = []
@@ -402,64 +456,100 @@ def check_data_drift(
             f"is not measured here. The weighted score is correspondingly conservative."
         )
 
+    group_column = (schema.get("feature_roles") or {}).get("group_column")
+    if groups is None and group_column and group_column in observed.columns:
+        groups = observed[group_column].to_numpy(dtype=object)
+    if group_column and groups is None:
+        notes.append(
+            f"The model groups rows by '{group_column}', but this window carries no "
+            f"'{group_column}', so its rows are read as independent observations. If entities "
+            f"recur in the window, drift is over-read: 300 rows from 60 customers alarmed in 88% "
+            f"of no-drift windows when rows were counted instead of customers."
+        )
+
     features: list[FeatureDrift] = []
+    unsized_references: list[str] = []
     for column in feature_columns:
         meta = column_meta.get(column) or {}
         reference = meta.get("reference") or {}
         kind = reference.get("kind", "numeric")
-        if kind == "categorical":
-            psi, statistic, p_value, detail = _categorical_drift(observed[column], reference, column)
-        elif kind == "numeric":
-            psi, statistic, p_value, detail = _numeric_drift(observed[column], reference, column)
-            if psi is None:
-                # Reported as unmeasured, never as a zero: a zero reads as
-                # "did not move", which nobody checked.
-                notes.append(f"'{column}' is not measured: {detail}.")
-                continue
-        else:
+        if kind not in ("categorical", "numeric"):
             # datetime / text references exist but have no settled drift
             # measure here; reported as unmeasured rather than silently zero.
             notes.append(f"'{column}' has a {kind} reference distribution, which is not compared.")
             continue
 
+        values = observed[column] if kind == "categorical" else pd.to_numeric(observed[column], errors="coerce")
+        n_window = effective_sample_size(values, groups)
+        n_reference = reference.get("n_effective")
+        if n_reference is None:
+            n_reference = reference.get("n_observed")
+            if group_column:
+                unsized_references.append(column)
+
+        drift_of = _categorical_drift if kind == "categorical" else _numeric_drift
+        psi, statistic, p_value, detail, n_bins = drift_of(observed[column], reference, column, n_window)
+        if psi is None:
+            # Reported as unmeasured, never as a zero: a zero reads as
+            # "did not move", which nobody checked.
+            notes.append(f"'{column}' is not measured: {detail}.")
+            continue
+
+        floor = noise_floor(n_bins, n_reference, n_window)
+        excess = max(0.0, float(psi) - floor)
         importance = float(weights.get(column, 0.0))
         features.append(FeatureDrift(
-            column=column, kind=kind, psi=float(psi), severity=_severity_from_psi(psi),
+            column=column, kind=kind, psi=float(psi), severity=_severity_from_psi(excess),
             importance=importance, weighted_psi=float(psi) * importance,
             n_observed=int(observed[column].notna().sum()),
             statistic=statistic, p_value=p_value, detail=detail,
+            noise_floor=floor, excess_psi=excess, n_effective=n_window,
+            n_effective_reference=float(n_reference) if n_reference is not None else None,
         ))
+
+    if unsized_references:
+        notes.append(
+            f"This artifact predates effective sample sizes, so its reference for "
+            f"{len(unsized_references)} column(s) is read as independent rows although the model "
+            f"groups by '{group_column}'. Repeated entities in training make that reference "
+            f"noisier than its row count says, and drift is over-read; re-train to refresh it."
+        )
 
     for feature, adjusted in zip(features, _benjamini_hochberg([f.p_value for f in features])):
         feature.p_value_adjusted = adjusted
 
     weighted_psi = float(sum(f.weighted_psi for f in features))
+    weighted_excess = float(sum(f.excess_psi * f.importance for f in features))
     max_psi = float(max((f.psi for f in features), default=0.0))
     # The aggregate is the weighted one: that is the question "does this
-    # matter?" as opposed to "did something move?".
-    severity = _severity_from_psi(weighted_psi)
+    # matter?" as opposed to "did something move?". And it is read beyond
+    # sampling noise, or an unchanged distribution alarms on a small sample.
+    severity = _severity_from_psi(weighted_excess)
 
     moved = [f for f in features if f.severity != DriftSeverity.OK]
     if moved:
         described = ", ".join(
-            f"{f.column} (PSI {f.psi:.3f}, {f.importance:.0%} of importance)"
-            for f in sorted(moved, key=lambda f: f.psi, reverse=True)[:5]
+            f"{f.column} (PSI {f.psi:.3f} against a noise floor of {f.noise_floor:.3f}, "
+            f"{f.importance:.0%} of importance)"
+            for f in sorted(moved, key=lambda f: f.excess_psi, reverse=True)[:5]
         )
         summary = (
-            f"{len(moved)} of {len(features)} feature(s) moved: {described}. "
-            f"Importance-weighted PSI {weighted_psi:.3f} -> {severity.value}."
+            f"{len(moved)} of {len(features)} feature(s) moved beyond sampling noise: {described}. "
+            f"Importance-weighted PSI {weighted_psi:.3f}, {weighted_excess:.3f} of it beyond "
+            f"noise -> {severity.value}."
         )
         if severity == DriftSeverity.OK:
             summary += (" The shift sits in features the model barely uses, so it is reported "
                         "rather than alarmed on.")
     else:
-        summary = (f"No feature moved materially across {len(observed)} rows "
+        summary = (f"No feature moved beyond sampling noise across {len(observed)} rows "
                    f"(max PSI {max_psi:.3f}).")
 
     return DataDriftReport(
         features=sorted(features, key=lambda f: f.weighted_psi, reverse=True),
         severity=severity, weighted_psi=weighted_psi, max_psi=max_psi,
         n_rows=len(observed), summary=summary, notes=notes,
+        weighted_excess_psi=weighted_excess,
     )
 
 

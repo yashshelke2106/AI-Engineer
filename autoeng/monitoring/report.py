@@ -81,15 +81,20 @@ class DriftReport:
             lines.append(self.data.summary + "\n")
             for note in self.data.notes:
                 lines.append(f"> {note}\n")
-            lines.append("| Feature | PSI | Importance | Weighted | Severity |")
-            lines.append("|---|---|---|---|---|")
+            lines.append("| Feature | PSI | Noise floor | Importance | Weighted | Severity |")
+            lines.append("|---|---|---|---|---|---|")
             for f in self.data.features:
-                lines.append(f"| {f.column} | {f.psi:.4f} | {f.importance:.1%} | "
+                lines.append(f"| {f.column} | {f.psi:.4f} | {f.noise_floor:.4f} | {f.importance:.1%} | "
                              f"{f.weighted_psi:.4f} | {f.severity.value} |")
             lines.append("")
             lines.append(
                 "*A feature can be flagged individually while the verdict stays quiet: that "
                 "means it moved but the model barely uses it. Drift is not degradation.*\n"
+            )
+            lines.append(
+                "*Severity counts only PSI beyond the noise floor: two samples of one "
+                "distribution never score zero, and a small or entity-clustered sample "
+                "scores well above it by chance.*\n"
             )
         return "\n".join(lines)
 

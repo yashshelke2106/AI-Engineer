@@ -24,7 +24,7 @@ python -m autoeng.cli serve runs/models/<run_name>         # score rows over HTT
 python -m autoeng.cli drift runs/models/<run_name>         # data / prediction / concept drift
 python -m autoeng.cli gate <champion> <challenger> --models-root runs/production --apply
 
-pytest tests/ -q                                           # 245 tests, ~220s
+pytest tests/ -q                                           # 256 tests, ~220s
 python scripts/calibrate_detection.py                      # detection accuracy harness
 ```
 
@@ -146,14 +146,19 @@ against a real run (595 reference rows):
 
 | Stream | Verdict | Weighted PSI | Live F1 vs baseline |
 |---|---|---|---|
-| unshifted | `ok` | 0.082 | 0.684 vs 0.609 |
-| `avg_amount` x8 | `alarm` | 3.04 | 0.308 vs 0.609 |
+| unshifted | `ok` | 0.053 | 0.684 vs 0.609 |
+| `avg_amount` x8 | `alarm` | 1.89 | 0.308 vs 0.609 |
 
-Over 200 no-drift 300-row windows it reads `ok` 99% of the time (1%
-`investigate`, never `alarm`). That rate needed a binning fix: the training
-range's tails were given zero reference mass and tied quantiles equal masses,
-which read 6.5% `investigate` here and alarmed on 88.5% of no-drift windows
-against a 600-row grouped reference.
+Over 200 no-drift 300-row windows it reads `ok` every time. Two samples of one
+distribution never score PSI zero, so severity counts only PSI beyond a 95%
+noise floor, (1/n_reference + 1/n_window) x chi2(bins - 1), with n counted in
+independent observations. On grouped data that means entities: against a
+600-row, 120-customer reference, fixed thresholds alarmed on 88% of no-drift
+windows of 60 customers, and with sizes counted in customers (the window's
+entity key, and an effective size stored with the reference) they read `ok`
+in 29 of 30, while a 1 sd shift in the dominant feature still alarms every
+time. Getting here also needed a binning fix: the training range's tails had
+zero reference mass and tied quantiles equal masses.
 
 `unknown` is kept distinct from `ok`: a window with no labels and a healthy
 model look identical if you collapse them, and they mean opposite things.
@@ -440,7 +445,7 @@ autoeng/
   reporting/       Markdown report generation
   pipeline.py      end-to-end orchestration
   cli.py           command-line entry point
-tests/             245 tests: planted leaks, regressions for every shipped bug, unit tests
+tests/             256 tests: planted leaks, regressions for every shipped bug, unit tests
 scripts/           detection calibration harness
 data/              synthetic + real validation datasets
 runs/              reports + MLflow store from the validation runs
