@@ -18,7 +18,7 @@ pytest tests/ -q                                # 155 tests, ~170s
 python scripts/calibrate_detection.py           # detection accuracy, 10/10 expected
 ```
 
-`ROADMAP.md` has the prioritised remaining work. **T1-3 is done; start at T1-4.**
+`ROADMAP.md` has the prioritised remaining work. **T1-4 is done; start at T1-5.**
 
 ## Invariants — do not break these
 
@@ -184,6 +184,18 @@ inside each fold (T2-2).
   train people to ignore it. `pip install mlflow` once lifted numpy from
   1.26.4 to 2.2.6 mid-session under the old `numpy>=1.26`. To move a pin:
   change it, run the suite and `calibrate_detection.py`, commit the result.
+- **A test that builds an artifact by hand proves nothing about real
+  artifacts.** The retrain group pin passed against a hand-written schema dict
+  while every real `training_schema.json` lacked `group_column` — T0-1
+  serialised roles before T0-3 added the field — so the pin was a silent no-op
+  until an end-to-end retrain exposed it. Build schema fixtures through
+  `build_training_schema` / `save_model`, and run the real loop before calling
+  a lifecycle item done.
+- **Null or mixed-type group keys crash sklearn's group splitters** with
+  `'<' not supported between 'float' and 'str'`. Rows appended from the
+  prediction log never carry the group column (it is excluded from features, so
+  no payload contains it). `group_values()` gives nulls singleton groups and
+  stringifies labels — always take groups from it, never `df[col].to_numpy()`.
 - **Model-store failures are reported, not raised.** A serialization problem
   must not discard a completed leaderboard, HPO sweep and explanation. But the
   report then says the model was *not* persisted, with the error. Never

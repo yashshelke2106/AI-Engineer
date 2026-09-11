@@ -338,6 +338,7 @@ def run_pipeline(
     precision_floor: float = DEFAULT_PRECISION_FLOOR,
     cost_false_negative: float = 10.0,
     cost_false_positive: float = 1.0,
+    parent_run_id: str | None = None,
 ) -> PipelineRunResult:
     dataset_path = str(dataset_path)
     out_dir = Path(output_dir)
@@ -678,6 +679,7 @@ def run_pipeline(
             decision_threshold={"selected": threshold_choice,
                                 "held_out": held_out_operating_point} if threshold_choice else None,
             group_decision=group_decision.as_dict(),
+            parent_run_id=parent_run_id,
         )
     except Exception as e:  # noqa: BLE001 - tracking must never take down the run
         (out_dir / f"{run_name}_mlflow_error.txt").write_text(

@@ -50,11 +50,19 @@ def log_pipeline_run(
     model_artifact: dict[str, Any] | None = None,
     decision_threshold: dict[str, Any] | None = None,
     group_decision: dict[str, Any] | None = None,
+    parent_run_id: str | None = None,
 ) -> str:
     mlflow.set_tracking_uri(tracking_uri)
     mlflow.set_experiment(DEFAULT_EXPERIMENT)
 
     with mlflow.start_run(run_name=run_name) as run:
+        if parent_run_id:
+            # MLflow renders a run with this tag as nested under its parent, so
+            # a challenger sits under the champion it was produced to replace
+            # rather than floating loose in the experiment list.
+            mlflow.set_tag("mlflow.parentRunId", parent_run_id)
+            mlflow.set_tag("champion_run_id", parent_run_id)
+            mlflow.set_tag("run_role", "challenger")
         mlflow.log_params({
             "source_path": source_path,
             "problem_type": problem_decision["chosen"]["problem_type"],

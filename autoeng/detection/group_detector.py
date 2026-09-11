@@ -260,7 +260,26 @@ def detect_group_column(
 
 
 def group_values(df: pd.DataFrame, decision: GroupDecision) -> np.ndarray | None:
-    """The `groups` array scikit-learn's group-aware splitters expect."""
+    """
+    The `groups` array scikit-learn's group-aware splitters expect.
+
+    Two normalisations, both found by a real retrain crashing rather than by
+    reasoning about it:
+
+      - **Missing keys become singleton groups.** Rows appended from the
+        prediction log never carry the group column — it is excluded from
+        features, so it is never part of a payload — and real datasets have
+        null keys too. A NaN mixed into string ids makes the splitters'
+        internal sort raise `'<' not supported between 'float' and 'str'`.
+        Each null row gets its own group, i.e. it is treated as an independent
+        entity. That is optimistic if two such rows are secretly the same
+        entity, and callers that know this happens say so.
+      - **Every label is a string.** Mixed int and str ids fail the same sort.
+    """
     if decision.column is None or decision.column not in df.columns:
         return None
-    return df[decision.column].to_numpy()
+    values = df[decision.column]
+    missing = values.isna().to_numpy()
+    labels = values.astype(str).to_numpy(dtype=object)
+    labels[missing] = [f"__ungrouped_row_{i}" for i in np.flatnonzero(missing)]
+    return labels

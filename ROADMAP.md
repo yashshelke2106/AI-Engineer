@@ -27,7 +27,7 @@ T1-4 and T1-5, and still should if any of this is revisited.
 ## Tier 0 — Blockers
 
 All three confirmed absent by grepping the codebase, not assumed.
-**Tier 0 is complete. T1-1, T1-2 and T1-3 are done; start at T1-4.**
+**Tier 0 is complete. T1-1 through T1-4 are done; start at T1-5.**
 
 ### ~~T0-1 · Persist the trained model and its schema~~ — **DONE**
 
@@ -243,21 +243,47 @@ computed in the explain stage, and report weighted alongside raw.
 quiet across a long window; a shift confined to a near-zero-importance feature
 is reported without alarming.
 
-### T1-4 · Retrain orchestration (~150 lines, 3 tests) — **NEXT**
+### ~~T1-4 · Retrain orchestration~~ — **DONE**
 
-Trigger on schedule or a T1-3 alarm; re-run `run_pipeline` over the accumulated
-window (original training data + newly labelled outcomes).
+`autoeng/lifecycle/retrain.py`. `should_retrain` requires both a reason (a drift
+alarm or a schedule) *and* at least 50 labelled outcomes that did not exist at
+training time; `build_retraining_frame` appends those to the original data;
+`retrain` runs the pipeline with the champion's decisions pinned and logs the
+result as an MLflow child of the champion. It does not promote — that is T1-5.
 
-**Critical detail:** pin target and problem type through the existing
-`--target` / `--problem-type` overrides rather than re-detecting. Detection is a
-heuristic guess at intent; re-guessing on every retrain means the system can
-silently change what it predicts mid-lifecycle. The override flags exist for
-exactly this.
+**Verified end to end on `data/synthetic_grouped.csv`**, not only in unit tests:
+240 shifted rows served and labelled, a triggered retrain, and a complete
+challenger run — leaderboard, tuning, selected model, persisted artifact,
+grouping section — carrying `mlflow.parentRunId` of the champion, with target
+and `customer_id` grouping pinned and no group overlap.
 
-**Done when:** a drift alarm produces a complete challenger run — leaderboard,
-tuning, explanation, report — logged to MLflow as a child of the champion run.
+- **UNKNOWN does not trigger.** A drift check that could not run is not evidence
+  of anything, and retraining on it is worse than waiting.
+- **Retraining on nothing new is refused.** Refitting the original file on a
+  schedule produces a model, a report and a green check, and has learned
+  nothing since day one — indistinguishable from a working lifecycle.
+- **Grouping is pinned in both directions.** An ungrouped champion pins
+  `use_groups=False`; leaving detection on would let the retraining frame (a
+  different shape, with null identifiers on every new row) pick a split scheme
+  the champion never used, and scores under different schemes are not
+  comparable. A schema *missing* the key predates grouping and means unknown,
+  so detection is left to run rather than a leakage guard being switched off.
 
-### T1-5 · Champion–challenger gate with a noise margin (~250 lines, 6 tests)
+**Two bugs the real run found that the unit tests had passed over:**
+
+1. **Artifacts never stored `group_column`.** T0-1 serialised the role
+   assignment before T0-3 added the field, so every champion read as ungrouped
+   and the group pin was a silent no-op. The pin test passed because it built
+   the schema dict by hand. It now builds through `build_training_schema`.
+2. **A null group key crashed every group-aware splitter.** Rows appended from
+   the prediction log never carry the group column — it is excluded from
+   features, so no payload contains it — and a NaN among string ids made
+   `StratifiedGroupKFold` raise `'<' not supported between 'float' and 'str'`.
+   `group_values` now gives null keys singleton groups and stringifies labels.
+   That also fixes real datasets with partially-null keys, which would have hit
+   the same crash in the first training run.
+
+### T1-5 · Champion–challenger gate with a noise margin (~250 lines, 6 tests) — **NEXT**
 
 **The item the original brief is really about** — "rejects the new model if it
 performs worse", answering "why did you reject the latest model?" from history.

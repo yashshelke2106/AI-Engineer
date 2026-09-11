@@ -171,3 +171,52 @@ class TestGroupOverlapFlag:
         train = df[~df["customer_id"].isin(held_out)]
         test = df[df["customer_id"].isin(held_out)]
         assert check_group_overlap(train, test, "customer_id").as_dict()["flags"] == []
+
+
+class TestGroupValuesSurviveMissingKeys:
+    """
+    Found by a real retrain, not by reasoning: rows appended from the
+    prediction log never carry the group column (it is excluded from
+    features, so no payload contains it), and a NaN among string ids made
+    StratifiedGroupKFold raise `'<' not supported between 'float' and 'str'`
+    inside its sort. Real datasets have null keys too, so this is not a
+    retraining edge case.
+    """
+
+    def _frame(self):
+        import pandas as pd
+        ids = [f"C{c}" for c in range(12) for _ in range(4)] + [None] * 10
+        return pd.DataFrame({
+            "customer_id": ids,
+            "x": np.arange(len(ids), dtype=float),
+            "y": [i % 2 for i in range(len(ids))],
+        })
+
+    def test_null_keys_become_distinct_singletons_and_splitting_no_longer_crashes(self):
+        from sklearn.model_selection import StratifiedGroupKFold
+        from autoeng.detection.group_detector import GroupDecision
+
+        df = self._frame()
+        groups = group_values(df, GroupDecision(column="customer_id", confidence=1.0))
+
+        assert all(isinstance(g, str) for g in groups)
+        assert "nan" not in set(groups)
+        null_labels = groups[df["customer_id"].isna().to_numpy()]
+        assert len(set(null_labels)) == 10, "each unkeyed row must be its own group"
+        assert not set(null_labels) & set(df["customer_id"].dropna()), "must not merge into a real id"
+        # Real entities keep their partition.
+        assert len(set(groups[:4])) == 1
+
+        splitter = StratifiedGroupKFold(n_splits=3, shuffle=True, random_state=0)
+        for train_idx, test_idx in splitter.split(df[["x"]], df["y"], groups):
+            assert not set(groups[train_idx]) & set(groups[test_idx])
+
+    def test_mixed_int_and_str_ids_do_not_crash_the_sort(self):
+        import pandas as pd
+        from sklearn.model_selection import GroupKFold
+        from autoeng.detection.group_detector import GroupDecision
+
+        df = pd.DataFrame({"key": [1, 1, 2, 2, "a", "a", "b", "b"], "x": range(8)})
+        groups = group_values(df, GroupDecision(column="key", confidence=1.0))
+        list(GroupKFold(n_splits=2).split(df[["x"]], groups=groups))
+

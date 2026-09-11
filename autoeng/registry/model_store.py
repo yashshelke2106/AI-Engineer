@@ -260,6 +260,9 @@ def _roles_as_dict(roles: FeatureRoleAssignment) -> dict[str, Any]:
         "excluded_columns": roles.excluded_columns,
         "target_column": roles.target_column,
         "time_column": roles.time_column,
+        # Added after T0-3. Without it every artifact reads as "no grouping"
+        # and a retrain cannot pin the champion's split scheme.
+        "group_column": roles.group_column,
         "reasoning": roles.reasoning,
     }
 
