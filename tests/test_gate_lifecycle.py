@@ -394,18 +394,75 @@ class TestHoldoutPayloadsServedAgain:
             request_id = store.log_prediction(payload=X_ho.iloc[i].to_dict(), prediction=0)
             store.record_outcome(request_id, actual=int(y_ho.iloc[i]))
         columns = list(X_ho.columns)
-        # Every training vector recurring three times: the signature of a
-        # discrete feature space, where a match is not the same observation.
+        # Flagged at retrain time as a discrete feature space, where a matching
+        # vector is ordinary recurrence rather than the same observation.
         manifest = {"included_request_ids": [], "fingerprint_columns": columns,
-                    "training_row_fingerprints": row_fingerprints(X_ho, columns) * 3}
+                    "training_row_fingerprints": row_fingerprints(X_ho, columns),
+                    "fingerprints_identify_observations": False}
 
         decision = gate_challenger(world["good"], world["bad"], store=store, manifest=manifest)
         assert decision.windows[FORWARD_WINDOW].comparison.n_rows == len(X_ho)
         assert any("not distinctive" in note for note in decision.notes), decision.notes
 
-    def test_fingerprint_distinctiveness(self):
-        from autoeng.lifecycle.retrain import fingerprints_identify_rows
 
-        assert fingerprints_identify_rows([f"row{i}" for i in range(100)])
-        assert not fingerprints_identify_rows(["a", "b", "c"] * 30)
-        assert not fingerprints_identify_rows([])
+class TestRepeatedObservationsAreNotADiscreteSpace:
+    """
+    A regression introduced by the discrete-space guard itself, found by
+    running the lifecycle on a multiclass target. The guard judged
+    distinctiveness by how often training rows repeated. But production
+    serving the same customers again repeats rows too, which is precisely what
+    content exclusion exists for, so the guard read repeated continuous
+    observations as "a discrete feature space" and switched the exclusion off,
+    reopening the leak it was meant to refine. Distinctiveness is now judged on
+    the columns of the distinct vectors, not on the duplication rate.
+    """
+
+    def test_continuous_observations_served_three_times_still_identify_rows(self):
+        from autoeng.lifecycle.retrain import vectors_identify_observations
+
+        rng = np.random.default_rng(4)
+        base = pd.DataFrame({"a": rng.normal(size=100).round(4), "b": rng.normal(size=100).round(4)})
+        assert vectors_identify_observations(pd.concat([base] * 3, ignore_index=True), ["a", "b"])
+
+    def test_a_small_grid_does_not_identify_rows_however_many_rows_it_has(self):
+        from autoeng.lifecycle.retrain import vectors_identify_observations
+
+        rng = np.random.default_rng(5)
+        grid = pd.DataFrame({"a": rng.integers(0, 3, 500), "b": rng.integers(0, 3, 500)})
+        assert not vectors_identify_observations(grid, ["a", "b"])
+        assert not vectors_identify_observations(grid.iloc[:0], ["a", "b"])
+
+    def test_the_gate_excludes_repeats_when_training_repeated_observations(self, world, tmp_path):
+        from autoeng.lifecycle.retrain import row_fingerprints
+
+        store = PredictionStore(tmp_path / "log.db")
+        X_ho, y_ho = world["X_ho"], world["y_ho"]
+        for i in range(len(X_ho)):
+            request_id = store.log_prediction(payload=X_ho.iloc[i].to_dict(), prediction=0)
+            store.record_outcome(request_id, actual=int(y_ho.iloc[i]))
+        columns = list(X_ho.columns)
+        manifest = {"included_request_ids": [], "fingerprint_columns": columns,
+                    # Each observation trained on three times over, as recurring traffic does.
+                    "training_row_fingerprints": row_fingerprints(X_ho, columns) * 3,
+                    "fingerprints_identify_observations": True}
+
+        decision = gate_challenger(world["good"], world["bad"], store=store, manifest=manifest)
+        assert FORWARD_WINDOW not in decision.windows
+        assert any("repeat a feature vector" in note for note in decision.notes), decision.notes
+
+    def test_a_manifest_without_the_flag_errs_towards_excluding(self, world, tmp_path):
+        """An empty forward window defers to the frozen holdout; a rigged one
+        promotes on memorised rows. When unsure, take the safe failure."""
+        from autoeng.lifecycle.retrain import row_fingerprints
+
+        store = PredictionStore(tmp_path / "log.db")
+        X_ho, y_ho = world["X_ho"], world["y_ho"]
+        for i in range(len(X_ho)):
+            request_id = store.log_prediction(payload=X_ho.iloc[i].to_dict(), prediction=0)
+            store.record_outcome(request_id, actual=int(y_ho.iloc[i]))
+        columns = list(X_ho.columns)
+        manifest = {"included_request_ids": [], "fingerprint_columns": columns,
+                    "training_row_fingerprints": row_fingerprints(X_ho, columns) * 3}
+
+        decision = gate_challenger(world["good"], world["bad"], store=store, manifest=manifest)
+        assert FORWARD_WINDOW not in decision.windows

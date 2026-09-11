@@ -57,6 +57,10 @@ MIN_ROWS_FOR_GATE = 30
 
 FROZEN_HOLDOUT = "frozen_holdout"
 FORWARD_WINDOW = "forward_window"
+# A frozen-holdout loss this large, as a share of the champion's own holdout
+# score, is not a regression a forward-window win may outvote. See
+# combine_windows.
+COLLAPSE_FOR_REVIEW = 0.5
 
 
 class GateVerdict(str, Enum):
@@ -293,6 +297,9 @@ class LifecycleGateDecision:
     windows: dict[str, GateDecision] = field(default_factory=dict)
     primary_window: str | None = None
     notes: list[str] = field(default_factory=list)
+    # Contradictory evidence no rule should settle: the champion stays and a
+    # person decides.
+    needs_review: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         primary = self.windows.get(self.primary_window) if self.primary_window else None
@@ -302,6 +309,7 @@ class LifecycleGateDecision:
             "reason": self.reason,
             "notes": self.notes,
             "primary_window": self.primary_window,
+            "needs_review": self.needs_review,
             # Kept at the top level in the shape autoeng/explain/qa.py reads.
             "comparison": primary.comparison.as_dict() if primary and primary.comparison else None,
             "windows": {name: decision.as_dict() for name, decision in self.windows.items()},
@@ -310,6 +318,16 @@ class LifecycleGateDecision:
 
 def _label(window: str) -> str:
     return window.replace("_", " ")
+
+
+def _holdout_collapse(holdout: GateDecision | None) -> float | None:
+    """Share of the champion's frozen-holdout score the challenger lost, if it regressed."""
+    if holdout is None or holdout.verdict != GateVerdict.REJECTED or holdout.comparison is None:
+        return None
+    champion = holdout.comparison.champion_score
+    if champion <= 0:
+        return None
+    return (champion - holdout.comparison.challenger_score) / champion
 
 
 def combine_windows(windows: dict[str, GateDecision], notes: list[str] | None = None) -> LifecycleGateDecision:
@@ -331,6 +349,11 @@ def combine_windows(windows: dict[str, GateDecision], notes: list[str] | None = 
     win promotes, with the regression stated rather than hidden.
 
     A forward-window regression always rejects.
+
+    The one exception to the forward window leading: if the challenger has
+    COLLAPSED on the frozen holdout (lost at least COLLAPSE_FOR_REVIEW of the
+    champion's score), a forward win cannot distinguish a regime change from a
+    corrupted label feed, so the verdict is inconclusive with needs_review set.
     """
     notes = list(notes or [])
     holdout = windows.get(FROZEN_HOLDOUT)
@@ -358,6 +381,22 @@ def combine_windows(windows: dict[str, GateDecision], notes: list[str] | None = 
                 windows, FORWARD_WINDOW, notes,
             )
         if forward.verdict == GateVerdict.PROMOTED:
+            # A mild holdout regression beside a forward win is what a real
+            # change looks like and promotes. A collapse beside it is also what a
+            # corrupted label feed looks like, and nothing in the data separates
+            # the two, so no verdict is earned.
+            collapse = _holdout_collapse(holdout)
+            if collapse is not None and collapse >= COLLAPSE_FOR_REVIEW:
+                return LifecycleGateDecision(
+                    GateVerdict.INCONCLUSIVE, False,
+                    f"Challenger not promoted: needs human review. It is better on recent labels "
+                    f"({forward.reason}) but has collapsed on the frozen holdout, losing "
+                    f"{collapse:.0%} of the champion's score ({holdout.reason}). That pair is what a "
+                    f"genuine regime change looks like and exactly what a corrupted label feed looks "
+                    f"like, and the data cannot tell them apart. The champion stays until a person "
+                    f"decides which it is.",
+                    windows, FORWARD_WINDOW, notes, needs_review=True,
+                )
             if holdout is not None and holdout.verdict == GateVerdict.REJECTED:
                 notes.append(
                     "The challenger is worse on the frozen holdout while better on recent traffic. "
@@ -501,9 +540,13 @@ def gate_challenger(
             fingerprints = set(fingerprint_list)
             fingerprint_columns = list(manifest.get("fingerprint_columns") or [])
             if fingerprints and fingerprint_columns and not forward.empty:
-                from autoeng.lifecycle.retrain import fingerprints_identify_rows, row_fingerprints
+                from autoeng.lifecycle.retrain import row_fingerprints
 
-                if not fingerprints_identify_rows(fingerprint_list):
+                # Decided at retrain time from the training frame's columns. A
+                # manifest without the flag errs towards excluding: an empty
+                # forward window defers to the frozen holdout, while a rigged one
+                # promotes on memorised rows.
+                if manifest.get("fingerprints_identify_observations") is False:
                     # Over a discrete feature space every vector recurs, so a
                     # match is not the same observation — and excluding matches
                     # would silently empty the window the gate relies on most.

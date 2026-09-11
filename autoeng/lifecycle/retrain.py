@@ -180,11 +180,11 @@ def should_retrain(
 
 
 _FINGERPRINT_SEPARATOR = chr(31)
-# Below this share of distinct vectors, identical feature vectors are an
-# ordinary property of a discrete feature space rather than evidence of the
-# same observation, and excluding every match would empty the data instead of
-# de-leaking it.
-MIN_FINGERPRINT_UNIQUENESS = 0.95
+# A column identifies observations when it takes at least this many values
+# and at least this share of the distinct vectors. Continuous readings clear
+# both; the axes of a small discrete grid clear neither.
+MIN_IDENTIFYING_VALUES = 10
+MIN_IDENTIFYING_SHARE = 0.5
 
 
 def _normalise_cell(value: Any) -> str:
@@ -219,20 +219,27 @@ def row_fingerprints(frame: pd.DataFrame, columns: list[str]) -> list[str]:
     return digests
 
 
-def fingerprints_identify_rows(fingerprints: list[str]) -> bool:
+def vectors_identify_observations(frame: pd.DataFrame, columns: list[str]) -> bool:
     """
     Whether an identical feature vector means the same observation.
 
     With continuous features it does: two customers do not share six
     four-decimal readings by chance, so a match is the row itself, served
-    again. With a handful of discrete features it does not — every possible
-    vector recurs constantly, "unseen" is not a property a vector can have, and
-    excluding matches would silently discard most of the data. The test is the
-    reference set's own duplication rate.
+    again. Over a small discrete grid it does not: every vector recurs, and
+    excluding matches would silently discard most of the data.
+
+    Judged on the DISTINCT vectors, never on how often rows repeat. The first
+    version used the duplication rate, but production serving the same
+    customers again duplicates rows too, which is exactly the situation content
+    exclusion exists for. It read repeated continuous observations as a
+    discrete space, switched exclusion off, and put back a promotion that had
+    rested entirely on memorised rows.
     """
-    if not fingerprints:
+    if frame is None or frame.empty or not columns:
         return False
-    return len(set(fingerprints)) / len(fingerprints) >= MIN_FINGERPRINT_UNIQUENESS
+    distinct = frame[columns].drop_duplicates()
+    needed = max(MIN_IDENTIFYING_VALUES, MIN_IDENTIFYING_SHARE * len(distinct))
+    return any(distinct[c].nunique(dropna=True) >= needed for c in columns)
 
 
 def _row_keys(frame: pd.DataFrame, columns: list[str]) -> list[tuple]:
@@ -348,7 +355,7 @@ def build_retraining_frame(
     if holdout is not None and not holdout.empty:
         shared = [c for c in feature_columns if c in holdout.columns]
         frozen = row_fingerprints(holdout, shared) if shared else []
-        if frozen and fingerprints_identify_rows(frozen):
+        if frozen and vectors_identify_observations(holdout, shared):
             frozen_set = set(frozen)
             keep = np.array([f not in frozen_set for f in row_fingerprints(new_rows, shared)], dtype=bool)
         elif frozen:
@@ -412,6 +419,11 @@ def build_retraining_frame(
         "warnings": warnings,
     }
     report["training_row_fingerprints"] = row_fingerprints(combined, report["fingerprint_columns"])
+    # Decided here, where the training columns are still available; the gate
+    # only ever sees hashes, which cannot tell a grid from recurring customers.
+    report["fingerprints_identify_observations"] = vectors_identify_observations(
+        combined, report["fingerprint_columns"],
+    )
     return combined, report
 
 
@@ -485,6 +497,7 @@ def retrain(
             "included_request_ids": frame_report.get("included_request_ids", []),
             "fingerprint_columns": frame_report.get("fingerprint_columns", []),
             "training_row_fingerprints": frame_report.get("training_row_fingerprints", []),
+            "fingerprints_identify_observations": frame_report.get("fingerprints_identify_observations", True),
             "n_holdout_rows_excluded": frame_report.get("n_holdout_rows_excluded", 0),
             "n_holdout_copies_excluded": frame_report.get("n_holdout_copies_excluded", 0),
             "n_new_rows_repeating_holdout_excluded": frame_report.get("n_new_rows_repeating_holdout_excluded", 0),

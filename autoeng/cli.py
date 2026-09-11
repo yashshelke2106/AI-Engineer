@@ -194,7 +194,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.apply:
             after = apply_gate_decision(args.models_root, record, challenger_dir, run_id)
             print(f"Production model: {(after or {}).get('model_dir')}")
-        # Distinct codes so a scheduled job can tell "worse" from "cannot tell yet".
+        # Distinct codes so a scheduled job can tell "worse" from "cannot tell yet"
+        # from "a person has to look": 0 promoted, 1 rejected, 2 inconclusive,
+        # 3 needs review (contradictory evidence the gate refuses to settle).
+        if decision.needs_review:
+            return 3
         return {GateVerdict.PROMOTED: 0, GateVerdict.REJECTED: 1}.get(decision.verdict, 2)
 
     if args.command == "ask":

@@ -183,3 +183,47 @@ class TestCombiningWindows:
     def test_nothing_usable_keeps_the_champion(self):
         decision = combine_windows({FORWARD_WINDOW: self._decision(GateVerdict.INCONCLUSIVE, rows=None)})
         assert decision.verdict == GateVerdict.INCONCLUSIVE and not decision.promote
+
+
+class TestCollapseNeedsReview:
+    """
+    Found by running the lifecycle on a multiclass target with a corrupted
+    label feed. The challenger, trained on those labels, collapsed on the
+    frozen holdout (accuracy 0.972 -> 0.167) while matching the corrupted
+    recent labels better (0.028 -> 0.426), and the window rule promoted it.
+
+    That pair of observations is what a genuine regime change looks like and
+    exactly what a broken label feed looks like: the data cannot tell them
+    apart, so neither verdict is earned. A mild holdout regression beside a
+    forward win still promotes, as a real change requires. A collapse keeps the
+    champion and asks a person.
+    """
+
+    @staticmethod
+    def _decision(verdict, champion, challenger, rows=200):
+        difference = challenger - champion
+        comparison = Comparison(
+            metric="accuracy", champion_score=champion, challenger_score=challenger,
+            difference=difference, ci_low=difference - 0.03, ci_high=difference + 0.03,
+            n_bootstrap=100, n_rows=rows, alpha=0.05,
+        )
+        return GateDecision(verdict=verdict, promote=verdict == GateVerdict.PROMOTED,
+                            reason=verdict.value, comparison=comparison)
+
+    def test_a_holdout_collapse_beside_a_forward_win_needs_review(self):
+        decision = combine_windows({
+            FROZEN_HOLDOUT: self._decision(GateVerdict.REJECTED, 0.972, 0.167),
+            FORWARD_WINDOW: self._decision(GateVerdict.PROMOTED, 0.028, 0.426),
+        })
+        assert not decision.promote
+        assert decision.verdict == GateVerdict.INCONCLUSIVE
+        assert decision.needs_review and decision.as_dict()["needs_review"] is True
+        assert "label" in decision.reason, "the review reason must name the label-feed hypothesis"
+
+    def test_a_mild_holdout_regression_beside_a_forward_win_still_promotes(self):
+        """The measured T1-5 concept change: 0.687 -> 0.605 on the holdout."""
+        decision = combine_windows({
+            FROZEN_HOLDOUT: self._decision(GateVerdict.REJECTED, 0.687, 0.605),
+            FORWARD_WINDOW: self._decision(GateVerdict.PROMOTED, 0.535, 0.679),
+        })
+        assert decision.promote and not decision.needs_review

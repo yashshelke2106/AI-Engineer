@@ -306,7 +306,7 @@ and `customer_id` grouping pinned and no group overlap.
 `autoeng/lifecycle/gate.py` decides; `autoeng/registry/champion.py` is
 production. `python -m autoeng.cli gate <champion> <challenger> --models-root
 <root> --apply --tracking-uri <uri>` exits 0 promoted, 1 rejected, 2
-inconclusive.
+inconclusive, 3 needs human review.
 
 **Verified end to end through `run_pipeline`**, with the champion serving
 *through* the production pointer. Two challengers were retrained on 1,200
@@ -356,7 +356,12 @@ the logged intervals on each window.
   second row of the table above — the retrain drift detection asked for. The
   forward window leads when it has enough rows; the frozen holdout decides
   otherwise; a forward-window regression always rejects; a holdout regression
-  alongside a forward win promotes *with the regression stated*.
+  alongside a forward win promotes *with the regression stated*. The exception
+  is a **collapse** (losing at least half the champion's holdout score): that is
+  also exactly what a corrupted label feed looks like, so it is inconclusive
+  with `needs_review`. Measured on a multiclass challenger retrained on
+  corrupted labels: holdout accuracy 0.972 -> 0.167, forward 0.028 -> 0.426,
+  exit 3, pointer unmoved. It had been promoted before this rule existed.
 - **String class labels.** The metrics count class 1 as positive, so a
   `"benign"/"malignant"` target would score F1 = 0 for both models and every
   gate would read as a tie, freezing the champion forever. Labels are mapped
@@ -404,7 +409,7 @@ Roughly 2,300 lines and 40 tests across all fourteen items; Tier 0 alone is
 about 530 lines and closes the gap between what the report claims and what the
 model does.
 
-Current state: 219 tests passing, 10/10 on unambiguous problem-type detection,
+Current state: 224 tests passing, 10/10 on unambiguous problem-type detection,
 7.4× search speedup from successive halving. **Tiers 0 and 1 are complete.**
 A trained model is persisted with its schema and a frozen holdout (T0-1),
 decides at an out-of-fold threshold (T0-2), and is split entity-aware (T0-3);

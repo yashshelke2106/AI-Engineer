@@ -14,7 +14,7 @@ everything to MLflow, and writes a report.
 python -m autoeng.cli run data/any.csv          # infer everything
 python -m autoeng.cli run data.csv --target y   # or pin the target
 python -m autoeng.cli ask <run_id> "why did you reject random_forest?"
-pytest tests/ -q                                # 219 tests, ~220s
+pytest tests/ -q                                # 224 tests, ~220s
 python scripts/calibrate_detection.py           # detection accuracy, 10/10 expected
 ```
 
@@ -142,7 +142,10 @@ disqualifies."** Under genuine concept drift a correct challenger must score
 worse on the old holdout; that rule blocks every retrain drift detection asks
 for. The forward window leads when it has enough rows, a forward regression
 always rejects, and a holdout regression alongside a forward win promotes with
-the regression stated. Do not "tighten" this back.
+the regression stated. Do not "tighten" this back. The one exception is a
+COLLAPSE (the challenger losing at least half of the champion's holdout
+score): that pair is also exactly what a corrupted label feed looks like, so
+it is inconclusive with `needs_review` and `gate` exits 3.
 
 **7i. Production is `CHAMPION.json`, and only a promotion moves it.** Serving
 follows the pointer; rejections and inconclusive verdicts are logged to
@@ -231,6 +234,15 @@ inside each fold (T2-2).
   type, and a baseline sharing no live metric is UNKNOWN. Fixing only one of
   the two creates a permanent false alarm: test string labels and regression
   whenever either is touched.
+- **A guard against one failure reopened another.** Content exclusion needs to
+  know whether an identical feature vector is the same observation. The first
+  guard judged that by how often training rows repeated, but recurring
+  customers repeat rows too, which is exactly what content exclusion exists
+  for, so it read them as a discrete feature space and switched exclusion off.
+  The contaminated T1-5 log was back to promoting on memorised rows. It is now
+  judged on the columns of the DISTINCT vectors (`vectors_identify_observations`)
+  at retrain time and written to the manifest. After changing any exclusion,
+  re-run it against the preserved contaminated logs, not only the unit tests.
 - **Model-store failures are reported, not raised.** A serialization problem
   must not discard a completed leaderboard, HPO sweep and explanation. But the
   report then says the model was *not* persisted, with the error. Never
@@ -277,7 +289,7 @@ autoeng/
 
 ## Current state
 
-219 tests passing. Detection 10/10 on unambiguous cases (iris is genuinely
+224 tests passing. Detection 10/10 on unambiguous cases (iris is genuinely
 ambiguous and excluded). Successive halving gives 7.4× speedup with an
 identical winner.
 

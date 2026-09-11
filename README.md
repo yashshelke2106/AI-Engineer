@@ -24,7 +24,7 @@ python -m autoeng.cli serve runs/models/<run_name>         # score rows over HTT
 python -m autoeng.cli drift runs/models/<run_name>         # data / prediction / concept drift
 python -m autoeng.cli gate <champion> <challenger> --models-root runs/production --apply
 
-pytest tests/ -q                                           # 219 tests, ~220s
+pytest tests/ -q                                           # 224 tests, ~220s
 python scripts/calibrate_detection.py                      # detection accuracy harness
 ```
 
@@ -172,6 +172,13 @@ disqualifies": after a real change, the right model has to look worse on the
 old holdout. The first row is why the forward window never excuses a regression
 on recent traffic.
 
+One case promotes neither way. Retrained on a corrupted label feed, a
+multiclass challenger collapsed on the frozen holdout (accuracy 0.972 -> 0.167)
+while matching the corrupted recent labels better (0.028 -> 0.426). That pair
+is what a genuine regime change looks like and exactly what a broken label
+feed looks like, so the gate keeps the champion, sets `needs_review`, and
+exits 3.
+
 ## Target detection: the hard part
 
 Picking the target column in an undescribed dataset is the bottleneck the
@@ -301,6 +308,13 @@ part:
   three standard deviations read `ok` (now `alarm`, r2 -8.5). Repairing the
   threshold alone would have stored an F1 baseline for that broken check to
   compare 0.0 against: a permanent false alarm on a healthy model.
+- **A guard added for one failure reopened another.** Content matching must
+  not empty a small discrete feature space, and the first guard decided that
+  from how often training rows repeated. Recurring customers repeat rows too,
+  so it switched exclusion off on exactly the traffic exclusion exists for,
+  and the contaminated log went back to promoting on memorised rows. Found
+  only by re-running that log after the change; distinctiveness is now judged
+  on the distinct vectors' columns.
 - **The most dangerous serving behaviour is the most convenient one.** When a
   request arrives without a feature, the pipeline's imputer is right there and
   filling in the median makes the request succeed. What comes back is a
@@ -396,7 +410,7 @@ autoeng/
   reporting/       Markdown report generation
   pipeline.py      end-to-end orchestration
   cli.py           command-line entry point
-tests/             219 tests: planted leaks, regressions for every shipped bug, unit tests
+tests/             224 tests: planted leaks, regressions for every shipped bug, unit tests
 scripts/           detection calibration harness
 data/              synthetic + real validation datasets
 runs/              reports + MLflow store from the validation runs
