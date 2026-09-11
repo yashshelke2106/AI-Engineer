@@ -609,6 +609,24 @@ def gate_challenger(
                     "The retrain manifest carries no training-row fingerprints, so forward-window "
                     "rows repeating a training payload under a new request id could not be excluded."
                 )
+            # The entity version of the leaks above: a new visit from a customer the
+            # challenger retrained on matches no request id and no vector, but the
+            # challenger predicts that customer from memory and the champion cannot.
+            challenger_only = {str(e) for e in (manifest.get("challenger_only_entities") or [])}
+            if group_column and challenger_only and not forward.empty and group_column in forward.columns:
+                from autoeng.lifecycle.retrain import normalise_entity_key
+
+                keys = [normalise_entity_key(v) for v in forward[group_column]]
+                seen = np.array([k in challenger_only for k in keys], dtype=bool)
+                if seen.any():
+                    n_entities = len({k for k, s in zip(keys, seen) if s})
+                    notes.append(
+                        f"{int(seen.sum())} forward-window row(s) from {n_entities} {group_column} "
+                        f"value(s) that only the challenger trained on were excluded. They are new "
+                        f"visits, so no request id or vector matches, but a model trained on an "
+                        f"entity predicts it from memory."
+                    )
+                    forward = forward.loc[~seen]
             if forward.empty:
                 notes.append(
                     "Every labelled prediction was used to train the challenger, so there is no "
@@ -616,14 +634,27 @@ def gate_challenger(
                 )
             else:
                 try:
-                    windows[FORWARD_WINDOW] = score(forward, forward["actual"])
-                    if group_column:
+                    forward_groups = None
+                    if group_column and group_column in forward.columns:
+                        from autoeng.detection.group_detector import GroupDecision, group_values
+
+                        forward_groups = group_values(forward, GroupDecision(column=group_column, confidence=1.0))
+                    windows[FORWARD_WINDOW] = score(forward, forward["actual"], groups=forward_groups)
+                    n_without_key = (0 if not group_column else len(forward) if forward_groups is None
+                                     else int(forward[group_column].isna().sum()))
+                    if n_without_key == len(forward):
                         notes.append(
-                            f"The champion groups rows by '{group_column}', but served payloads never "
-                            f"carry it, so the forward window is resampled by row. If entities recur "
-                            f"in recent traffic its interval is optimistic: on the frozen holdout, "
-                            f"resampling rows instead of entities halved the interval and turned an "
-                            f"undecidable comparison into a rejection."
+                            f"The champion groups rows by '{group_column}', but no forward-window "
+                            f"payload carried it, so the window is resampled by row. If entities "
+                            f"recur in recent traffic its interval is optimistic: on this project's "
+                            f"grouped data, resampling rows made the interval 1.9-2.1x too narrow. "
+                            f"/model publishes '{group_column}' as the entity key to send."
+                        )
+                    elif n_without_key:
+                        notes.append(
+                            f"{n_without_key} of {len(forward)} forward-window row(s) arrived without "
+                            f"'{group_column}' and are resampled as independent entities, so the "
+                            f"interval is optimistic to the extent those rows repeat an entity."
                         )
                 except ValueError as e:
                     notes.append(f"The forward window could not be scored: {e}.")

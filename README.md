@@ -24,7 +24,7 @@ python -m autoeng.cli serve runs/models/<run_name>         # score rows over HTT
 python -m autoeng.cli drift runs/models/<run_name>         # data / prediction / concept drift
 python -m autoeng.cli gate <champion> <challenger> --models-root runs/production --apply
 
-pytest tests/ -q                                           # 229 tests, ~220s
+pytest tests/ -q                                           # 238 tests, ~220s
 python scripts/calibrate_detection.py                      # detection accuracy harness
 ```
 
@@ -183,8 +183,11 @@ On grouped data the bootstrap resamples entities, not rows. The frozen
 holdout's 150 rows above are 30 customers; resampled by row its interval was
 half as wide as the evidence allows and read as a rejection, and resampled by
 customer both holdout comparisons are inconclusive. Both verdicts above rest on
-the forward window, which is still resampled by row because served payloads
-carry no customer key.
+the forward window. Those payloads carried no customer key, so it was resampled
+by row; recovering the customers from the traffic and resampling by them widens
+both forward intervals about 2x ([-0.132, -0.007] and [+0.055, +0.240]) and
+neither verdict moves. Serving now accepts the key, so later windows are
+resampled by customer directly.
 
 ## Target detection: the hard part
 
@@ -327,6 +330,14 @@ part:
   rows. A 150-row holdout of 30 customers is 30 customers' worth of evidence:
   resampled by row, its interval was 2.07x too narrow and a comparison the data
   could not decide read as a rejection. Entities are now resampled together.
+- **A customer is not a row in the lifecycle either.** A frozen-holdout customer
+  coming back on a new visit has a new vector, so the check for repeated holdout
+  rows passed it. Retrained on 150 such visits, a challenger was promoted on the
+  frozen holdout (F1 0.687 -> 0.970) and on the forward window, where its whole
+  gain came from customers it had retrained on (0.448 -> 0.970; on unseen
+  customers 0.660 -> 0.684, the interval spanning zero). Serving rejected the
+  customer key as an unknown column, so nothing downstream could see it. It now
+  travels with the payload, and the same traffic reads inconclusive.
 - **The most dangerous serving behaviour is the most convenient one.** When a
   request arrives without a feature, the pipeline's imputer is right there and
   filling in the median makes the request succeed. What comes back is a
@@ -422,7 +433,7 @@ autoeng/
   reporting/       Markdown report generation
   pipeline.py      end-to-end orchestration
   cli.py           command-line entry point
-tests/             229 tests: planted leaks, regressions for every shipped bug, unit tests
+tests/             238 tests: planted leaks, regressions for every shipped bug, unit tests
 scripts/           detection calibration harness
 data/              synthetic + real validation datasets
 runs/              reports + MLflow store from the validation runs

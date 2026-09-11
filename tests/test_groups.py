@@ -176,8 +176,8 @@ class TestGroupOverlapFlag:
 class TestGroupValuesSurviveMissingKeys:
     """
     Found by a real retrain, not by reasoning: rows appended from the
-    prediction log never carry the group column (it is excluded from
-    features, so no payload contains it), and a NaN among string ids made
+    prediction log carry the group column only when the caller sent it as the
+    entity key (it is not a feature, so nothing requires it), and a NaN among string ids made
     StratifiedGroupKFold raise `'<' not supported between 'float' and 'str'`
     inside its sort. Real datasets have null keys too, so this is not a
     retraining edge case.

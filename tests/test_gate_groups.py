@@ -117,15 +117,15 @@ def test_gate_challenger_resamples_the_frozen_holdout_by_entity(tmp_path):
     assert comparison.n_rows == 100
     assert comparison.n_groups == 20, "the frozen holdout must be resampled by customer"
 
-    # Served payloads never carry the group key, so the forward window cannot
-    # be resampled by entity — and the decision has to say so.
+    # Payloads served without the entity key cannot be resampled by entity —
+    # and the decision has to say so.
     store = PredictionStore(tmp_path / "log.db")
     for i in range(len(X_ho)):
         request_id = store.log_prediction(payload=X_ho.iloc[i].to_dict(), prediction=0)
         store.record_outcome(request_id, actual=int(y_ho.iloc[i]))
     with_forward = gate_challenger(good, bad, store=store, manifest={"included_request_ids": []})
     assert with_forward.windows[FORWARD_WINDOW].comparison.n_groups is None
-    assert any("never carry it" in note for note in with_forward.notes), with_forward.notes
+    assert any("no forward-window payload carried it" in note for note in with_forward.notes), with_forward.notes
 
 
 def test_ask_names_the_window_its_figures_come_from(tmp_path):

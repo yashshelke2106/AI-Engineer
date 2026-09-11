@@ -267,9 +267,9 @@ def group_values(df: pd.DataFrame, decision: GroupDecision) -> np.ndarray | None
     reasoning about it:
 
       - **Missing keys become singleton groups.** Rows appended from the
-        prediction log never carry the group column — it is excluded from
-        features, so it is never part of a payload — and real datasets have
-        null keys too. A NaN mixed into string ids makes the splitters'
+        prediction log carry the group column only when the caller sent it as
+        the entity key — it is not a feature, so nothing requires it — and
+        real datasets have null keys too. A NaN mixed into string ids makes the splitters'
         internal sort raise `'<' not supported between 'float' and 'str'`.
         Each null row gets its own group, i.e. it is treated as an independent
         entity. That is optimistic if two such rows are secretly the same

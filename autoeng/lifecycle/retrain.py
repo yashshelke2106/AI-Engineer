@@ -200,6 +200,28 @@ def _normalise_cell(value: Any) -> str:
     return str(value)
 
 
+def normalise_entity_key(value: Any) -> str | None:
+    """
+    One spelling per entity across the CSV, the frozen holdout and the JSON log.
+
+    A numeric id read back from a column that also holds nulls comes out as a
+    float, so 1001 and 1001.0 have to be the same customer; and a null is no key
+    at all, not an entity called "nan" that every keyless row would share.
+    """
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, (bool, np.bool_)):
+        return str(bool(value))
+    if isinstance(value, (float, np.floating)) and float(value).is_integer():
+        return str(int(value))
+    if isinstance(value, (int, np.integer)):
+        return str(int(value))
+    return str(value)
+
+
 def row_fingerprints(frame: pd.DataFrame, columns: list[str]) -> list[str]:
     """
     Content fingerprints of rows over `columns`, stable across CSV and JSON.
@@ -319,11 +341,17 @@ def build_retraining_frame(
     Original training data, minus the champion's frozen holdout, plus
     everything that has since been served and labelled.
 
-    New rows carry only what was actually sent to `/predict`, which is the
-    feature set — identifier and group columns were never part of a payload and
-    so cannot be reconstructed. They are left null and reported rather than
-    invented or silently dropped: filling them fabricates data, and dropping
-    the column changes the dataset's shape between generations.
+    New rows carry only what was actually sent to `/predict`: the feature set,
+    plus the entity key when the caller sent it. Identifier columns were never
+    part of a payload and cannot be reconstructed. They are left null and
+    reported rather than invented or silently dropped: filling them fabricates
+    data, and dropping the column changes the dataset's shape between
+    generations.
+
+    The entity key matters twice. It lets an entity's served rows share a group
+    in every split of the retrain rather than one singleton each, and it is the
+    only way to see that a frozen-holdout customer came back on a NEW visit —
+    different vector, same customer, which vector matching cannot catch.
     """
     labelled = store.labelled_frame(since=since)
     if labelled is None or labelled.empty:
@@ -339,8 +367,10 @@ def build_retraining_frame(
 
     target = (schema.get("target") or {}).get("column")
     feature_columns = [c for c in (schema.get("feature_columns") or []) if c in labelled.columns]
+    group_column = (schema.get("feature_roles") or {}).get("group_column")
+    carries_key = bool(group_column) and group_column in labelled.columns and group_column not in feature_columns
 
-    new_rows = labelled[feature_columns].copy()
+    new_rows = labelled[feature_columns + ([group_column] if carries_key else [])].copy()
     # The store calls it `actual`; the pipeline needs it under the target's own
     # name, or the pinned --target would refer to a column that is not there.
     new_rows[target] = labelled["actual"].to_numpy()
@@ -364,12 +394,31 @@ def build_retraining_frame(
                 "space), so a new row repeating one cannot be told apart from ordinary recurrence "
                 "and none were excluded."
             )
-    new_rows = new_rows.loc[keep]
     holdout_repeats = int((~keep).sum())
+
+    # The same customer on a new visit: a different vector, so the check above
+    # passes it, but the same entity the frozen holdout holds out. A model that
+    # trains on it scores that customer's frozen rows from memory.
+    holdout_grouped = (holdout is not None and not holdout.empty and bool(group_column)
+                       and group_column in holdout.columns)
+    entity_repeats = np.zeros(len(labelled), dtype=bool)
+    if carries_key and holdout_grouped:
+        frozen_entities = {k for k in map(normalise_entity_key, holdout[group_column]) if k is not None}
+        entity_repeats = keep & np.array(
+            [normalise_entity_key(v) in frozen_entities for v in new_rows[group_column]], dtype=bool,
+        )
+        keep = keep & ~entity_repeats
+    n_entity_repeats = int(entity_repeats.sum())
+    n_frozen_entities_returned = (
+        len({normalise_entity_key(v) for v in new_rows.loc[entity_repeats, group_column]}) if n_entity_repeats else 0
+    )
+
+    new_rows = new_rows.loc[keep]
     if new_rows.empty:
         raise ValueError(
-            "Every new labelled prediction repeats a frozen holdout row. Training on them would "
-            "rig the gate, and without them there is nothing new to retrain on."
+            "Every new labelled prediction repeats a frozen holdout row or belongs to a frozen "
+            "holdout entity. Training on them would rig the gate, and without them there is "
+            "nothing new to retrain on."
         )
 
     missing = [c for c in original.columns if c not in new_rows.columns]
@@ -378,7 +427,18 @@ def build_retraining_frame(
 
     combined = pd.concat([original, new_rows[original.columns]], ignore_index=True)
 
-    group_column = (schema.get("feature_roles") or {}).get("group_column")
+    n_without_key = 0
+    if group_column:
+        n_without_key = int(new_rows[group_column].isna().sum()) if carries_key else len(new_rows)
+    challenger_only_entities: list[str] = []
+    if carries_key:
+        original_entities = (
+            {normalise_entity_key(v) for v in original[group_column]} if group_column in original.columns else set()
+        )
+        challenger_only_entities = sorted(
+            {k for k in map(normalise_entity_key, new_rows[group_column]) if k is not None} - original_entities
+        )
+
     warnings: list[str] = []
     warnings.extend(content_warnings)
     if holdout_repeats:
@@ -387,13 +447,26 @@ def build_retraining_frame(
             f"holdout's own customers, served again) and were kept out of retraining, or the "
             f"frozen holdout would no longer measure anything."
         )
-    if group_column and group_column in missing:
+    if n_entity_repeats:
         warnings.append(
-            f"The champion grouped on '{group_column}', but served payloads never carried it, "
-            f"so the {len(new_rows)} new row(s) have no group key. Each is given its own "
-            f"singleton group — treated as an independent entity — which is optimistic if the "
-            f"same entity was served more than once."
+            f"{n_entity_repeats} new labelled row(s) from {n_frozen_entities_returned} frozen-holdout "
+            f"{group_column} value(s), served again on new visits, were kept out of retraining. Their "
+            f"vectors differ, so vector matching passes them, but a model trained on an entity "
+            f"scores that entity's frozen rows from memory."
         )
+    if n_without_key:
+        warning = (
+            f"The champion grouped on '{group_column}', but {n_without_key} of {len(new_rows)} new "
+            f"row(s) were served without it. Each is given its own singleton group — treated as "
+            f"an independent entity — which is optimistic if the same entity was served more "
+            f"than once."
+        )
+        if holdout_grouped:
+            warning += (
+                " Those rows also cannot be checked against the frozen holdout's entities, so "
+                "only exact repeats of frozen vectors were excluded."
+            )
+        warnings.append(warning + f" /model publishes '{group_column}' as the entity key to send.")
     if missing:
         warnings.append(
             f"{len(missing)} column(s) present in the original data are absent from served "
@@ -405,6 +478,13 @@ def build_retraining_frame(
         "n_holdout_rows_excluded": excluded_rows,
         "n_holdout_copies_excluded": excluded_copies,
         "n_new_rows_repeating_holdout_excluded": holdout_repeats,
+        "n_new_rows_of_holdout_entities_excluded": n_entity_repeats,
+        "n_new_rows_without_group_key": n_without_key,
+        "group_column": group_column,
+        # Entities the challenger has trained on and the champion never saw.
+        # Forward-window rows from them are the entity version of scoring the
+        # challenger on rows it was fitted to.
+        "challenger_only_entities": challenger_only_entities,
         "n_new_rows": int(len(new_rows)),
         "n_total_rows": int(len(combined)),
         "columns_missing_from_new_rows": missing,
@@ -501,6 +581,10 @@ def retrain(
             "n_holdout_rows_excluded": frame_report.get("n_holdout_rows_excluded", 0),
             "n_holdout_copies_excluded": frame_report.get("n_holdout_copies_excluded", 0),
             "n_new_rows_repeating_holdout_excluded": frame_report.get("n_new_rows_repeating_holdout_excluded", 0),
+            "n_new_rows_of_holdout_entities_excluded": frame_report.get("n_new_rows_of_holdout_entities_excluded", 0),
+            "n_new_rows_without_group_key": frame_report.get("n_new_rows_without_group_key", 0),
+            "group_column": frame_report.get("group_column"),
+            "challenger_only_entities": frame_report.get("challenger_only_entities", []),
             "overrides": overrides,
         }
         manifest_path = Path(challenger_dir) / RETRAIN_MANIFEST

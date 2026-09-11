@@ -14,7 +14,7 @@ everything to MLflow, and writes a report.
 python -m autoeng.cli run data/any.csv          # infer everything
 python -m autoeng.cli run data.csv --target y   # or pin the target
 python -m autoeng.cli ask <run_id> "why did you reject random_forest?"
-pytest tests/ -q                                # 229 tests, ~220s
+pytest tests/ -q                                # 238 tests, ~220s
 python scripts/calibrate_detection.py           # detection accuracy, 10/10 expected
 ```
 
@@ -124,8 +124,8 @@ makes the most-used categorical look unused and discounts its drift to zero.
 importance so unattributable mass (derived interactions) is lost rather than
 inflating the columns that did match.
 
-**7g. Neither model may have been fitted to the rows the gate scores.**
-Four leaks, each found or confirmed in a real run, each silent, each in the
+**7g. Neither model may have been fitted to the rows — or the entities — the gate scores.**
+Six leaks, each found or confirmed in a real run, each silent, each in the
 challenger's favour: the champion's holdout inside the retraining frame
 (excluded via `freeze_holdout` + `_exclude_holdout`), forward-window
 predictions the challenger trained on (excluded by the manifest's request
@@ -134,8 +134,17 @@ ids), and the same payload served again under a new id (excluded by
 gap end to end, and was the only thing holding up one promotion). The fourth: the holdout's own customers served again through the log, excluded
 as new rows repeating a frozen vector (it took a random forest from F1 0.464 to
 1.000 on the holdout). Content matching is skipped unless vectors are at least
-95% distinct, or a discrete feature space would be emptied. A new evaluation
-path must close all four.
+95% distinct, or a discrete feature space would be emptied.
+The fifth and sixth are the same leaks one level up, on grouped data: an
+entity that comes back on a NEW visit matches no id and no vector. A
+frozen-holdout customer's new visits are excluded from retraining by entity key
+(trained on, they turned the holdout comparison from inconclusive into a
+promotion, 0.687 -> 0.970), and forward rows from entities only the challenger
+retrained on are excluded via the manifest's `challenger_only_entities` (the
+challenger scored 0.970 against 0.448 on them while indistinguishable on unseen
+customers, and the gate promoted). Both need the entity key in the payload;
+without it neither can be closed, and the retrain and the gate say so. A new
+evaluation path must close all six.
 
 **7h. The gate's window rule is deliberately NOT "a regression on either
 disqualifies."** Under genuine concept drift a correct challenger must score
@@ -161,8 +170,10 @@ also excluded from features: it identifies the entity rather than describing
 it. Measured on `data/synthetic_grouped.csv`: 1.000 ROC-AUC ungrouped against
 0.730 grouped. This includes the gate's bootstrap: the frozen holdout is
 resampled by entity (row resampling made its interval 2.07x too narrow and
-turned an undecidable comparison into a rejection). The forward window cannot
-be, because served payloads never carry the group key; the gate says so.
+turned an undecidable comparison into a rejection). So is the forward window,
+when payloads carry the entity key: serving accepts the group column without
+requiring or scoring it, and `/model` publishes it as `entity_key`. Keyless
+rows are resampled as independent entities and the gate says how many.
 
 **8a. Turning a safety check off must not turn its warning off.**
 `--no-groups` still runs detection and still raises the `group_overlap` flag.
@@ -224,8 +235,8 @@ inside each fold (T2-2).
   a lifecycle item done.
 - **Null or mixed-type group keys crash sklearn's group splitters** with
   `'<' not supported between 'float' and 'str'`. Rows appended from the
-  prediction log never carry the group column (it is excluded from features, so
-  no payload contains it). `group_values()` gives nulls singleton groups and
+  prediction log carry the group column only when the caller sent the entity
+  key, so it is null on the rest. `group_values()` gives nulls singleton groups and
   stringifies labels — always take groups from it, never `df[col].to_numpy()`.
 - **Integer 0/1 labels were silently assumed in two places.** `select_threshold`
   did `astype(int)` and raised on "benign"/"malignant"; the pipeline caught it
@@ -292,7 +303,7 @@ autoeng/
 
 ## Current state
 
-229 tests passing. Detection 10/10 on unambiguous cases (iris is genuinely
+238 tests passing. Detection 10/10 on unambiguous cases (iris is genuinely
 ambiguous and excluded). Successive halving gives 7.4× speedup with an
 identical winner.
 

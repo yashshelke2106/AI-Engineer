@@ -294,8 +294,9 @@ and `customer_id` grouping pinned and no group overlap.
    and the group pin was a silent no-op. The pin test passed because it built
    the schema dict by hand. It now builds through `build_training_schema`.
 2. **A null group key crashed every group-aware splitter.** Rows appended from
-   the prediction log never carry the group column — it is excluded from
-   features, so no payload contains it — and a NaN among string ids made
+   the prediction log did not carry the group column — it is excluded from
+   features, and serving then rejected it as an unknown column (since fixed,
+   see T1-5) — and a NaN among string ids made
    `StratifiedGroupKFold` raise `'<' not supported between 'float' and 'str'`.
    `group_values` now gives null keys singleton groups and stringifies labels.
    That also fixes real datasets with partially-null keys, which would have hit
@@ -321,8 +322,12 @@ labelled rows each, then gated on 300 rows of freshly generated customers:
 "rejected", resampled rows. The holdout's 150 rows are 30 customers; resampled
 by customer the interval is 2.07x wider and the holdout comparison is
 inconclusive for both challengers. The final verdicts rest on the forward
-window and did not change, but that window is still resampled by row, because
-served payloads never carry the customer key.
+window and did not change. That traffic carried no customer key and was
+resampled by row; its customers can be recovered from the log (five consecutive
+visits each, one region and one label per block), and resampled by them the
+forward intervals are 1.90x and 2.01x wider, [-0.132, -0.007] and
+[+0.055, +0.240], with both verdicts unchanged. Serving now accepts the key
+(leak 6 below).
 
 `ask <challenger_run_id> "why did you reject the latest model"` answers from
 the logged intervals on each window.
@@ -330,7 +335,7 @@ the logged intervals on each window.
 - **"Stays out of production" needed a production.** `CHAMPION.json` names the
   active model; serving follows it; only a promotion moves it; every decision,
   including the ones that change nothing, is appended to `gate_log.jsonl`.
-- **The comparison had four ways to be rigged, and each is now closed:**
+- **The comparison had six ways to be rigged, and each is now closed:**
   1. *The challenger trained on the champion's holdout.* The retraining frame
      contained the original rows. The holdout is now frozen with the artifact
      and excluded from every retraining frame — by source-row position,
@@ -357,6 +362,43 @@ the logged intervals on each window.
      run then leaves 0 of 150 and scores 0.464. Content matching applies only when
      vectors are distinctive (at least 95% unique): over a small discrete feature
      space every vector recurs, and matching would empty the data instead.
+  5. *A holdout customer came back on a new visit.* Leak 4 one level up: a new
+     visit is a new vector, so vector matching passed it, but it is the same
+     customer the holdout holds out, and the model memorises customers through
+     their stable attributes. Measured by retraining the T1-5 champion on 300
+     new visits, identical except for who they came from: with 150 of them from
+     the 30 frozen-holdout customers the holdout comparison read **promoted,
+     0.687 -> 0.970, CI [+0.144, +0.457]**, resampled by customer; with none it
+     read inconclusive, 0.687 -> 0.585. New rows whose entity key is in the frozen
+     holdout are now excluded; the same traffic then leaves 150 new rows and
+     reads inconclusive, 0.687 -> 0.712, CI [-0.056, +0.120].
+  6. *The forward window held customers only the challenger had trained on.*
+     Leaks 2 and 3 one level up. The gate promoted that challenger on the
+     forward window (0.568 -> 0.800), and split by customer the whole gain was
+     memory: 0.448 -> 0.970 on the 30 customers it had retrained on,
+     indistinguishable (0.660 -> 0.684, CI [-0.040, +0.089]) on 30 nobody had
+     seen. The manifest now records `challenger_only_entities` and the gate
+     excludes their rows. Same traffic: 150 rows excluded, the remaining 300
+     resampled across 60 customers, inconclusive, CI [-0.026, +0.087]. The
+     champion stays.
+
+  Leaks 5 and 6 need the entity key, which serving used to reject as an unknown
+  column. It is now accepted without being required or scored, published by
+  `/model` as `entity_key`, logged with the payload, and carried into the
+  retraining frame, so an entity's served rows also share a group in every
+  split of the retrain instead of one singleton each. Rows sent without it
+  cannot be checked, and both the retrain report and the gate count them.
+
+  Grouping the served rows changed the retrain itself, not only its
+  evaluation. With keyless new rows, each its own group, both probe retrains
+  selected lightgbm on out-of-fold F1 0.746 and 0.737, one of them at a
+  threshold of 0.010; with the key they scored 0.653 and 0.673 out of fold (the
+  first on the 150 rows left after exclusion) and selected a stacked ensemble
+  and adaboost. The clean arm's challenger went from 0.585 to 0.698 on the
+  frozen holdout and was promoted on the 30 unseen customers, 0.660 -> 0.732,
+  CI [+0.015, +0.158] by customer: the only promotion in the probe that
+  survives both fixes. One run each, so read the model choice as what
+  singleton groups let selection reward, not as a benchmark.
 - **The window rule is not "a regression on either disqualifies."** That rule
   sounds safe and breaks the lifecycle: under genuine concept drift a correct
   challenger *must* score worse on the old holdout. It would have blocked the
@@ -416,7 +458,7 @@ Roughly 2,300 lines and 40 tests across all fourteen items; Tier 0 alone is
 about 530 lines and closes the gap between what the report claims and what the
 model does.
 
-Current state: 229 tests passing, 10/10 on unambiguous problem-type detection,
+Current state: 238 tests passing, 10/10 on unambiguous problem-type detection,
 7.4× search speedup from successive halving. **Tiers 0 and 1 are complete.**
 A trained model is persisted with its schema and a frozen holdout (T0-1),
 decides at an out-of-fold threshold (T0-2), and is split entity-aware (T0-3);

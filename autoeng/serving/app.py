@@ -40,7 +40,7 @@ from autoeng.registry.champion import read_champion
 from autoeng.registry.model_store import MODEL_FILENAME, SCHEMA_FILENAME, load_model
 from autoeng.serving.predictor import predict_frame, threshold_from_schema
 from autoeng.serving.store import PredictionStore, UnknownRequestError, new_request_id
-from autoeng.serving.validation import validate_payload
+from autoeng.serving.validation import entity_key_column, validate_payload
 
 MODEL_DIR_ENV = "AUTOENG_MODEL_DIR"
 STORE_PATH_ENV = "AUTOENG_PREDICTION_LOG"
@@ -109,6 +109,25 @@ def _serving_contract(schema: dict[str, Any]) -> dict[str, Any]:
             for name in (schema.get("feature_columns") or [])
         ],
         "library_versions": schema.get("library_versions"),
+        "entity_key": _entity_key_contract(schema),
+    }
+
+
+def _entity_key_contract(schema: dict[str, Any]) -> dict[str, Any] | None:
+    """Published so a caller knows the key is wanted, and that it is safe to send."""
+    column = entity_key_column(schema)
+    if not column:
+        return None
+    return {
+        "column": column,
+        "required": False,
+        "used_for_scoring": False,
+        "purpose": (
+            "Identifies which entity a row belongs to. It is logged with the prediction so "
+            "retraining keeps an entity's rows together and the gate can resample recent "
+            "traffic by entity. Omitting it does not change the prediction; it makes the "
+            "lifecycle's measurements less honest."
+        ),
     }
 
 

@@ -25,6 +25,15 @@ Order is enforced, not assumed. The schema records `feature_columns` in the
 order the estimator was fit on; a frame built from dict keys comes out in
 insertion order, and a positional mismatch scores the wrong columns silently
 rather than raising.
+
+**The entity key is the one non-feature a payload may carry.** On grouped data
+(T0-3) the group column is excluded from features — it identifies the entity
+rather than describing it — so the unknown-column rule rejected it, and the key
+never reached the prediction log. Everything downstream that needs to know
+which rows are the same customer then had to guess: retraining gave every
+served row its own singleton group, and the gate resampled recent traffic by
+row, an interval measured 1.9-2.0x too narrow. It is accepted, never required,
+and never scored: the frame is built from `feature_columns` alone.
 """
 from __future__ import annotations
 
@@ -95,6 +104,11 @@ def _coerce_column(values: pd.Series, dtype: str, column: str) -> tuple[pd.Serie
         )
 
 
+def entity_key_column(schema: dict[str, Any]) -> str | None:
+    """The group column the model was trained with, if it has one."""
+    return (schema.get("feature_roles") or {}).get("group_column") or None
+
+
 def validate_payload(
     rows: list[dict[str, Any]],
     schema: dict[str, Any],
@@ -102,6 +116,7 @@ def validate_payload(
 ) -> ValidationResult:
     """Turn raw request rows into a frame the estimator can score, or explain why not."""
     expected: list[str] = list(schema.get("feature_columns") or [])
+    entity_key = entity_key_column(schema)
     column_meta: dict[str, Any] = schema.get("columns") or {}
 
     if not rows:
@@ -126,7 +141,9 @@ def validate_payload(
                         "invented here would be returned as a confident prediction."),
             ))
 
-    unknown = sorted({k for row in rows for k in row} - set(expected))
+    # The entity key is known, not unknown — but it is also not a feature, so
+    # it is neither required here nor ever copied into the scored frame.
+    unknown = sorted({k for row in rows for k in row} - set(expected) - {entity_key})
     if unknown:
         if allow_unknown:
             warnings.append(
