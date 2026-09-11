@@ -180,6 +180,11 @@ def should_retrain(
 
 
 _FINGERPRINT_SEPARATOR = chr(31)
+# Below this share of distinct vectors, identical feature vectors are an
+# ordinary property of a discrete feature space rather than evidence of the
+# same observation, and excluding every match would empty the data instead of
+# de-leaking it.
+MIN_FINGERPRINT_UNIQUENESS = 0.95
 
 
 def _normalise_cell(value: Any) -> str:
@@ -212,6 +217,22 @@ def row_fingerprints(frame: pd.DataFrame, columns: list[str]) -> list[str]:
         joined = _FINGERPRINT_SEPARATOR.join(_normalise_cell(v) for v in row)
         digests.append(hashlib.sha1(joined.encode("utf-8")).hexdigest()[:20])
     return digests
+
+
+def fingerprints_identify_rows(fingerprints: list[str]) -> bool:
+    """
+    Whether an identical feature vector means the same observation.
+
+    With continuous features it does: two customers do not share six
+    four-decimal readings by chance, so a match is the row itself, served
+    again. With a handful of discrete features it does not — every possible
+    vector recurs constantly, "unseen" is not a property a vector can have, and
+    excluding matches would silently discard most of the data. The test is the
+    reference set's own duplication rate.
+    """
+    if not fingerprints:
+        return False
+    return len(set(fingerprints)) / len(fingerprints) >= MIN_FINGERPRINT_UNIQUENESS
 
 
 def _row_keys(frame: pd.DataFrame, columns: list[str]) -> list[tuple]:
@@ -317,6 +338,33 @@ def build_retraining_frame(
     # name, or the pinned --target would refer to a column that is not there.
     new_rows[target] = labelled["actual"].to_numpy()
 
+    # Excluding the holdout from the ORIGINAL data is not enough: production can
+    # serve the holdout's own customers again, and those rows arrive through the
+    # log. Measured end to end, all 150 frozen vectors came back this way and a
+    # random forest trained on them scored F1 1.000 on the "frozen" holdout
+    # against 0.464 without them.
+    keep = np.ones(len(labelled), dtype=bool)
+    content_warnings: list[str] = []
+    if holdout is not None and not holdout.empty:
+        shared = [c for c in feature_columns if c in holdout.columns]
+        frozen = row_fingerprints(holdout, shared) if shared else []
+        if frozen and fingerprints_identify_rows(frozen):
+            frozen_set = set(frozen)
+            keep = np.array([f not in frozen_set for f in row_fingerprints(new_rows, shared)], dtype=bool)
+        elif frozen:
+            content_warnings.append(
+                "The frozen holdout's feature vectors are not distinctive (a discrete feature "
+                "space), so a new row repeating one cannot be told apart from ordinary recurrence "
+                "and none were excluded."
+            )
+    new_rows = new_rows.loc[keep]
+    holdout_repeats = int((~keep).sum())
+    if new_rows.empty:
+        raise ValueError(
+            "Every new labelled prediction repeats a frozen holdout row. Training on them would "
+            "rig the gate, and without them there is nothing new to retrain on."
+        )
+
     missing = [c for c in original.columns if c not in new_rows.columns]
     for column in missing:
         new_rows[column] = pd.NA
@@ -325,6 +373,13 @@ def build_retraining_frame(
 
     group_column = (schema.get("feature_roles") or {}).get("group_column")
     warnings: list[str] = []
+    warnings.extend(content_warnings)
+    if holdout_repeats:
+        warnings.append(
+            f"{holdout_repeats} new labelled row(s) repeat a frozen holdout feature vector (the "
+            f"holdout's own customers, served again) and were kept out of retraining, or the "
+            f"frozen holdout would no longer measure anything."
+        )
     if group_column and group_column in missing:
         warnings.append(
             f"The champion grouped on '{group_column}', but served payloads never carried it, "
@@ -342,14 +397,15 @@ def build_retraining_frame(
         "n_original_rows": int(len(original) + excluded_rows + excluded_copies),
         "n_holdout_rows_excluded": excluded_rows,
         "n_holdout_copies_excluded": excluded_copies,
+        "n_new_rows_repeating_holdout_excluded": holdout_repeats,
         "n_new_rows": int(len(new_rows)),
         "n_total_rows": int(len(combined)),
         "columns_missing_from_new_rows": missing,
         # Which logged predictions the challenger trains on. The gate's forward
         # window must exclude exactly these, or it scores the challenger on
         # rows it was fitted to.
-        "included_request_ids": labelled["request_id"].astype(str).tolist(),
-        "training_cutoff": str(labelled["predicted_at"].max()),
+        "included_request_ids": labelled.loc[keep, "request_id"].astype(str).tolist(),
+        "training_cutoff": str(labelled.loc[keep, "predicted_at"].max()),
         # Content, not just ids: a payload served again under a new request id
         # must not count as unseen in the gate's forward window.
         "fingerprint_columns": [c for c in (schema.get("feature_columns") or []) if c in combined.columns],
@@ -431,6 +487,7 @@ def retrain(
             "training_row_fingerprints": frame_report.get("training_row_fingerprints", []),
             "n_holdout_rows_excluded": frame_report.get("n_holdout_rows_excluded", 0),
             "n_holdout_copies_excluded": frame_report.get("n_holdout_copies_excluded", 0),
+            "n_new_rows_repeating_holdout_excluded": frame_report.get("n_new_rows_repeating_holdout_excluded", 0),
             "overrides": overrides,
         }
         manifest_path = Path(challenger_dir) / RETRAIN_MANIFEST

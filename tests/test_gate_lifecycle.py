@@ -320,3 +320,92 @@ class TestForwardWindowContent:
         frame, report = build_retraining_frame(tmp_path / "original.csv", store, schema)
         assert report["fingerprint_columns"] == ["a", "b"]
         assert len(report["training_row_fingerprints"]) == len(frame) == report["n_total_rows"]
+
+
+class TestHoldoutPayloadsServedAgain:
+    """
+    The fourth leak, found by measuring rather than assuming. Retraining
+    excluded the frozen holdout from the ORIGINAL data, but rows appended from
+    the prediction log were never checked against it. When production served
+    the holdout customers' payloads again, all 150 of 150 frozen vectors
+    re-entered the retraining frame, and a random forest trained on it scored
+    F1 1.000 on the "frozen" holdout against 0.464 without them.
+
+    The fix has a trap of its own: over a small discrete feature space every
+    vector recurs, so content matching would empty the data instead of
+    de-leaking it. Both directions are pinned.
+    """
+
+    SCHEMA = {"feature_columns": ["a", "b"], "target": {"column": "y"}, "feature_roles": {}}
+
+    @staticmethod
+    def _original(tmp_path, discrete=False):
+        rng = np.random.default_rng(11)
+        n = 60
+        if discrete:
+            a, b = rng.integers(0, 3, n), rng.integers(0, 3, n)
+        else:
+            a, b = rng.normal(size=n).round(4), rng.normal(size=n).round(4)
+        df = pd.DataFrame({"a": a, "b": b, "y": rng.integers(0, 2, n)})
+        path = tmp_path / "original.csv"
+        df.to_csv(path, index=False)
+        holdout = df.iloc[:10].copy()
+        holdout.insert(0, ROW_INDEX_COLUMN, list(range(10)))
+        return path, df, holdout
+
+    @staticmethod
+    def _serve(store, df, rows):
+        for i in rows:
+            payload = {c: df.iloc[i][c].item() for c in ("a", "b")}
+            request_id = store.log_prediction(payload=payload, prediction=0)
+            store.record_outcome(request_id, actual=int(df.iloc[i]["y"]))
+
+    def test_a_holdout_payload_served_again_is_kept_out_of_retraining(self, tmp_path):
+        from autoeng.lifecycle.retrain import row_fingerprints
+
+        path, df, holdout = self._original(tmp_path)
+        store = PredictionStore(tmp_path / "log.db")
+        self._serve(store, df, range(10))        # the holdout's customers, again
+        self._serve(store, df, range(40, 45))    # ordinary traffic
+
+        frame, report = build_retraining_frame(path, store, self.SCHEMA, holdout=holdout)
+        assert report["n_new_rows_repeating_holdout_excluded"] == 10
+        assert report["n_new_rows"] == 5
+        assert len(report["included_request_ids"]) == 5, "excluded rows were not trained on"
+        frozen = set(row_fingerprints(holdout, ["a", "b"]))
+        assert not frozen & set(row_fingerprints(frame, ["a", "b"])), "no frozen vector may be trained on"
+
+    def test_a_discrete_feature_space_is_not_emptied_by_content_matching(self, tmp_path):
+        path, df, holdout = self._original(tmp_path, discrete=True)
+        store = PredictionStore(tmp_path / "log.db")
+        self._serve(store, df, range(10, 40))
+
+        _, report = build_retraining_frame(path, store, self.SCHEMA, holdout=holdout)
+        assert report["n_new_rows_repeating_holdout_excluded"] == 0
+        assert report["n_new_rows"] == 30
+        assert any("not distinctive" in w for w in report["warnings"]), report["warnings"]
+
+    def test_the_gate_does_not_wipe_a_forward_window_over_a_discrete_space(self, world, tmp_path):
+        from autoeng.lifecycle.retrain import row_fingerprints
+
+        store = PredictionStore(tmp_path / "log.db")
+        X_ho, y_ho = world["X_ho"], world["y_ho"]
+        for i in range(len(X_ho)):
+            request_id = store.log_prediction(payload=X_ho.iloc[i].to_dict(), prediction=0)
+            store.record_outcome(request_id, actual=int(y_ho.iloc[i]))
+        columns = list(X_ho.columns)
+        # Every training vector recurring three times: the signature of a
+        # discrete feature space, where a match is not the same observation.
+        manifest = {"included_request_ids": [], "fingerprint_columns": columns,
+                    "training_row_fingerprints": row_fingerprints(X_ho, columns) * 3}
+
+        decision = gate_challenger(world["good"], world["bad"], store=store, manifest=manifest)
+        assert decision.windows[FORWARD_WINDOW].comparison.n_rows == len(X_ho)
+        assert any("not distinctive" in note for note in decision.notes), decision.notes
+
+    def test_fingerprint_distinctiveness(self):
+        from autoeng.lifecycle.retrain import fingerprints_identify_rows
+
+        assert fingerprints_identify_rows([f"row{i}" for i in range(100)])
+        assert not fingerprints_identify_rows(["a", "b", "c"] * 30)
+        assert not fingerprints_identify_rows([])

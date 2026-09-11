@@ -14,7 +14,7 @@ everything to MLflow, and writes a report.
 python -m autoeng.cli run data/any.csv          # infer everything
 python -m autoeng.cli run data.csv --target y   # or pin the target
 python -m autoeng.cli ask <run_id> "why did you reject random_forest?"
-pytest tests/ -q                                # 206 tests, ~225s
+pytest tests/ -q                                # 210 tests, ~205s
 python scripts/calibrate_detection.py           # detection accuracy, 10/10 expected
 ```
 
@@ -125,13 +125,17 @@ importance so unattributable mass (derived interactions) is lost rather than
 inflating the columns that did match.
 
 **7g. Neither model may have been fitted to the rows the gate scores.**
-Three leaks, each found or confirmed in a real run, each silent, each in the
+Four leaks, each found or confirmed in a real run, each silent, each in the
 challenger's favour: the champion's holdout inside the retraining frame
 (excluded via `freeze_holdout` + `_exclude_holdout`), forward-window
 predictions the challenger trained on (excluded by the manifest's request
 ids), and the same payload served again under a new id (excluded by
 `row_fingerprints` in the manifest — this one more than doubled the apparent
-gap end to end, and was the only thing holding up one promotion). A new evaluation path must close all three.
+gap end to end, and was the only thing holding up one promotion). The fourth: the holdout's own customers served again through the log, excluded
+as new rows repeating a frozen vector (it took a random forest from F1 0.464 to
+1.000 on the holdout). Content matching is skipped unless vectors are at least
+95% distinct, or a discrete feature space would be emptied. A new evaluation
+path must close all four.
 
 **7h. The gate's window rule is deliberately NOT "a regression on either
 disqualifies."** Under genuine concept drift a correct challenger must score
@@ -263,7 +267,7 @@ autoeng/
 
 ## Current state
 
-206 tests passing. Detection 10/10 on unambiguous cases (iris is genuinely
+210 tests passing. Detection 10/10 on unambiguous cases (iris is genuinely
 ambiguous and excluded). Successive halving gives 7.4× speedup with an
 identical winner.
 

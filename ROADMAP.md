@@ -224,7 +224,15 @@ enough to compute the live operating point directly.
   whatever is deployed when someone looks — and so T1-5 can compare champion
   against challenger over the same window.
 
-### T1-3 · Drift detection, weighted by importance (~300 lines, 7 tests) — **NEXT**
+### ~~T1-3 · Drift detection, weighted by importance~~ — **DONE**
+
+Built in `autoeng/monitoring/` (`drift.py`, `report.py`); `autoeng.cli drift`
+exits non-zero only on alarm. All three "done when" clauses are tests, and on a
+real artifact the check read `ok` for unshifted traffic (weighted PSI 0.030)
+and `alarm` when a feature carrying 35.5% of importance moved (weighted PSI
+3.72, live F1 0.609 -> 0.177). Per-feature PSI is reported raw and
+importance-weighted, the verdict is not the maximum of the three checks, and
+UNKNOWN is never OK — see CLAUDE.md 7d-7f. The brief it was built from:
 
 - **Data drift:** PSI per feature against the T0-1 reference distributions
   (investigate >0.1, alarm >0.2), KS for continuous and chi-square for
@@ -305,7 +313,7 @@ the logged intervals on each window.
 - **"Stays out of production" needed a production.** `CHAMPION.json` names the
   active model; serving follows it; only a promotion moves it; every decision,
   including the ones that change nothing, is appended to `gate_log.jsonl`.
-- **The comparison had three ways to be rigged, and each is now closed:**
+- **The comparison had four ways to be rigged, and each is now closed:**
   1. *The challenger trained on the champion's holdout.* The retraining frame
      contained the original rows. The holdout is now frozen with the artifact
      and excluded from every retraining frame — by source-row position,
@@ -324,6 +332,14 @@ the logged intervals on each window.
      now carries
      content fingerprints of every training row, and matching forward rows are
      excluded and counted.
+  4. *The holdout's own customers came back through the log.* Excluding the
+     holdout from the original data missed rows served again in production:
+     all 150 of 150 frozen vectors re-entered the retraining frame, and a random
+     forest trained on it scored F1 1.000 on the "frozen" holdout against 0.464
+     without them. New rows repeating a frozen vector are now excluded; the same
+     run then leaves 0 of 150 and scores 0.464. Content matching applies only when
+     vectors are distinctive (at least 95% unique): over a small discrete feature
+     space every vector recurs, and matching would empty the data instead.
 - **The window rule is not "a regression on either disqualifies."** That rule
   sounds safe and breaks the lifecycle: under genuine concept drift a correct
   challenger *must* score worse on the old holdout. It would have blocked the
@@ -378,7 +394,7 @@ Roughly 2,300 lines and 40 tests across all fourteen items; Tier 0 alone is
 about 530 lines and closes the gap between what the report claims and what the
 model does.
 
-Current state: 206 tests passing, 10/10 on unambiguous problem-type detection,
+Current state: 210 tests passing, 10/10 on unambiguous problem-type detection,
 7.4× search speedup from successive halving. **Tiers 0 and 1 are complete.**
 A trained model is persisted with its schema and a frozen holdout (T0-1),
 decides at an out-of-fold threshold (T0-2), and is split entity-aware (T0-3);

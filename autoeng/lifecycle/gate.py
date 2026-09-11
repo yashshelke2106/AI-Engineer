@@ -497,12 +497,22 @@ def gate_challenger(
         elif not labelled.empty:
             trained_on = set(str(r) for r in (manifest.get("included_request_ids") or []))
             forward = labelled[~labelled["request_id"].astype(str).isin(trained_on)]
-            fingerprints = set(manifest.get("training_row_fingerprints") or [])
+            fingerprint_list = list(manifest.get("training_row_fingerprints") or [])
+            fingerprints = set(fingerprint_list)
             fingerprint_columns = list(manifest.get("fingerprint_columns") or [])
             if fingerprints and fingerprint_columns and not forward.empty:
-                if all(c in forward.columns for c in fingerprint_columns):
-                    from autoeng.lifecycle.retrain import row_fingerprints
+                from autoeng.lifecycle.retrain import fingerprints_identify_rows, row_fingerprints
 
+                if not fingerprints_identify_rows(fingerprint_list):
+                    # Over a discrete feature space every vector recurs, so a
+                    # match is not the same observation — and excluding matches
+                    # would silently empty the window the gate relies on most.
+                    notes.append(
+                        "The challenger's training feature vectors are not distinctive (a discrete "
+                        "feature space), so a forward row matching one is ordinary recurrence rather "
+                        "than the same observation; content exclusion was not applied."
+                    )
+                elif all(c in forward.columns for c in fingerprint_columns):
                     repeats = np.array(
                         [f in fingerprints for f in row_fingerprints(forward, fingerprint_columns)],
                         dtype=bool,

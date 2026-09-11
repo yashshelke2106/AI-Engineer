@@ -24,7 +24,7 @@ python -m autoeng.cli serve runs/models/<run_name>         # score rows over HTT
 python -m autoeng.cli drift runs/models/<run_name>         # data / prediction / concept drift
 python -m autoeng.cli gate <champion> <challenger> --models-root runs/production --apply
 
-pytest tests/ -q                                           # 206 tests, ~225s
+pytest tests/ -q                                           # 210 tests, ~205s
 python scripts/calibrate_detection.py                      # detection accuracy harness
 ```
 
@@ -268,7 +268,7 @@ part:
   defaults to the platform codepage, not UTF-8, and the reports contain em
   dashes. They were being written as cp1252 and could not be decoded by a
   UTF-8 reader. Found by corrupting three source files the same way.
-- **A fair comparison had three separate leaks, all in the challenger's
+- **A fair comparison had four separate leaks, all in the challenger's
   favour, all silent.** The challenger trained on the champion's holdout
   (the retraining data contained the original rows); the forward window
   included predictions the challenger trained on; and — found only by running
@@ -277,8 +277,12 @@ part:
   "unseen" window repeated a training vector, and it **more than doubled the
   apparent gap** between the models (-0.155 against an honest -0.069), and on
   the concept-change run it was the only thing holding up a promotion. All
-  three are closed: a frozen holdout excluded from retraining, a manifest of
-  request ids, and content fingerprints of every training row.
+  four are closed: a frozen holdout excluded from retraining, a manifest of
+  request ids, content fingerprints of every training row, and the same check
+  on new traffic, because the holdout's own customers served again took a
+  random forest from F1 0.464 to 1.000 on the "frozen" holdout. Content
+  matching is skipped over non-distinctive feature spaces, where it would
+  empty the data instead.
 - **The safe-sounding gate rule breaks the lifecycle.** "Reject if the
   challenger regresses on either window" blocks exactly the retrain that
   genuine concept drift requires, because the correct new model must score
@@ -383,7 +387,7 @@ autoeng/
   reporting/       Markdown report generation
   pipeline.py      end-to-end orchestration
   cli.py           command-line entry point
-tests/             206 tests: planted leaks, regressions for every shipped bug, unit tests
+tests/             210 tests: planted leaks, regressions for every shipped bug, unit tests
 scripts/           detection calibration harness
 data/              synthetic + real validation datasets
 runs/              reports + MLflow store from the validation runs
