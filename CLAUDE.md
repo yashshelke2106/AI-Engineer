@@ -14,7 +14,7 @@ everything to MLflow, and writes a report.
 python -m autoeng.cli run data/any.csv          # infer everything
 python -m autoeng.cli run data.csv --target y   # or pin the target
 python -m autoeng.cli ask <run_id> "why did you reject random_forest?"
-pytest tests/ -q                                # 210 tests, ~205s
+pytest tests/ -q                                # 219 tests, ~220s
 python scripts/calibrate_detection.py           # detection accuracy, 10/10 expected
 ```
 
@@ -221,6 +221,16 @@ inside each fold (T2-2).
   prediction log never carry the group column (it is excluded from features, so
   no payload contains it). `group_values()` gives nulls singleton groups and
   stringifies labels — always take groups from it, never `df[col].to_numpy()`.
+- **Integer 0/1 labels were silently assumed in two places.** `select_threshold`
+  did `astype(int)` and raised on "benign"/"malignant"; the pipeline caught it
+  and kept 0.5, so T0-2 never ran on a string target. Concept drift scored
+  `prediction == 1`, reading F1 0.0 on a healthy string-labelled model, and
+  shared no metric with a regression baseline, so outcomes shifted +3 sd read
+  `ok`. Labels now go through `binary_indicator` (positive = the second sorted
+  label, which is what `predict_proba[:, 1]` means), metrics follow the problem
+  type, and a baseline sharing no live metric is UNKNOWN. Fixing only one of
+  the two creates a permanent false alarm: test string labels and regression
+  whenever either is touched.
 - **Model-store failures are reported, not raised.** A serialization problem
   must not discard a completed leaderboard, HPO sweep and explanation. But the
   report then says the model was *not* persisted, with the error. Never
@@ -267,7 +277,7 @@ autoeng/
 
 ## Current state
 
-210 tests passing. Detection 10/10 on unambiguous cases (iris is genuinely
+219 tests passing. Detection 10/10 on unambiguous cases (iris is genuinely
 ambiguous and excluded). Successive halving gives 7.4× speedup with an
 identical winner.
 

@@ -58,6 +58,9 @@ class ThresholdChoice:
     n_candidates: int
     reasoning: str
     curve: list[dict[str, float]] = field(default_factory=list)
+    # The label predict_proba column 1 refers to, so a reader can tell which
+    # class the precision and recall describe.
+    positive_label: Any = None
 
     @property
     def recall_gain(self) -> float:
@@ -72,6 +75,7 @@ class ThresholdChoice:
             "n_candidates": self.n_candidates,
             "reasoning": self.reasoning,
             "curve": self.curve,
+            "positive_label": self.positive_label,
         }
 
 
@@ -136,7 +140,7 @@ def _build_curve(y_true: np.ndarray, y_proba: np.ndarray, candidates: np.ndarray
     return [operating_point(y_true, y_proba, t) for t in sampled]
 
 
-def select_threshold(
+def _select_threshold_on_indicator(
     y_true,
     y_proba,
     objective: Objective = DEFAULT_OBJECTIVE,
@@ -149,7 +153,7 @@ def select_threshold(
 
     Never pass held-out probabilities here (CLAUDE.md #5).
     """
-    y_true = np.asarray(y_true).astype(int)
+    y_true = np.asarray(y_true).astype(int)  # already 0/1: select_threshold maps labels first
     y_proba = np.asarray(y_proba, dtype=float)
     default_metrics = operating_point(y_true, y_proba, DEFAULT_THRESHOLD)
 
@@ -219,3 +223,44 @@ def select_threshold(
         default_metrics=default_metrics, n_candidates=len(candidates),
         reasoning=reasoning, curve=_build_curve(y_true, y_proba, candidates),
     )
+
+
+def binary_indicator(y, positive_label: Any = None) -> tuple[np.ndarray, Any]:
+    """
+    Labels as a 0/1 indicator with the positive class made explicit.
+
+    `predict_proba(X)[:, 1]` is the probability of `classes_[1]`, and sklearn
+    sorts its classes, so the positive class is the second sorted label
+    whatever its type. The old `astype(int)` handled 0/1 targets and raised on
+    anything else; the pipeline caught the error and silently kept the 0.5
+    default, so threshold selection had never run on a string target.
+    """
+    values = np.asarray(y)
+    if positive_label is None:
+        observed = np.unique(values[pd.notna(values)])
+        positive_label = observed[-1] if len(observed) else 1
+    if hasattr(positive_label, "item"):
+        positive_label = positive_label.item()
+    return (values == positive_label).astype(int), positive_label
+
+
+def select_threshold(
+    y_true,
+    y_proba,
+    objective: Objective = DEFAULT_OBJECTIVE,
+    precision_floor: float = DEFAULT_PRECISION_FLOOR,
+    cost_false_negative: float = 10.0,
+    cost_false_positive: float = 1.0,
+    positive_label: Any = None,
+) -> ThresholdChoice:
+    """
+    Choose an operating point from out-of-fold predictions, for any binary
+    label type. Never pass held-out probabilities here (CLAUDE.md #5).
+    """
+    indicator, positive = binary_indicator(y_true, positive_label)
+    choice = _select_threshold_on_indicator(
+        indicator, y_proba, objective=objective, precision_floor=precision_floor,
+        cost_false_negative=cost_false_negative, cost_false_positive=cost_false_positive,
+    )
+    choice.positive_label = positive
+    return choice

@@ -24,7 +24,7 @@ python -m autoeng.cli serve runs/models/<run_name>         # score rows over HTT
 python -m autoeng.cli drift runs/models/<run_name>         # data / prediction / concept drift
 python -m autoeng.cli gate <champion> <challenger> --models-root runs/production --apply
 
-pytest tests/ -q                                           # 210 tests, ~205s
+pytest tests/ -q                                           # 219 tests, ~220s
 python scripts/calibrate_detection.py                      # detection accuracy harness
 ```
 
@@ -292,6 +292,15 @@ part:
   no-op (its test built the schema by hand). And a null group key — every row
   appended from the prediction log has one — crashed all of scikit-learn's
   group splitters.
+- **Two stages assumed integer 0/1 labels, and fixing only one would have made
+  things worse.** Threshold selection raised on string labels and silently fell
+  back to 0.5, so it had never run on the real breast-cancer data; it now
+  selects 0.442 and catches 39 of 42 held-out malignant cases. Concept drift
+  scored `prediction == 1`, reading F1 0.0 on a healthy string-labelled model,
+  and for regression shared no metric with its baseline, so outcomes shifted
+  three standard deviations read `ok` (now `alarm`, r2 -8.5). Repairing the
+  threshold alone would have stored an F1 baseline for that broken check to
+  compare 0.0 against: a permanent false alarm on a healthy model.
 - **The most dangerous serving behaviour is the most convenient one.** When a
   request arrives without a feature, the pipeline's imputer is right there and
   filling in the median makes the request succeed. What comes back is a
@@ -387,7 +396,7 @@ autoeng/
   reporting/       Markdown report generation
   pipeline.py      end-to-end orchestration
   cli.py           command-line entry point
-tests/             210 tests: planted leaks, regressions for every shipped bug, unit tests
+tests/             219 tests: planted leaks, regressions for every shipped bug, unit tests
 scripts/           detection calibration harness
 data/              synthetic + real validation datasets
 runs/              reports + MLflow store from the validation runs

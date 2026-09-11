@@ -458,27 +458,82 @@ def check_prediction_drift(
     )
 
 
+_REGRESSION_METRICS = {"r2", "rmse", "mae"}
+_CLASSIFICATION_METRICS = {"precision", "recall", "f1", "accuracy", "f1_macro"}
+# Error metrics carry the target's scale, so their degradation is judged
+# relative to the baseline rather than in absolute units.
+_LOWER_IS_BETTER = {"rmse", "mae"}
+
+
+def _live_metrics(y_true, y_pred, regression: bool, binary: bool, positive_label: Any) -> dict[str, float]:
+    if regression:
+        yt = pd.to_numeric(pd.Series(y_true), errors="coerce").to_numpy(dtype=float)
+        yp = pd.to_numeric(pd.Series(y_pred), errors="coerce").to_numpy(dtype=float)
+        finite = np.isfinite(yt) & np.isfinite(yp)
+        yt, yp = yt[finite], yp[finite]
+        if len(yt) == 0:
+            return {}
+        ss_res = float(((yt - yp) ** 2).sum())
+        ss_tot = float(((yt - yt.mean()) ** 2).sum())
+        return {"r2": 1.0 - ss_res / ss_tot if ss_tot else 0.0,
+                "rmse": float(np.sqrt(((yt - yp) ** 2).mean())),
+                "mae": float(np.abs(yt - yp).mean())}
+
+    yt, yp = np.asarray(y_true, dtype=object), np.asarray(y_pred, dtype=object)
+    metrics = {"accuracy": float(np.asarray(yt == yp, dtype=bool).mean())}
+    classes = sorted(set(yt.tolist()) | set(yp.tolist()), key=str)
+    per_class = []
+    for c in classes:
+        pc, tc = np.asarray(yp == c, dtype=bool), np.asarray(yt == c, dtype=bool)
+        tp, fp, fn = int((pc & tc).sum()), int((pc & ~tc).sum()), int((~pc & tc).sum())
+        prec = tp / (tp + fp) if (tp + fp) else 0.0
+        rec = tp / (tp + fn) if (tp + fn) else 0.0
+        per_class.append(2 * prec * rec / (prec + rec) if (prec + rec) else 0.0)
+    metrics["f1_macro"] = float(np.mean(per_class)) if per_class else 0.0
+
+    if binary:
+        if positive_label is None:
+            numeric = all(isinstance(v, (int, float, np.integer, np.floating)) for v in classes)
+            positive_label = 1 if numeric else (classes[-1] if len(classes) == 2 else None)
+        if positive_label is not None:
+            pi, ti = np.asarray(yp == positive_label, dtype=bool), np.asarray(yt == positive_label, dtype=bool)
+            tp, fp, fn = int((pi & ti).sum()), int((pi & ~ti).sum()), int((~pi & ti).sum())
+            precision = tp / (tp + fp) if (tp + fp) else 0.0
+            recall = tp / (tp + fn) if (tp + fn) else 0.0
+            f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) else 0.0
+            metrics.update(precision=precision, recall=recall, f1=f1)
+    return metrics
+
+
 def check_concept_drift(
     labelled: pd.DataFrame,
     baseline: dict[str, float],
     prediction_column: str = "prediction",
     actual_column: str = "actual",
     tolerance: float = 0.10,
+    problem_type: str | None = None,
+    positive_label: Any = None,
 ) -> SimpleDriftReport:
     """
     Rolling performance on the labelled window against the training baseline.
 
     The only check that measures what actually matters, and the only one that
-    can be blocked by an upstream problem: if labels stop arriving this returns
-    UNKNOWN, never OK. Those look identical on a dashboard and mean opposite
-    things — a broken label pipeline should not read as a healthy model.
+    can be blocked upstream: if labels stop arriving this returns UNKNOWN, never
+    OK. The same now holds for a baseline sharing no metric with what can be
+    measured live. That used to fall through to an empty comparison and read
+    OK, which is how a regression model whose outcomes had moved three standard
+    deviations was reported healthy — and why string binary labels scored
+    F1 = 0 on perfectly healthy traffic.
+
+    Metrics follow the problem type: precision/recall/F1 against the stored
+    positive label for binary targets of any label type, accuracy and macro F1
+    for classification, r2/rmse/mae for regression.
     """
     if labelled is None or labelled.empty or actual_column not in labelled.columns:
         return SimpleDriftReport(
             severity=DriftSeverity.UNKNOWN, n_rows=0, baseline=dict(baseline),
             summary="No labelled predictions in the window, so live performance is unknown.",
         )
-
     usable = labelled.dropna(subset=[prediction_column, actual_column])
     if len(usable) < MIN_LABELS_FOR_CONCEPT:
         return SimpleDriftReport(
@@ -488,22 +543,30 @@ def check_concept_drift(
                      "Reported as unknown rather than healthy."),
         )
 
-    y_true = usable[actual_column].to_numpy()
-    y_pred = usable[prediction_column].to_numpy()
-    tp = int(((y_pred == 1) & (y_true == 1)).sum())
-    fp = int(((y_pred == 1) & (y_true == 0)).sum())
-    fn = int(((y_pred == 0) & (y_true == 1)).sum())
-    precision = tp / (tp + fp) if (tp + fp) else 0.0
-    recall = tp / (tp + fn) if (tp + fn) else 0.0
-    f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) else 0.0
-    observed = {"precision": precision, "recall": recall, "f1": f1,
-                "accuracy": float((y_pred == y_true).mean())}
+    keys = set(baseline)
+    regression = problem_type == "regression" or (
+        problem_type is None and bool(keys & _REGRESSION_METRICS) and not (keys & _CLASSIFICATION_METRICS)
+    )
+    binary = not regression and problem_type in (None, "binary_classification")
+    observed = _live_metrics(usable[actual_column].to_numpy(), usable[prediction_column].to_numpy(),
+                             regression, binary, positive_label)
+
+    comparable = sorted(m for m in baseline if m in observed
+                        and isinstance(baseline[m], (int, float)) and np.isfinite(baseline[m]))
+    if not comparable:
+        return SimpleDriftReport(
+            severity=DriftSeverity.UNKNOWN, n_rows=len(usable), observed=observed, baseline=dict(baseline),
+            summary=(f"The stored baseline ({', '.join(sorted(baseline)) or 'empty'}) shares no metric "
+                     f"with what can be measured live ({', '.join(sorted(observed)) or 'nothing'}), so "
+                     f"live performance cannot be compared. Reported as unknown rather than healthy."),
+        )
 
     drops = {
-        metric: baseline[metric] - observed[metric]
-        for metric in baseline if metric in observed
+        m: ((observed[m] - baseline[m]) / baseline[m] if baseline[m] else observed[m])
+        if m in _LOWER_IS_BETTER else baseline[m] - observed[m]
+        for m in comparable
     }
-    worst = max(drops.values(), default=0.0)
+    worst = max(drops.values())
     if worst >= tolerance * 2:
         severity = DriftSeverity.ALARM
     elif worst >= tolerance:
@@ -511,10 +574,7 @@ def check_concept_drift(
     else:
         severity = DriftSeverity.OK
 
-    described = ", ".join(
-        f"{m} {observed[m]:.3f} against baseline {baseline[m]:.3f} ({-drops[m]:+.3f})"
-        for m in sorted(drops)
-    )
+    described = ", ".join(f"{m} {observed[m]:.3f} against baseline {baseline[m]:.3f}" for m in comparable)
     return SimpleDriftReport(
         severity=severity, n_rows=len(usable), observed=observed, baseline=dict(baseline),
         summary=f"Live performance over {len(usable)} labelled predictions: {described} -> {severity.value}.",

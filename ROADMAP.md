@@ -101,6 +101,13 @@ be read as precise. The out-of-fold selection uses all 23 training positives
 and is the sounder number. A dataset this rare wants repeated CV or a larger
 holdout; neither is in place.
 
+**Correction, found by a later end-to-end run:** threshold selection converted
+labels with `astype(int)`, which raised on string targets, and the pipeline
+caught the error and kept the 0.5 default. Every result above used 0/1 labels,
+so nothing noticed: on `real_breast_cancer.csv` (`benign`/`malignant`) no
+threshold had ever been selected. Labels now map to the second sorted class,
+which is what `predict_proba[:, 1]` refers to, and that dataset selects 0.442.
+
 ### ~~T0-3 · Group-aware splitting and group leakage~~ — **DONE**
 
 Built in `autoeng/detection/group_detector.py`. `groups` is threaded through
@@ -232,7 +239,10 @@ real artifact the check read `ok` for unshifted traffic (weighted PSI 0.030)
 and `alarm` when a feature carrying 35.5% of importance moved (weighted PSI
 3.72, live F1 0.609 -> 0.177). Per-feature PSI is reported raw and
 importance-weighted, the verdict is not the maximum of the three checks, and
-UNKNOWN is never OK — see CLAUDE.md 7d-7f. The brief it was built from:
+UNKNOWN is never OK — see CLAUDE.md 7d-7f. Concept drift originally assumed
+integer binary labels: regression outcomes shifted three standard deviations
+read `ok`, and string labels scored F1 0.0. Both were fixed later with
+problem-type-aware metrics. The brief it was built from:
 
 - **Data drift:** PSI per feature against the T0-1 reference distributions
   (investigate >0.1, alarm >0.2), KS for continuous and chi-square for
@@ -394,7 +404,7 @@ Roughly 2,300 lines and 40 tests across all fourteen items; Tier 0 alone is
 about 530 lines and closes the gap between what the report claims and what the
 model does.
 
-Current state: 210 tests passing, 10/10 on unambiguous problem-type detection,
+Current state: 219 tests passing, 10/10 on unambiguous problem-type detection,
 7.4× search speedup from successive halving. **Tiers 0 and 1 are complete.**
 A trained model is persisted with its schema and a frozen holdout (T0-1),
 decides at an out-of-fold threshold (T0-2), and is split entity-aware (T0-3);

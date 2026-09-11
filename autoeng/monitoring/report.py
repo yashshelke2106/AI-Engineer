@@ -146,7 +146,11 @@ def run_drift_report(
     resolved_baseline = baseline or schema.get("baseline_metrics") or {}
     concept = None
     if resolved_baseline:
-        concept = check_concept_drift(labelled, resolved_baseline)
+        labels = (schema.get("target") or {}).get("class_labels") or []
+        concept = check_concept_drift(
+            labelled, resolved_baseline, problem_type=schema.get("problem_type"),
+            positive_label=labels[1] if len(labels) == 2 else None,
+        )
         if schema.get("baseline_source"):
             notes.append(f"Concept-drift baseline: {schema['baseline_source']}.")
     else:

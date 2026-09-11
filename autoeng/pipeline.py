@@ -47,7 +47,7 @@ from autoeng.modeling.search import (
 )
 from autoeng.modeling.threshold import (
     DEFAULT_OBJECTIVE, DEFAULT_PRECISION_FLOOR, DEFAULT_THRESHOLD,
-    operating_point, out_of_fold_probabilities, select_threshold,
+    binary_indicator, operating_point, out_of_fold_probabilities, select_threshold,
 )
 from autoeng.modeling.time_series import run_time_series_search
 from autoeng.profiling.profiler import profile_dataset
@@ -118,7 +118,10 @@ def _held_out_operating_point(pipeline, X_test, y_test, threshold: float) -> dic
     if not hasattr(pipeline, "predict_proba"):
         return None
     proba = pipeline.predict_proba(X_test)[:, 1]
-    y = np.asarray(y_test)
+    classes = list(getattr(pipeline, "classes_", []))
+    # Column 1 is classes_[1]. Comparing against the literal 1 would score zero
+    # true positives at every threshold on a string target.
+    y, _ = binary_indicator(y_test, classes[1] if len(classes) == 2 else None)
     return {
         "at_selected_threshold": operating_point(y, proba, threshold),
         "at_default_threshold": operating_point(y, proba, DEFAULT_THRESHOLD),
