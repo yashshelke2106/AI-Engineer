@@ -27,7 +27,7 @@ T1-4 and T1-5, and still should if any of this is revisited.
 ## Tier 0 — Blockers
 
 All three confirmed absent by grepping the codebase, not assumed.
-**Tier 0 is complete. T1-1 through T1-4 are done; start at T1-5.**
+**Tier 0 and Tier 1 are complete.** Tier 2 items are independent of each other; see rule 3 below.
 
 ### ~~T0-1 · Persist the trained model and its schema~~ — **DONE**
 
@@ -283,22 +283,63 @@ and `customer_id` grouping pinned and no group overlap.
    That also fixes real datasets with partially-null keys, which would have hit
    the same crash in the first training run.
 
-### T1-5 · Champion–challenger gate with a noise margin (~250 lines, 6 tests) — **NEXT**
+### ~~T1-5 · Champion–challenger gate with a noise margin~~ — **DONE**
 
-**The item the original brief is really about** — "rejects the new model if it
-performs worse", answering "why did you reject the latest model?" from history.
+`autoeng/lifecycle/gate.py` decides; `autoeng/registry/champion.py` is
+production. `python -m autoeng.cli gate <champion> <challenger> --models-root
+<root> --apply --tracking-uri <uri>` exits 0 promoted, 1 rejected, 2
+inconclusive.
 
-- **Build:** score champion and challenger on a common frozen holdout *and* the
-  most recent labelled window. Promote only when the improvement clears a noise
-  margin: bootstrap the paired difference, require the CI to exclude zero. A
-  challenger winning by 0.002 on a metric that swings 0.02 between folds has
-  not won.
-- **Free win:** log the decision — both score sets, interval, verdict, reason —
-  into MLflow in the shape `autoeng/explain/qa.py` already reads. The rejection
-  question then answers itself from real numbers, with no new retrieval code.
-- **Done when:** an intentionally degraded challenger is rejected and stays out
-  of production, and `ask <run_id> "why did you reject the latest model"`
-  returns the actual comparison figures.
+**Verified end to end through `run_pipeline`**, with the champion serving
+*through* the production pointer. Two challengers were retrained on 1,200
+labelled rows each, then gated on 300 rows of freshly generated customers:
+
+| challenger | frozen holdout (F1) | forward window (F1) | verdict | pointer |
+|---|---|---|---|---|
+| trained on corrupted labels | 0.687 -> 0.605, CI [-0.140, -0.022] | 0.708 -> 0.639, CI [-0.101, -0.035] | **rejected**, exit 1 | unmoved |
+| retrained after a genuine concept change | 0.687 -> 0.605, CI [-0.140, -0.022] | 0.535 -> 0.679, CI [+0.097, +0.189] | **promoted**, exit 0 | moved; serving followed |
+
+`ask <challenger_run_id> "why did you reject the latest model"` answers from
+the logged intervals on each window.
+
+- **"Stays out of production" needed a production.** `CHAMPION.json` names the
+  active model; serving follows it; only a promotion moves it; every decision,
+  including the ones that change nothing, is appended to `gate_log.jsonl`.
+- **The comparison had three ways to be rigged, and each is now closed:**
+  1. *The challenger trained on the champion's holdout.* The retraining frame
+     contained the original rows. The holdout is now frozen with the artifact
+     and excluded from every retraining frame — by source-row position,
+     cross-checked against content (a changed original file is refused), plus
+     any exact copies elsewhere in the raw file.
+  2. *The forward window included predictions the challenger trained on.* The
+     retrain manifest records the request ids it used.
+  3. *Excluding by request id was not enough.* Found end to end: every row of an
+     id-excluded forward window repeated a training feature vector under a new
+     id, and that contamination **more than doubled the apparent gap**
+     (-0.155 against an honest -0.069; +0.361 against +0.144). Applying
+     the fix to that same contaminated log removed all 300 rows and flipped the
+     concept-change verdict from promoted to rejected: the promotion had rested
+     entirely on memorised rows, so the gate waited for traffic the challenger
+     had never seen, on which it was then promoted legitimately. The manifest
+     now carries
+     content fingerprints of every training row, and matching forward rows are
+     excluded and counted.
+- **The window rule is not "a regression on either disqualifies."** That rule
+  sounds safe and breaks the lifecycle: under genuine concept drift a correct
+  challenger *must* score worse on the old holdout. It would have blocked the
+  second row of the table above — the retrain drift detection asked for. The
+  forward window leads when it has enough rows; the frozen holdout decides
+  otherwise; a forward-window regression always rejects; a holdout regression
+  alongside a forward win promotes *with the regression stated*.
+- **String class labels.** The metrics count class 1 as positive, so a
+  `"benign"/"malignant"` target would score F1 = 0 for both models and every
+  gate would read as a tie, freezing the champion forever. Labels are mapped
+  onto the positive class first.
+- **Each model is scored at its own stored threshold**: the operating point is
+  part of what was retrained.
+- **Not covered:** the gate compares one challenger against one champion; no
+  multi-armed or shadow deployment, and no automatic rollback if a promoted
+  model later degrades (the drift check would flag it, and a person decides).
 
 ---
 
@@ -337,12 +378,16 @@ Roughly 2,300 lines and 40 tests across all fourteen items; Tier 0 alone is
 about 530 lines and closes the gap between what the report claims and what the
 model does.
 
-Current state: 155 tests passing, 10/10 on unambiguous problem-type detection,
-7.4× search speedup from successive halving. The trained model is persisted
-with its schema (T0-1) and the decision threshold is selected out-of-fold,
-saved into that schema, and reported beside the ranking metrics (T0-2), and
-every split is entity-aware where a repeated-entity key exists (T0-3).
-**Tier 0 is complete.**
+Current state: 206 tests passing, 10/10 on unambiguous problem-type detection,
+7.4× search speedup from successive halving. **Tiers 0 and 1 are complete.**
+A trained model is persisted with its schema and a frozen holdout (T0-1),
+decides at an out-of-fold threshold (T0-2), and is split entity-aware (T0-3);
+it is served under a strict contract (T1-1), every prediction and outcome is
+logged (T1-2), drift is measured against training references (T1-3), a
+challenger is retrained with the champion's decisions pinned (T1-4), and it
+reaches production only through a paired-bootstrap gate on data neither model
+trained on (T1-5). The whole loop has been run end to end through
+`run_pipeline`.
 
 **Tier 0 front-loaded work for later items.** The reference
 distributions T1-3 needs are already captured; T1-1 has a column contract to

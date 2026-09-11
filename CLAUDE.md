@@ -14,11 +14,11 @@ everything to MLflow, and writes a report.
 python -m autoeng.cli run data/any.csv          # infer everything
 python -m autoeng.cli run data.csv --target y   # or pin the target
 python -m autoeng.cli ask <run_id> "why did you reject random_forest?"
-pytest tests/ -q                                # 155 tests, ~170s
+pytest tests/ -q                                # 206 tests, ~225s
 python scripts/calibrate_detection.py           # detection accuracy, 10/10 expected
 ```
 
-`ROADMAP.md` has the prioritised remaining work. **T1-4 is done; start at T1-5.**
+`ROADMAP.md` has the prioritised remaining work. **Tiers 0 and 1 are done; Tier 2 is independent items.**
 
 ## Invariants — do not break these
 
@@ -124,6 +124,27 @@ makes the most-used categorical look unused and discounts its drift to zero.
 importance so unattributable mass (derived interactions) is lost rather than
 inflating the columns that did match.
 
+**7g. Neither model may have been fitted to the rows the gate scores.**
+Three leaks, each found or confirmed in a real run, each silent, each in the
+challenger's favour: the champion's holdout inside the retraining frame
+(excluded via `freeze_holdout` + `_exclude_holdout`), forward-window
+predictions the challenger trained on (excluded by the manifest's request
+ids), and the same payload served again under a new id (excluded by
+`row_fingerprints` in the manifest — this one more than doubled the apparent
+gap end to end, and was the only thing holding up one promotion). A new evaluation path must close all three.
+
+**7h. The gate's window rule is deliberately NOT "a regression on either
+disqualifies."** Under genuine concept drift a correct challenger must score
+worse on the old holdout; that rule blocks every retrain drift detection asks
+for. The forward window leads when it has enough rows, a forward regression
+always rejects, and a holdout regression alongside a forward win promotes with
+the regression stated. Do not "tighten" this back.
+
+**7i. Production is `CHAMPION.json`, and only a promotion moves it.** Serving
+follows the pointer; rejections and inconclusive verdicts are logged to
+`gate_log.jsonl` and leave it untouched. "Stays out of production" is only
+checkable because this exists.
+
 **8. Groups, when detected, apply to EVERY split.**
 Held-out partition, search folds, the halving screen's subsample (which samples
 whole entities, not rows), HPO folds, the stack, and the threshold selector's
@@ -220,6 +241,8 @@ autoeng/
   serving/      validation.py (contract) + predictor.py (threshold) + app.py (T1-1)
                 store.py — append-only prediction/outcome log (T1-2)
   monitoring/   drift.py (PSI/KS/chi2, importance-weighted) + report.py (T1-3)
+  lifecycle/    retrain.py (pinned challenger, T1-4) + gate.py (paired bootstrap, T1-5)
+  registry/     + champion.py — CHAMPION.json production pointer + gate log (T1-5)
   tracking/     MLflow logging + querying
   reporting/    Markdown report generation
   pipeline.py   orchestration      cli.py  entry point
@@ -240,7 +263,7 @@ autoeng/
 
 ## Current state
 
-155 tests passing. Detection 10/10 on unambiguous cases (iris is genuinely
+206 tests passing. Detection 10/10 on unambiguous cases (iris is genuinely
 ambiguous and excluded). Successive halving gives 7.4× speedup with an
 identical winner.
 
@@ -268,7 +291,9 @@ structure nobody gave it.
 **T0-3 is done:** repeated-entity keys are detected, excluded from features,
 and honoured by every split. See invariants 8 and 8a.
 
-**Tier 0 and T1-1 through T1-3 are complete.** Next is T1-4 (retrain
-orchestration). Note rule 1 in `ROADMAP.md` before starting it, and pin the
-target via `--target` on a retrain rather than re-detecting — otherwise the
-system can silently change what it predicts mid-lifecycle (invariant 6).
+**Tiers 0 and 1 are complete**: persist, threshold, groups, serve, log,
+drift, retrain, gate. The full loop has been run end to end through
+`run_pipeline` — a champion serving through the production pointer, a drift
+check, two retrained challengers, and a gate that rejected the corrupted one
+and promoted the one retrained after a genuine concept change. Invariants
+7g-7i record what that run found. Tier 2 items are independent.

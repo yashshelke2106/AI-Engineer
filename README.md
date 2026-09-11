@@ -21,8 +21,10 @@ python -m autoeng.cli run data.csv --target revenue        # or tell it the targ
 python -m autoeng.cli ask <run_id> "why did you reject random_forest?"
 python -m autoeng.cli list-runs
 python -m autoeng.cli serve runs/models/<run_name>         # score rows over HTTP
+python -m autoeng.cli drift runs/models/<run_name>         # data / prediction / concept drift
+python -m autoeng.cli gate <champion> <challenger> --models-root runs/production --apply
 
-pytest tests/ -q                                           # 155 tests, ~170s
+pytest tests/ -q                                           # 206 tests, ~225s
 python scripts/calibrate_detection.py                      # detection accuracy harness
 ```
 
@@ -97,7 +99,6 @@ Supports CSV/TSV, Parquet, JSON/JSON-Lines, and Excel.
     predictions apply the stored decision threshold rather than
     `predict()`'s 0.5, so the deployed operating point is the one the report
     measured.
-
 18. **Log and label** — every served prediction is written to an append-only
     SQLite log with its raw payload, and `/predict` returns a `request_id` the
     caller quotes to `POST /outcomes` when ground truth arrives.
@@ -109,6 +110,16 @@ Supports CSV/TSV, Parquet, JSON/JSON-Lines, and Excel.
     corrected for multiple testing), the output distribution against this
     model's own earlier predictions, and live performance against the stored
     baseline. See [Drift detection](#drift-detection-and-what-it-refuses-to-claim).
+20. **Retrain** — when drift alarms or a schedule fires *and* new labels have
+    arrived, the pipeline re-runs on the original data plus the labelled log,
+    with the champion's target, problem type and grouping pinned rather than
+    re-detected. The champion's frozen holdout is excluded from the retraining
+    data, and a manifest records exactly what the challenger trained on.
+21. **Gate** — the challenger replaces the champion only if a paired bootstrap
+    shows it is better beyond the noise, on data neither model trained on.
+    Promoted, rejected, or inconclusive; only a promotion moves the
+    `CHAMPION.json` pointer that serving follows. See
+    [the gate](#the-champion-challenger-gate).
 
 ### Drift detection, and what it refuses to claim
 
@@ -139,6 +150,27 @@ Measured end to end, serving 300 rows against a real run:
 
 `unknown` is kept distinct from `ok`: a window with no labels and a healthy
 model look identical if you collapse them, and they mean opposite things.
+
+### The champion-challenger gate
+
+A retrained model is a hypothesis, not an improvement. Comparing two point
+estimates and promoting the larger is a coin flip that ratchets: every deploy
+takes the lucky side of the noise. The gate bootstraps the *paired* difference
+and promotes only when the interval excludes zero — and "inconclusive" is a
+real outcome that keeps the incumbent.
+
+End to end, with the champion serving through the production pointer and two
+retrained challengers gated on 300 freshly generated customers:
+
+| challenger | frozen holdout F1 | forward window F1 | verdict |
+|---|---|---|---|
+| trained on corrupted labels | 0.687 -> 0.605 | 0.708 -> 0.639 | **rejected** — pointer unmoved |
+| retrained after a genuine concept change | 0.687 -> 0.605 | 0.535 -> 0.679 | **promoted** — serving followed |
+
+The second row is why the window rule is not "a regression on either
+disqualifies": after a real change, the right model has to look worse on the
+old holdout. The first row is why the forward window never excuses a regression
+on recent traffic.
 
 ## Target detection: the hard part
 
@@ -236,6 +268,26 @@ part:
   defaults to the platform codepage, not UTF-8, and the reports contain em
   dashes. They were being written as cp1252 and could not be decoded by a
   UTF-8 reader. Found by corrupting three source files the same way.
+- **A fair comparison had three separate leaks, all in the challenger's
+  favour, all silent.** The challenger trained on the champion's holdout
+  (the retraining data contained the original rows); the forward window
+  included predictions the challenger trained on; and — found only by running
+  the loop end to end — excluding those by request id was not enough, because
+  the same payloads were served again under new ids. Every row of that
+  "unseen" window repeated a training vector, and it **more than doubled the
+  apparent gap** between the models (-0.155 against an honest -0.069), and on
+  the concept-change run it was the only thing holding up a promotion. All
+  three are closed: a frozen holdout excluded from retraining, a manifest of
+  request ids, and content fingerprints of every training row.
+- **The safe-sounding gate rule breaks the lifecycle.** "Reject if the
+  challenger regresses on either window" blocks exactly the retrain that
+  genuine concept drift requires, because the correct new model must score
+  worse on the old holdout. The forward window leads when it has the rows.
+- **Two bugs a real retrain found that unit tests had passed over.** Every
+  saved artifact silently lacked `group_column`, so the retrain group pin was a
+  no-op (its test built the schema by hand). And a null group key — every row
+  appended from the prediction log has one — crashed all of scikit-learn's
+  group splitters.
 - **The most dangerous serving behaviour is the most convenient one.** When a
   request arrives without a feature, the pipeline's imputer is right there and
   filling in the median makes the request succeed. What comes back is a
@@ -254,10 +306,11 @@ part:
 
 ## Scope — what's not here
 
-- **No auto-retrain loop or champion–challenger gate yet.** Drift is measured
-  (stage 19) but nothing acts on it. That ordering is deliberate: automating
-  retraining before you can tell whether the new model is actually better is
-  how a pipeline industrialises a regression on a schedule.
+- **The lifecycle is triggered, not scheduled.** Retrain and gate are
+  commands and functions; nothing runs them on a timer, and nothing rolls a
+  promoted model back automatically if it later degrades — the drift check
+  would flag it, and a person decides. One champion against one challenger; no
+  shadow or multi-armed deployment.
 - **The serving API is a contract layer, not a hardened endpoint.** No auth,
   rate limiting, or TLS.
 - **Only classification and regression runs persist a model.** Time-series
@@ -325,11 +378,12 @@ autoeng/
   serving/         FastAPI: schema validation + threshold-aware prediction,
                    append-only prediction/outcome log
   monitoring/      data / prediction / concept drift, weighted by importance
+  lifecycle/       pinned retraining + paired-bootstrap champion-challenger gate
   tracking/        MLflow logging and querying
   reporting/       Markdown report generation
   pipeline.py      end-to-end orchestration
   cli.py           command-line entry point
-tests/             155 tests: planted leaks, regressions for every shipped bug, unit tests
+tests/             206 tests: planted leaks, regressions for every shipped bug, unit tests
 scripts/           detection calibration harness
 data/              synthetic + real validation datasets
 runs/              reports + MLflow store from the validation runs

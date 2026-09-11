@@ -18,6 +18,14 @@ the first day. It is indistinguishable from a working lifecycle from the
 outside. So the trigger requires labelled outcomes that did not exist at
 training time, and refuses otherwise.
 
+A third, found while building the gate: **the challenger must not train on the
+champion's holdout.** The original data contains the rows the champion was
+evaluated on. Retrain on all of it and any later "frozen holdout" comparison
+scores the challenger partly on rows it was fitted to — rigged in its favour,
+invisibly. So the champion's frozen holdout is excluded here, and a manifest
+records which logged predictions the challenger did train on, so the gate's
+forward window can exclude those too.
+
 What this module does NOT do is promote the result. A challenger is produced
 and scored; whether it replaces the champion is T1-5's decision, deliberately
 kept separate — automating "retrain" and "deploy" as one step is how a
@@ -25,6 +33,7 @@ regression ships on a schedule.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -32,14 +41,19 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from autoeng.ingestion.loader import load_raw_dataset
 from autoeng.monitoring.drift import DriftSeverity
+from autoeng.registry.model_store import ROW_INDEX_COLUMN, load_holdout
 
 # Below this, a retrain is fitting essentially the same data again. The number
 # is a floor on "did anything actually happen", not a statistical threshold.
 MIN_NEW_LABELS = 50
+# Written into the challenger's model directory: what it trained on, so the
+# gate can score it only on data it never saw.
+RETRAIN_MANIFEST = "retrain_manifest.json"
 
 
 class RetrainTrigger(str, Enum):
@@ -68,6 +82,7 @@ class RetrainResult:
     challenger_run_id: str | None = None
     challenger_model_dir: str | None = None
     report_path: str | None = None
+    manifest_path: str | None = None
     frame_report: dict[str, Any] = field(default_factory=dict)
     overrides: dict[str, Any] = field(default_factory=dict)
     error: str | None = None
@@ -78,6 +93,7 @@ class RetrainResult:
             "challenger_run_id": self.challenger_run_id,
             "challenger_model_dir": self.challenger_model_dir,
             "report_path": self.report_path,
+            "manifest_path": self.manifest_path,
             "frame_report": self.frame_report,
             "overrides": self.overrides,
             "error": self.error,
@@ -163,15 +179,117 @@ def should_retrain(
     )
 
 
+_FINGERPRINT_SEPARATOR = chr(31)
+
+
+def _normalise_cell(value: Any) -> str:
+    try:
+        if pd.isna(value):
+            return "<NA>"
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, (bool, np.bool_, int, float, np.integer, np.floating)):
+        # Through float, so 5 and 5.0 — an int column in the CSV and a JSON
+        # number in the prediction log — fingerprint identically.
+        return repr(float(value))
+    return str(value)
+
+
+def row_fingerprints(frame: pd.DataFrame, columns: list[str]) -> list[str]:
+    """
+    Content fingerprints of rows over `columns`, stable across CSV and JSON.
+
+    Excluding the challenger's training rows from the gate's forward window by
+    request_id is not enough. The same payload can be served again under a new
+    id, and scoring the challenger on a feature vector it was fitted to rigs the
+    comparison exactly as scoring it on its own training rows would. Found end
+    to end: every row of an id-excluded forward window repeated a training
+    vector, and the contaminated window more than doubled the apparent gap
+    between champion and challenger.
+    """
+    digests = []
+    for row in frame[columns].itertuples(index=False, name=None):
+        joined = _FINGERPRINT_SEPARATOR.join(_normalise_cell(v) for v in row)
+        digests.append(hashlib.sha1(joined.encode("utf-8")).hexdigest()[:20])
+    return digests
+
+
+def _row_keys(frame: pd.DataFrame, columns: list[str]) -> list[tuple]:
+    # NaN never equals NaN, so it is normalised to None before building
+    # hashable keys — otherwise a copy of a row with a missing value would
+    # never be recognised as a copy.
+    normalised = frame[columns].astype(object).where(frame[columns].notna(), None)
+    return list(normalised.itertuples(index=False, name=None))
+
+
+def _exclude_holdout(original: pd.DataFrame, holdout: pd.DataFrame) -> tuple[pd.DataFrame, int, int]:
+    """
+    Remove the champion's frozen holdout from the retraining data.
+
+    By source-row position first, cross-checked against content: if the rows
+    at those positions no longer match what was frozen, the original file has
+    changed since the champion trained, and excluding by position would remove
+    the wrong rows while leaving the real holdout in. That is refused loudly
+    rather than done quietly.
+
+    Then any other exact copy of a holdout row is removed as well. Structural
+    cleaning dropped duplicates before the champion's split, so a copy of a
+    holdout row elsewhere in the raw file was never trained on by the champion
+    — but the challenger would train on it and then be scored against it.
+    """
+    if ROW_INDEX_COLUMN not in holdout.columns:
+        raise ValueError(
+            f"The frozen holdout has no '{ROW_INDEX_COLUMN}' column, so its rows cannot be "
+            f"located in the original data and cannot be kept out of retraining."
+        )
+    positions = holdout[ROW_INDEX_COLUMN].astype(int).to_numpy()
+    beyond = [int(p) for p in positions if p not in original.index]
+    if beyond:
+        raise ValueError(
+            f"{len(beyond)} frozen holdout row(s) point past the end of the original dataset, "
+            f"so it has changed since the champion was trained. Retrain from the file the "
+            f"champion was trained on."
+        )
+
+    located = original.loc[positions]
+    shared = [c for c in holdout.columns if c != ROW_INDEX_COLUMN and c in original.columns]
+    for column in shared:
+        a = located[column].reset_index(drop=True)
+        b = holdout[column].reset_index(drop=True)
+        a_num, b_num = pd.to_numeric(a, errors="coerce"), pd.to_numeric(b, errors="coerce")
+        numeric = (a_num.notna().sum() == a.notna().sum()) and (b_num.notna().sum() == b.notna().sum())
+        if numeric:
+            same = np.isclose(a_num.to_numpy(dtype=float), b_num.to_numpy(dtype=float),
+                              rtol=1e-9, atol=1e-12, equal_nan=True)
+        else:
+            same = (a.astype(str).where(a.notna(), "<NA>").to_numpy()
+                    == b.astype(str).where(b.notna(), "<NA>").to_numpy())
+        if not bool(np.all(same)):
+            raise ValueError(
+                f"The original dataset has changed since the champion was trained: column "
+                f"'{column}' no longer matches the frozen holdout at {int((~same).sum())} row(s). "
+                f"Excluding by position would remove the wrong rows and leave the real holdout "
+                f"in the retraining data, rigging the gate in the challenger's favour. Retrain "
+                f"from the file the champion was trained on."
+            )
+
+    remaining = original.drop(index=positions)
+    columns = list(original.columns)
+    frozen = set(_row_keys(located, columns))
+    copies = np.array([key in frozen for key in _row_keys(remaining, columns)], dtype=bool)
+    return remaining.loc[~copies], int(len(positions)), int(copies.sum())
+
+
 def build_retraining_frame(
     original_dataset: str | Path,
     store,
     schema: dict[str, Any],
     since: datetime | None = None,
+    holdout: pd.DataFrame | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """
-    Original training data plus everything that has since been served and
-    labelled.
+    Original training data, minus the champion's frozen holdout, plus
+    everything that has since been served and labelled.
 
     New rows carry only what was actually sent to `/predict`, which is the
     feature set — identifier and group columns were never part of a payload and
@@ -187,6 +305,10 @@ def build_retraining_frame(
         )
 
     original, _ = load_raw_dataset(str(original_dataset))
+    excluded_rows = excluded_copies = 0
+    if holdout is not None and not holdout.empty:
+        original, excluded_rows, excluded_copies = _exclude_holdout(original, holdout)
+
     target = (schema.get("target") or {}).get("column")
     feature_columns = [c for c in (schema.get("feature_columns") or []) if c in labelled.columns]
 
@@ -217,12 +339,23 @@ def build_retraining_frame(
         )
 
     report = {
-        "n_original_rows": int(len(original)),
+        "n_original_rows": int(len(original) + excluded_rows + excluded_copies),
+        "n_holdout_rows_excluded": excluded_rows,
+        "n_holdout_copies_excluded": excluded_copies,
         "n_new_rows": int(len(new_rows)),
         "n_total_rows": int(len(combined)),
         "columns_missing_from_new_rows": missing,
+        # Which logged predictions the challenger trains on. The gate's forward
+        # window must exclude exactly these, or it scores the challenger on
+        # rows it was fitted to.
+        "included_request_ids": labelled["request_id"].astype(str).tolist(),
+        "training_cutoff": str(labelled["predicted_at"].max()),
+        # Content, not just ids: a payload served again under a new request id
+        # must not count as unseen in the gate's forward window.
+        "fingerprint_columns": [c for c in (schema.get("feature_columns") or []) if c in combined.columns],
         "warnings": warnings,
     }
+    report["training_row_fingerprints"] = row_fingerprints(combined, report["fingerprint_columns"])
     return combined, report
 
 
@@ -235,6 +368,7 @@ def retrain(
     champion_run_id: str | None = None,
     since: datetime | None = None,
     run_name: str | None = None,
+    champion_model_dir: str | Path | None = None,
     **pipeline_kwargs: Any,
 ) -> RetrainResult:
     """
@@ -255,7 +389,16 @@ def retrain(
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    frame, frame_report = build_retraining_frame(original_dataset, store, champion_schema, since)
+    holdout = load_holdout(champion_model_dir) if champion_model_dir else None
+    frame, frame_report = build_retraining_frame(
+        original_dataset, store, champion_schema, since, holdout=holdout,
+    )
+    if holdout is None:
+        frame_report["warnings"].append(
+            "The champion has no frozen holdout (no model directory given, or an artifact "
+            "from before holdouts were kept), so nothing was excluded from retraining and the "
+            "gate can compare the two models only on the forward window."
+        )
 
     # Written out so the challenger trains from a file that can be inspected
     # and re-run later. A retrain nobody can reproduce is not an improvement
@@ -274,8 +417,28 @@ def retrain(
         return RetrainResult(decision=decision, frame_report=frame_report, overrides=overrides,
                              error=f"{type(e).__name__}: {e}")
 
+    challenger_dir = (result.model_artifact or {}).get("model_dir")
+    manifest_path = None
+    if challenger_dir:
+        manifest = {
+            "champion_model_dir": str(Path(champion_model_dir).resolve()) if champion_model_dir else None,
+            "champion_run_id": champion_run_id,
+            "challenger_run_id": result.run_id,
+            "trigger": decision.trigger.value,
+            "training_cutoff": frame_report.get("training_cutoff"),
+            "included_request_ids": frame_report.get("included_request_ids", []),
+            "fingerprint_columns": frame_report.get("fingerprint_columns", []),
+            "training_row_fingerprints": frame_report.get("training_row_fingerprints", []),
+            "n_holdout_rows_excluded": frame_report.get("n_holdout_rows_excluded", 0),
+            "n_holdout_copies_excluded": frame_report.get("n_holdout_copies_excluded", 0),
+            "overrides": overrides,
+        }
+        manifest_path = Path(challenger_dir) / RETRAIN_MANIFEST
+        manifest_path.write_text(json.dumps(manifest, indent=2, default=str), encoding="utf-8")
+
     return RetrainResult(
         decision=decision, challenger_run_id=result.run_id,
-        challenger_model_dir=(result.model_artifact or {}).get("model_dir"),
-        report_path=result.report_path, frame_report=frame_report, overrides=overrides,
+        challenger_model_dir=challenger_dir, report_path=result.report_path,
+        manifest_path=str(manifest_path) if manifest_path else None,
+        frame_report=frame_report, overrides=overrides,
     )

@@ -36,6 +36,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+from autoeng.registry.champion import read_champion
 from autoeng.registry.model_store import MODEL_FILENAME, SCHEMA_FILENAME, load_model
 from autoeng.serving.predictor import predict_frame, threshold_from_schema
 from autoeng.serving.store import PredictionStore, UnknownRequestError, new_request_id
@@ -123,6 +124,14 @@ def create_app(
     temporary directory without touching the environment.
     """
     resolved = Path(model_dir or os.environ.get(MODEL_DIR_ENV, "")).expanduser()
+    # A models root holding a CHAMPION.json pointer is followed to whichever
+    # model the gate last promoted. That is what makes "a rejected challenger
+    # stays out of production" true rather than merely recorded: serving reads
+    # the pointer, and only a promotion moves it.
+    if not (resolved / MODEL_FILENAME).is_file():
+        champion = read_champion(resolved)
+        if champion and champion.get("model_dir"):
+            resolved = Path(champion["model_dir"])
     app = FastAPI(
         title="Autonomous ML Engineer — serving",
         description="Scores rows through a persisted run under its training contract.",

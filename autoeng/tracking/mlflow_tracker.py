@@ -51,6 +51,7 @@ def log_pipeline_run(
     decision_threshold: dict[str, Any] | None = None,
     group_decision: dict[str, Any] | None = None,
     parent_run_id: str | None = None,
+    promotion_decision: dict[str, Any] | None = None,
 ) -> str:
     mlflow.set_tracking_uri(tracking_uri)
     mlflow.set_experiment(DEFAULT_EXPERIMENT)
@@ -104,6 +105,13 @@ def log_pipeline_run(
         _log_dict_artifact({"hpo_results": hpo_results}, "hpo_results.json")
         _log_dict_artifact(post_training_leakage, "post_training_leakage_report.json")
         _log_dict_artifact(explanation, "model_explanation.json")
+
+        if promotion_decision:
+            # Logged in the shape autoeng/explain/qa.py reads, so
+            # "why did you reject the latest model" answers from the actual
+            # interval rather than from a stored sentence.
+            _log_dict_artifact(promotion_decision, "promotion_decision.json")
+            mlflow.set_tag("promotion_verdict", promotion_decision.get("verdict", "unknown"))
 
         if group_decision:
             _log_dict_artifact(group_decision, "group_decision.json")
@@ -177,3 +185,18 @@ def get_run_artifact(tracking_uri: str, run_id: str, artifact_name: str) -> dict
         if artifact_name.endswith(".json"):
             return json.loads(text)
         return text
+
+
+def log_promotion_decision(tracking_uri: str, run_id: str, decision: dict[str, Any]) -> None:
+    """
+    Attach a gate decision to an existing (challenger) run.
+
+    The gate runs after the challenger's own run has closed, so the decision is
+    added by resuming that run rather than creating a new one — which keeps
+    `ask <challenger_run_id> "why did you reject the latest model"` answerable
+    from the run a person would actually look up.
+    """
+    mlflow.set_tracking_uri(tracking_uri)
+    with mlflow.start_run(run_id=run_id):
+        _log_dict_artifact(decision, "promotion_decision.json")
+        mlflow.set_tag("promotion_verdict", decision.get("verdict", "unknown"))

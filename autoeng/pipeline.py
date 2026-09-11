@@ -52,7 +52,7 @@ from autoeng.modeling.threshold import (
 from autoeng.modeling.time_series import run_time_series_search
 from autoeng.profiling.profiler import profile_dataset
 from autoeng.monitoring.drift import raw_column_importances
-from autoeng.registry.model_store import save_model, update_training_schema
+from autoeng.registry.model_store import freeze_holdout, save_model, update_training_schema
 from autoeng.reporting.report_generator import generate_report
 from autoeng.tracking.mlflow_tracker import log_pipeline_run
 
@@ -154,6 +154,34 @@ def _persist_final_model(
         return saved.as_dict()
     except Exception as e:  # noqa: BLE001 - see docstring
         return {"status": "failed", "error": f"{type(e).__name__}: {e}"}
+
+
+def _freeze_holdout_into_artifact(model_artifact, X_test, y_test, target_column, clean_df, group_column):
+    """
+    Persist this run's held-out rows beside the model.
+
+    A later challenger is compared with this model on exactly these rows (T1-5),
+    and a retrain excludes them from its training data so the comparison is not
+    rigged. The group column rides along when there is one, so an entity-aware
+    comparison stays possible. Failure is reported on the artifact rather than
+    raised: the model itself is already safely on disk.
+    """
+    if not model_artifact or model_artifact.get("status") != "saved":
+        return model_artifact
+    try:
+        extra = (clean_df.loc[X_test.index, [group_column]]
+                 if group_column and group_column in clean_df.columns else None)
+        record = freeze_holdout(model_artifact["model_dir"], X_test, y_test, target_column,
+                                extra_columns=extra)
+        model_artifact = dict(model_artifact)
+        model_artifact["holdout"] = record
+    except Exception as e:  # noqa: BLE001 - see docstring
+        model_artifact = dict(model_artifact)
+        model_artifact.setdefault("warnings", []).append(
+            f"Holdout was not frozen ({type(e).__name__}: {e}); a later gate can only "
+            f"compare on the forward window."
+        )
+    return model_artifact
 
 
 def _holdout_split(X, y, problem_kind: str, groups=None):
@@ -473,6 +501,10 @@ def run_pipeline(
             decision_threshold=threshold_choice,
         )
 
+        model_artifact = _freeze_holdout_into_artifact(
+            model_artifact, X_test, y_test, target_column, clean_df, group_column,
+        )
+
         held_out_metrics = _classification_metric(final_pipeline, X_test, y_test, n_classes)
         if threshold_choice is not None:
             held_out_operating_point = _held_out_operating_point(
@@ -542,6 +574,10 @@ def run_pipeline(
             final_pipeline, X_train, y_train, profile, roles,
             problem_type=chosen.problem_type.value, model_name=final_name,
             selection_source=final_source, dataset_path=dataset_path, model_dir=model_dir,
+        )
+
+        model_artifact = _freeze_holdout_into_artifact(
+            model_artifact, X_test, y_test, target_column, clean_df, group_column,
         )
 
         held_out_metrics = _regression_metric_from_r2(final_pipeline, X_test, y_test)

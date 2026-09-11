@@ -82,6 +82,22 @@ def main(argv: list[str] | None = None) -> int:
                               "mixes two models and attributes it to neither.")
     drift_p.add_argument("--json", action="store_true", help="Emit JSON instead of Markdown.")
 
+    gate_p = sub.add_parser(
+        "gate", help="Decide whether a retrained challenger replaces the champion.")
+    gate_p.add_argument("champion_dir", help="The champion's model directory.")
+    gate_p.add_argument("challenger_dir", help="The challenger's model directory.")
+    gate_p.add_argument("--log", default=None,
+                        help="Prediction log for the forward window "
+                             "(default: predictions.db in the champion's directory).")
+    gate_p.add_argument("--models-root", default=None,
+                        help="Directory holding CHAMPION.json, the production pointer.")
+    gate_p.add_argument("--apply", action="store_true",
+                        help="Record the decision in the gate log and move the production "
+                             "pointer if, and only if, the challenger was promoted.")
+    gate_p.add_argument("--tracking-uri", default=None,
+                        help="MLflow tracking URI. The decision is logged onto the challenger's "
+                             "run so `ask` can explain it afterwards.")
+
     list_p = sub.add_parser("list-runs", help="List past runs.")
     list_p.add_argument("--runs-dir", default="./runs")
 
@@ -145,6 +161,41 @@ def main(argv: list[str] | None = None) -> int:
         # UNKNOWN do not fail: one is not decisive, and the other means the
         # check could not run — neither is evidence the model is broken.
         return 1 if report.severity == DriftSeverity.ALARM else 0
+
+    if args.command == "gate":
+        import json as _json
+
+        from autoeng.lifecycle.gate import GateVerdict, gate_challenger
+        from autoeng.lifecycle.retrain import RETRAIN_MANIFEST
+        from autoeng.registry.champion import apply_gate_decision
+        from autoeng.serving.store import PredictionStore
+
+        if args.apply and not args.models_root:
+            parser.error("--apply needs --models-root, which holds the production pointer")
+
+        champion_dir, challenger_dir = Path(args.champion_dir), Path(args.challenger_dir)
+        log_path = Path(args.log) if args.log else champion_dir / "predictions.db"
+        # Only opened if it exists: PredictionStore creates its database, and a
+        # gate that silently creates an empty log would then report "no forward
+        # window" as if traffic had simply not arrived.
+        store = PredictionStore(log_path) if log_path.is_file() else None
+        manifest_path = challenger_dir / RETRAIN_MANIFEST
+        manifest = (_json.loads(manifest_path.read_text(encoding="utf-8"))
+                    if manifest_path.is_file() else None)
+
+        decision = gate_challenger(champion_dir, challenger_dir, store=store, manifest=manifest)
+        record = decision.as_dict()
+        print(_json.dumps(record, indent=2, default=str))
+
+        run_id = (manifest or {}).get("challenger_run_id")
+        if args.tracking_uri and run_id:
+            from autoeng.tracking.mlflow_tracker import log_promotion_decision
+            log_promotion_decision(args.tracking_uri, run_id, record)
+        if args.apply:
+            after = apply_gate_decision(args.models_root, record, challenger_dir, run_id)
+            print(f"Production model: {(after or {}).get('model_dir')}")
+        # Distinct codes so a scheduled job can tell "worse" from "cannot tell yet".
+        return {GateVerdict.PROMOTED: 0, GateVerdict.REJECTED: 1}.get(decision.verdict, 2)
 
     if args.command == "ask":
         uri = f"sqlite:///{args.runs_dir}/mlflow.db"

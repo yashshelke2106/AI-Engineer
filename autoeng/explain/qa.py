@@ -41,11 +41,58 @@ def answer_question(tracking_uri: str, run_id: str, question: str) -> str:
     problem_decision = get_run_artifact(tracking_uri, run_id, "problem_type_decision.json")
     structural = get_run_artifact(tracking_uri, run_id, "structural_cleaning_report.json")
     hpo = get_run_artifact(tracking_uri, run_id, "hpo_results.json")
+    promotion = get_run_artifact(tracking_uri, run_id, "promotion_decision.json")
 
     if leaderboard is None:
         return f"No logged run found with id '{run_id}' at tracking URI '{tracking_uri}'."
 
     model_names = [r["name"] for r in leaderboard["results"]]
+
+    # "why did you reject the latest model / the challenger / the retrained one"
+    # Checked BEFORE the per-model branch: "the latest model" names no
+    # leaderboard entry, so that branch would fall through to a generic answer
+    # while the actual comparison sits logged and unread.
+    if any(kw in q for kw in ("latest model", "challenger", "new model", "retrain", "promote")):
+        if promotion is None:
+            return ("No champion-challenger comparison was logged for this run. That decision "
+                    "is only recorded on a retrain, so this run is either the original "
+                    "training run or a challenger that has not been gated yet.")
+        comparison = promotion.get("comparison") or {}
+        lines = [promotion.get("reason", "")]
+        if comparison:
+            lines.append(
+                f"Measured on {comparison.get('n_rows')} held-out rows over "
+                f"{comparison.get('n_bootstrap')} bootstrap resamples of the paired difference: "
+                f"champion {comparison.get('metric')}={comparison.get('champion_score'):.4f}, "
+                f"challenger={comparison.get('challenger_score'):.4f}, "
+                f"difference {comparison.get('difference'):+.4f} with "
+                f"{100 * (1 - comparison.get('alpha', 0.05)):.0f}% CI "
+                f"[{comparison.get('ci_low'):+.4f}, {comparison.get('ci_high'):+.4f}]."
+            )
+            if not comparison.get("excludes_zero"):
+                lines.append(
+                    "The interval spans zero, so the two models are not distinguishable on this "
+                    "data. A challenger that wins by less than the comparison's own noise has "
+                    "not won."
+                )
+        # Per-window figures when the gate scored more than one set of rows —
+        # "rejected on the frozen holdout" and "rejected on this week's traffic"
+        # are different findings, and the answer should say which it was.
+        for name, window in (promotion.get("windows") or {}).items():
+            label = name.replace("_", " ")
+            window_comparison = window.get("comparison") or {}
+            if window_comparison:
+                lines.append(
+                    f"{label}: {window.get('verdict')} — {window_comparison.get('metric')} "
+                    f"champion {window_comparison.get('champion_score'):.4f}, challenger "
+                    f"{window_comparison.get('challenger_score'):.4f}, CI "
+                    f"[{window_comparison.get('ci_low'):+.4f}, {window_comparison.get('ci_high'):+.4f}] "
+                    f"over {window_comparison.get('n_rows')} rows."
+                )
+            else:
+                lines.append(f"{label}: {window.get('verdict')} — {window.get('reason')}")
+        lines.extend(promotion.get("notes") or [])
+        return '\n'.join(line for line in lines if line)
 
     # "why did you reject / not use <model>" or "why isn't <model> the winner"
     if any(kw in q for kw in ("reject", "why not", "why isn't", "instead of", "worse than")):

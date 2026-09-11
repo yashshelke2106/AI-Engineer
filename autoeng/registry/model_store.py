@@ -500,3 +500,56 @@ def load_model(model_path: str | Path, schema_path: str | Path | None = None) ->
         _warnings.warn(message, RuntimeWarning, stacklevel=2)
 
     return LoadedModel(estimator=estimator, schema=schema, warnings=warnings_found)
+
+HOLDOUT_FILENAME = "holdout.csv"
+# Source-row positions of the holdout in the ORIGINAL dataset file. Structural
+# cleaning drops duplicates without resetting the index, so these are row
+# positions in the file as loaded — which is what lets a retrain find and
+# remove them.
+ROW_INDEX_COLUMN = "__source_row__"
+
+
+def freeze_holdout(
+    model_dir: str | Path,
+    X_holdout: pd.DataFrame,
+    y_holdout: pd.Series,
+    target_column: str,
+    extra_columns: pd.DataFrame | None = None,
+) -> dict[str, Any]:
+    """
+    Write down the rows this model was evaluated on and never trained on.
+
+    T1-5 compares a challenger with the champion on a *common frozen* holdout,
+    and that comparison is only fair if neither model trained on those rows.
+    The champion did not, by construction. A challenger retrained on "original
+    data plus new labels" would — the original data contains them — unless
+    retraining removes them. So they are persisted here with their source-row
+    positions, and `build_retraining_frame` excludes them. Without this every
+    frozen-holdout comparison is rigged in the challenger's favour: it is
+    scored partly on rows it was fitted to.
+    """
+    model_dir = Path(model_dir)
+    frame = X_holdout.copy()
+    frame[target_column] = np.asarray(y_holdout)
+    if extra_columns is not None:
+        for column in extra_columns.columns:
+            if column not in frame.columns:
+                frame[column] = extra_columns[column].to_numpy()
+    frame.insert(0, ROW_INDEX_COLUMN, np.asarray(X_holdout.index))
+    frame.to_csv(model_dir / HOLDOUT_FILENAME, index=False)
+    record = {
+        "path": HOLDOUT_FILENAME,
+        "n_rows": int(len(frame)),
+        "row_index_column": ROW_INDEX_COLUMN,
+        "target_column": target_column,
+    }
+    update_training_schema(model_dir / SCHEMA_FILENAME, {"holdout": record})
+    return record
+
+
+def load_holdout(model_dir: str | Path) -> pd.DataFrame | None:
+    """The frozen holdout, or None for an artifact written before holdouts were kept."""
+    path = Path(model_dir) / HOLDOUT_FILENAME
+    if not path.is_file():
+        return None
+    return pd.read_csv(path)
