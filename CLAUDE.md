@@ -14,7 +14,7 @@ everything to MLflow, and writes a report.
 python -m autoeng.cli run data/any.csv          # infer everything
 python -m autoeng.cli run data.csv --target y   # or pin the target
 python -m autoeng.cli ask <run_id> "why did you reject random_forest?"
-pytest tests/ -q                                # 224 tests, ~220s
+pytest tests/ -q                                # 229 tests, ~220s
 python scripts/calibrate_detection.py           # detection accuracy, 10/10 expected
 ```
 
@@ -159,7 +159,10 @@ out-of-fold predictions. A single ungrouped split anywhere reintroduces the
 whole leak — and it will look like an improvement, not a bug. The group key is
 also excluded from features: it identifies the entity rather than describing
 it. Measured on `data/synthetic_grouped.csv`: 1.000 ROC-AUC ungrouped against
-0.730 grouped.
+0.730 grouped. This includes the gate's bootstrap: the frozen holdout is
+resampled by entity (row resampling made its interval 2.07x too narrow and
+turned an undecidable comparison into a rejection). The forward window cannot
+be, because served payloads never carry the group key; the gate says so.
 
 **8a. Turning a safety check off must not turn its warning off.**
 `--no-groups` still runs detection and still raises the `group_overlap` flag.
@@ -289,7 +292,7 @@ autoeng/
 
 ## Current state
 
-224 tests passing. Detection 10/10 on unambiguous cases (iris is genuinely
+229 tests passing. Detection 10/10 on unambiguous cases (iris is genuinely
 ambiguous and excluded). Successive halving gives 7.4× speedup with an
 identical winner.
 

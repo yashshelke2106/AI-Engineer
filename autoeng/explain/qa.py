@@ -61,8 +61,10 @@ def answer_question(tracking_uri: str, run_id: str, question: str) -> str:
         lines = [promotion.get("reason", "")]
         if comparison:
             lines.append(
-                f"Measured on {comparison.get('n_rows')} held-out rows over "
-                f"{comparison.get('n_bootstrap')} bootstrap resamples of the paired difference: "
+                f"Measured on {comparison.get('n_rows')} rows of the "
+                f"{(promotion.get('primary_window') or 'evaluation data').replace('_', ' ')}"
+                f"{', resampled across ' + str(comparison.get('n_groups')) + ' entities' if comparison.get('n_groups') else ''}"
+                f" over {comparison.get('n_bootstrap')} bootstrap resamples of the paired difference: "
                 f"champion {comparison.get('metric')}={comparison.get('champion_score'):.4f}, "
                 f"challenger={comparison.get('challenger_score'):.4f}, "
                 f"difference {comparison.get('difference'):+.4f} with "
@@ -87,7 +89,8 @@ def answer_question(tracking_uri: str, run_id: str, question: str) -> str:
                     f"champion {window_comparison.get('champion_score'):.4f}, challenger "
                     f"{window_comparison.get('challenger_score'):.4f}, CI "
                     f"[{window_comparison.get('ci_low'):+.4f}, {window_comparison.get('ci_high'):+.4f}] "
-                    f"over {window_comparison.get('n_rows')} rows."
+                    f"over {window_comparison.get('n_rows')} rows"
+                    f"{' resampled across ' + str(window_comparison.get('n_groups')) + ' entities' if window_comparison.get('n_groups') else ''}."
                 )
             else:
                 lines.append(f"{label}: {window.get('verdict')} — {window.get('reason')}")

@@ -314,8 +314,15 @@ labelled rows each, then gated on 300 rows of freshly generated customers:
 
 | challenger | frozen holdout (F1) | forward window (F1) | verdict | pointer |
 |---|---|---|---|---|
-| trained on corrupted labels | 0.687 -> 0.605, CI [-0.140, -0.022] | 0.708 -> 0.639, CI [-0.101, -0.035] | **rejected**, exit 1 | unmoved |
-| retrained after a genuine concept change | 0.687 -> 0.605, CI [-0.140, -0.022] | 0.535 -> 0.679, CI [+0.097, +0.189] | **promoted**, exit 0 | moved; serving followed |
+| trained on corrupted labels | 0.687 -> 0.605, CI [-0.204, +0.041] by customer | 0.708 -> 0.639, CI [-0.101, -0.035] | **rejected**, exit 1 | unmoved |
+| retrained after a genuine concept change | 0.687 -> 0.605, CI [-0.204, +0.041] by customer | 0.535 -> 0.679, CI [+0.097, +0.189] | **promoted**, exit 0 | moved; serving followed |
+
+**Correction:** the holdout intervals first recorded here, [-0.140, -0.022] and
+"rejected", resampled rows. The holdout's 150 rows are 30 customers; resampled
+by customer the interval is 2.07x wider and the holdout comparison is
+inconclusive for both challengers. The final verdicts rest on the forward
+window and did not change, but that window is still resampled by row, because
+served payloads never carry the customer key.
 
 `ask <challenger_run_id> "why did you reject the latest model"` answers from
 the logged intervals on each window.
@@ -409,7 +416,7 @@ Roughly 2,300 lines and 40 tests across all fourteen items; Tier 0 alone is
 about 530 lines and closes the gap between what the report claims and what the
 model does.
 
-Current state: 224 tests passing, 10/10 on unambiguous problem-type detection,
+Current state: 229 tests passing, 10/10 on unambiguous problem-type detection,
 7.4× search speedup from successive halving. **Tiers 0 and 1 are complete.**
 A trained model is persisted with its schema and a frozen holdout (T0-1),
 decides at an out-of-fold threshold (T0-2), and is split entity-aware (T0-3);

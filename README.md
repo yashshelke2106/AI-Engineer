@@ -24,7 +24,7 @@ python -m autoeng.cli serve runs/models/<run_name>         # score rows over HTT
 python -m autoeng.cli drift runs/models/<run_name>         # data / prediction / concept drift
 python -m autoeng.cli gate <champion> <challenger> --models-root runs/production --apply
 
-pytest tests/ -q                                           # 224 tests, ~220s
+pytest tests/ -q                                           # 229 tests, ~220s
 python scripts/calibrate_detection.py                      # detection accuracy harness
 ```
 
@@ -179,6 +179,13 @@ is what a genuine regime change looks like and exactly what a broken label
 feed looks like, so the gate keeps the champion, sets `needs_review`, and
 exits 3.
 
+On grouped data the bootstrap resamples entities, not rows. The frozen
+holdout's 150 rows above are 30 customers; resampled by row its interval was
+half as wide as the evidence allows and read as a rejection, and resampled by
+customer both holdout comparisons are inconclusive. Both verdicts above rest on
+the forward window, which is still resampled by row because served payloads
+carry no customer key.
+
 ## Target detection: the hard part
 
 Picking the target column in an undescribed dataset is the bottleneck the
@@ -315,6 +322,11 @@ part:
   and the contaminated log went back to promoting on memorised rows. Found
   only by re-running that log after the change; distinctiveness is now judged
   on the distinct vectors' columns.
+- **The gate re-introduced the overconfidence grouping had removed.** T0-3 made
+  every training split entity-aware, but the gate's bootstrap still resampled
+  rows. A 150-row holdout of 30 customers is 30 customers' worth of evidence:
+  resampled by row, its interval was 2.07x too narrow and a comparison the data
+  could not decide read as a rejection. Entities are now resampled together.
 - **The most dangerous serving behaviour is the most convenient one.** When a
   request arrives without a feature, the pipeline's imputer is right there and
   filling in the median makes the request succeed. What comes back is a
@@ -410,7 +422,7 @@ autoeng/
   reporting/       Markdown report generation
   pipeline.py      end-to-end orchestration
   cli.py           command-line entry point
-tests/             224 tests: planted leaks, regressions for every shipped bug, unit tests
+tests/             229 tests: planted leaks, regressions for every shipped bug, unit tests
 scripts/           detection calibration harness
 data/              synthetic + real validation datasets
 runs/              reports + MLflow store from the validation runs

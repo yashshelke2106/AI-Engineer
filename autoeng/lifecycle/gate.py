@@ -34,6 +34,13 @@ frozen holdout decides otherwise. See `combine_windows` for why the obvious
 rule — "a regression on either window disqualifies" — would block exactly the
 retrains that genuine concept drift makes necessary.
 
+**With repeated entities, entities are resampled, not rows.** A customer's rows
+share a label and near-identical features, so a grouped holdout's effective
+sample size is its number of customers. Resampling rows treated 150 correlated
+rows as 150 independent ones: on the grouped fixture the interval came out about
+half as wide as the evidence allows, and an undecidable comparison read as a
+rejection.
+
 The decision is logged with the numbers that produced it, so
 `ask <run_id> "why did you reject the latest model"` answers from the actual
 intervals rather than from a stored sentence.
@@ -54,6 +61,8 @@ DEFAULT_ALPHA = 0.05
 # Below this the interval is so wide that every comparison is inconclusive
 # anyway; saying so is more useful than returning a number nobody should read.
 MIN_ROWS_FOR_GATE = 30
+# Resampled by entity, the evidence is the number of entities, not rows.
+MIN_GROUPS_FOR_GATE = 10
 
 FROZEN_HOLDOUT = "frozen_holdout"
 FORWARD_WINDOW = "forward_window"
@@ -125,6 +134,7 @@ class Comparison:
     n_bootstrap: int
     n_rows: int
     alpha: float
+    n_groups: int | None = None
 
     @property
     def excludes_zero(self) -> bool:
@@ -158,6 +168,7 @@ def bootstrap_paired_difference(
     y_true, champion_pred, challenger_pred, metric: str = "f1",
     n_bootstrap: int = DEFAULT_BOOTSTRAP, alpha: float = DEFAULT_ALPHA,
     random_state: int = 42,
+    groups=None,
 ) -> Comparison:
     """
     Percentile CI for (challenger - champion) on the same rows.
@@ -178,9 +189,18 @@ def bootstrap_paired_difference(
 
     rng = np.random.default_rng(random_state)
     n = len(y_true)
+    # With groups, whole entities are resampled together: their rows are not
+    # independent evidence, and pretending otherwise narrows the interval.
+    blocks = None
+    if groups is not None:
+        labels = np.asarray(groups).astype(str)
+        blocks = [np.flatnonzero(labels == g) for g in np.unique(labels)]
     differences = np.empty(n_bootstrap, dtype=float)
     for i in range(n_bootstrap):
-        idx = rng.integers(0, n, n)
+        if blocks is None:
+            idx = rng.integers(0, n, n)
+        else:
+            idx = np.concatenate([blocks[j] for j in rng.integers(0, len(blocks), len(blocks))])
         differences[i] = score(y_true[idx], challenger_pred[idx]) - score(y_true[idx], champion_pred[idx])
 
     low, high = np.percentile(differences, [100 * alpha / 2, 100 * (1 - alpha / 2)])
@@ -190,6 +210,7 @@ def bootstrap_paired_difference(
         difference=float(challenger_score - champion_score),
         ci_low=float(low), ci_high=float(high),
         n_bootstrap=int(n_bootstrap), n_rows=int(n), alpha=float(alpha),
+        n_groups=len(blocks) if blocks is not None else None,
     )
 
 
@@ -197,6 +218,7 @@ def evaluate_gate(
     y_true, champion_pred, challenger_pred, metric: str = "f1",
     n_bootstrap: int = DEFAULT_BOOTSTRAP, alpha: float = DEFAULT_ALPHA,
     notes: list[str] | None = None,
+    groups=None,
 ) -> GateDecision:
     """Decide whether the challenger replaces the champion, on one set of rows."""
     y_true = np.asarray(y_true)
@@ -210,13 +232,20 @@ def evaluate_gate(
                     f"The champion stays."),
         )
 
+    if groups is not None and len(np.unique(np.asarray(groups).astype(str))) < MIN_GROUPS_FOR_GATE:
+        return GateDecision(
+            verdict=GateVerdict.INCONCLUSIVE, promote=False, notes=notes,
+            reason=(f"Too few entities to compare (below {MIN_GROUPS_FOR_GATE}), however many rows "
+                    f"they span: rows of one entity are not independent evidence. The champion stays."),
+        )
     comparison = bootstrap_paired_difference(
-        y_true, champion_pred, challenger_pred, metric, n_bootstrap, alpha,
+        y_true, champion_pred, challenger_pred, metric, n_bootstrap, alpha, groups=groups,
     )
     interval = (f"{metric} {comparison.challenger_score:.4f} against the champion's "
                 f"{comparison.champion_score:.4f} ({comparison.difference:+.4f}), "
                 f"{100 * (1 - alpha):.0f}% CI [{comparison.ci_low:+.4f}, {comparison.ci_high:+.4f}] "
-                f"over {comparison.n_rows} rows")
+                f"over {comparison.n_rows} rows"
+                f"{', resampled across ' + str(comparison.n_groups) + ' entities' if comparison.n_groups else ''}")
 
     if comparison.ci_low > 0:
         return GateDecision(
@@ -485,8 +514,9 @@ def gate_challenger(
     positive = class_labels[1] if class_labels and len(class_labels) == 2 else None
     champion_features = list(champion_schema.get("feature_columns") or [])
     challenger_features = list(challenger_schema.get("feature_columns") or [])
+    group_column = (champion_schema.get("feature_roles") or {}).get("group_column")
 
-    def score(frame, y) -> GateDecision:
+    def score(frame, y, groups=None) -> GateDecision:
         missing = sorted({c for c in champion_features + challenger_features if c not in frame.columns})
         if missing:
             raise ValueError(f"missing feature column(s): {', '.join(missing)}")
@@ -494,20 +524,21 @@ def gate_challenger(
             champion.estimator, challenger.estimator, frame[champion_features], y,
             metric=metric, champion_threshold=champion_threshold,
             challenger_threshold=challenger_threshold, positive_label=positive,
-            n_bootstrap=n_bootstrap, alpha=alpha,
+            n_bootstrap=n_bootstrap, alpha=alpha, groups=groups,
         ) if champion_features == challenger_features else _score_different_features(
-            frame, y,
+            frame, y, groups,
         )
         return decision
 
-    def _score_different_features(frame, y) -> GateDecision:
+    def _score_different_features(frame, y, groups=None) -> GateDecision:
         notes.append("The two models use different feature sets; each is scored on its own.")
         yy = np.asarray(y)
         c_pred = _predict_with_threshold(champion.estimator, frame[champion_features], champion_threshold)
         n_pred = _predict_with_threshold(challenger.estimator, frame[challenger_features], challenger_threshold)
         if positive is not None and metric in _POSITIVE_CLASS_METRICS:
             yy, c_pred, n_pred = ((np.asarray(a) == positive).astype(int) for a in (yy, c_pred, n_pred))
-        return evaluate_gate(yy, c_pred, n_pred, metric=metric, n_bootstrap=n_bootstrap, alpha=alpha)
+        return evaluate_gate(yy, c_pred, n_pred, metric=metric, n_bootstrap=n_bootstrap, alpha=alpha,
+                             groups=groups)
 
     windows: dict[str, GateDecision] = {}
 
@@ -521,7 +552,12 @@ def gate_challenger(
         notes.append(f"The frozen holdout has no '{target}' column and cannot be scored.")
     else:
         try:
-            windows[FROZEN_HOLDOUT] = score(holdout, holdout[target])
+            holdout_groups = None
+            if group_column and group_column in holdout.columns:
+                from autoeng.detection.group_detector import GroupDecision, group_values
+
+                holdout_groups = group_values(holdout, GroupDecision(column=group_column, confidence=1.0))
+            windows[FROZEN_HOLDOUT] = score(holdout, holdout[target], groups=holdout_groups)
         except ValueError as e:
             notes.append(f"The frozen holdout could not be scored: {e}.")
 
@@ -581,6 +617,14 @@ def gate_challenger(
             else:
                 try:
                     windows[FORWARD_WINDOW] = score(forward, forward["actual"])
+                    if group_column:
+                        notes.append(
+                            f"The champion groups rows by '{group_column}', but served payloads never "
+                            f"carry it, so the forward window is resampled by row. If entities recur "
+                            f"in recent traffic its interval is optimistic: on the frozen holdout, "
+                            f"resampling rows instead of entities halved the interval and turned an "
+                            f"undecidable comparison into a rejection."
+                        )
                 except ValueError as e:
                     notes.append(f"The forward window could not be scored: {e}.")
 
