@@ -61,7 +61,7 @@ import pandas as pd
 
 from autoeng.common.roles import FeatureRoleAssignment
 from autoeng.common.entities import learn_entity_signature
-from autoeng.common.sampling import effective_sample_size
+from autoeng.common.sampling import design_effect, effective_sample_size, entity_codes
 from autoeng.profiling.profiler import DatasetProfile, SemanticType
 
 SCHEMA_VERSION = 1
@@ -169,6 +169,17 @@ def _n_effective(series: pd.Series, groups: Any, bins: Any = None) -> float:
     return effective_sample_size(series, groups, bins=bins)
 
 
+def _icc(series: pd.Series, groups: Any, bins: Any = None) -> float:
+    """Intraclass correlation implied by the design effect at this column's entity sizes."""
+    present = series.notna().to_numpy()
+    if groups is None or present.sum() < 2:
+        return 0.0
+    mean_size = present.sum() / (entity_codes(groups, present).max() + 1)
+    if mean_size <= 1:
+        return 0.0
+    return float(min(1.0, max(0.0, (design_effect(series, groups, bins=bins) - 1.0) / (mean_size - 1.0))))
+
+
 def _numeric_reference(series: pd.Series, groups: Any = None) -> dict[str, Any]:
     numeric = pd.to_numeric(series, errors="coerce")
     observed = numeric.dropna()
@@ -195,6 +206,12 @@ def _numeric_reference(series: pd.Series, groups: Any = None) -> dict[str, Any]:
     # And over the raw value, for the test on the mean: a customer's visits are
     # one observation of anything the customer holds constant.
     ref["n_effective_mean"] = _n_effective(numeric, groups)
+    if groups is not None:
+        # How strongly this column clusters within an entity, over its bins and
+        # its mean. A keyless window with no recoverable entities is sized from
+        # these and the training entity size rather than as independent rows.
+        ref["icc_bins"] = _icc(numeric, groups, bins=sorted(set(ref["quantiles"].values())))
+        ref["icc_mean"] = _icc(numeric, groups)
     ref["min"] = float(observed.min())
     ref["max"] = float(observed.max())
     ref["mean"] = float(observed.mean())
@@ -208,6 +225,7 @@ def _categorical_reference(series: pd.Series, groups: Any = None) -> dict[str, A
         "kind": "categorical",
         "n_observed": int(len(observed)),
         "n_effective": _n_effective(series, groups),
+        "icc_bins": _icc(series, groups) if groups is not None else None,
         "n_unique": int(observed.nunique()),
         "missing_ratio": float(series.isna().mean()) if len(series) else 0.0,
         "frequencies": {},
@@ -345,6 +363,11 @@ def build_training_schema(
         "schema_version": SCHEMA_VERSION,
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "entity_signature": entity_signature,
+        # Rows per entity in training: with each column's ICC, the design a
+        # keyless window is assumed to share when no signature can recover it.
+        "entity_design": ({"mean_entity_size": float(len(X_train)) / (entity_codes(groups).max() + 1),
+                           "n_entities": int(entity_codes(groups).max() + 1)}
+                          if groups is not None else None),
         "dataset_path": dataset_path,
         "problem_type": problem_type,
         "n_training_rows": int(len(X_train)),

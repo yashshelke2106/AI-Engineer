@@ -123,6 +123,9 @@ class TestNoDriftStaysQuiet:
 
         unsigned = copy.deepcopy(grouped_reference)
         unsigned["entity_signature"] = None
+        # Without a signature the training design is assumed instead
+        # (tests/test_drift_sizing_gaps.py); only with neither are rows independent.
+        unsigned["entity_design"] = None
         window = _entities(60, 5, np.random.default_rng(30)).drop(columns=[KEY])
         report = check_data_drift(window, unsigned, IMPORTANCES)
         assert any(KEY in note and "independent" in note for note in report.notes), report.notes

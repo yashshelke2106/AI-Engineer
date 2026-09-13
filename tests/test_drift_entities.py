@@ -28,7 +28,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from autoeng.common.entities import MAX_RECOVERY_ERROR, learn_entity_signature, recover_entities
+from autoeng.common.entities import MAX_OVERSIZE, MAX_UNDERSIZE, learn_entity_signature, recover_entities
 from autoeng.monitoring.drift import DriftSeverity, check_data_drift, with_estimated_reference_sizes
 from autoeng.monitoring.report import run_drift_report
 from autoeng.serving.store import PredictionStore
@@ -72,8 +72,9 @@ class TestTheSignature:
         assert signature is not None
         assert set(signature["columns"]) <= {"device_fingerprint", "measure_a", "home_region"}
         assert "measure_c" not in signature["columns"], "a per-visit reading identifies nobody"
-        assert signature["split_rate"] <= MAX_RECOVERY_ERROR
-        assert signature["merge_rate"] <= MAX_RECOVERY_ERROR
+        low, high = signature["sizing_error"]
+        assert -MAX_UNDERSIZE <= low and high <= MAX_OVERSIZE
+        assert signature["split_rate"] <= 0.05 and signature["merge_rate"] <= 0.05
 
     def test_no_signature_is_learned_where_nothing_identifies_the_entity(self):
         rng = np.random.default_rng(3)

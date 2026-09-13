@@ -24,7 +24,7 @@ python -m autoeng.cli serve runs/models/<run_name>         # score rows over HTT
 python -m autoeng.cli drift runs/models/<run_name>         # data / prediction / concept drift
 python -m autoeng.cli gate <champion> <challenger> --models-root runs/production --apply
 
-pytest tests/ -q                                           # 287 tests, ~220s
+pytest tests/ -q                                           # 300 tests, ~220s
 python scripts/calibrate_detection.py                      # detection accuracy harness
 ```
 
@@ -363,10 +363,14 @@ part:
   were flagged in 42-97% of cases, and the real T1-5 champion's fresh traffic
   read `alarm` (exit 1, the retrain trigger). Entities are now recovered from a
   signature learned where the key is known (constant, distinctive feature
-  columns, kept only if they reproduce 95% of true entities), and an old
-  artifact estimates its sizes and signature from its frozen holdout. Those
+  columns, kept only if the groups they recover size every column within -25% to
+  +10% of the truth), and an old artifact estimates its sizes and signature from
+  its frozen holdout, or its original dataset when it has no holdout. Those
   windows read `ok` (0% flagged); the champion's traffic reads `ok` with exactly
-  its 60 customers recovered. Shifts are caught as before.
+  its 60 customers recovered, with or without its holdout. Shifts are caught as
+  before. Where no feature identifies a customer at all, a keyless window
+  assumes training's rows per customer and each column's clustering: flagged
+  0% at training's visit pattern, 10% at twice it (22% before).
 - **A quiet report now says what it could not have seen.** Some limits are the
   data's: 30 customers cannot reliably show a 0.5 sd shift, and no test fixes
   that. So each numeric feature reports the smallest mean shift its window
@@ -476,7 +480,7 @@ autoeng/
   reporting/       Markdown report generation
   pipeline.py      end-to-end orchestration
   cli.py           command-line entry point
-tests/             287 tests: planted leaks, regressions for every shipped bug, unit tests
+tests/             300 tests: planted leaks, regressions for every shipped bug, unit tests
 scripts/           detection calibration harness
 data/              synthetic + real validation datasets
 runs/              reports + MLflow store from the validation runs

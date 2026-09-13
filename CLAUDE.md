@@ -14,7 +14,7 @@ everything to MLflow, and writes a report.
 python -m autoeng.cli run data/any.csv          # infer everything
 python -m autoeng.cli run data.csv --target y   # or pin the target
 python -m autoeng.cli ask <run_id> "why did you reject random_forest?"
-pytest tests/ -q                                # 287 tests, ~220s
+pytest tests/ -q                                # 300 tests, ~220s
 python scripts/calibrate_detection.py           # detection accuracy, 10/10 expected
 ```
 
@@ -128,10 +128,15 @@ Rao-Scott chi-square for categoricals. Honest, they may raise a quiet report to
 `investigate` when significant features hold >= 25% of importance — never to
 `alarm`. When the entities are not visible, learn them rather than assume:
 a keyless window is grouped by the `entity_signature` learned at training
-(`autoeng/common/entities.py`, kept only if it splits and merges <= 5% of the
-known entities), and an artifact without stored sizes estimates them and the
-signature from its frozen holdout (`with_estimated_reference_sizes`; the CLI
-passes the holdout). Keyless no-drift windows had been flagged in 42-83%, old
+(`autoeng/common/entities.py`, kept only if the recovered groups size every
+column within -25% .. +10% of the true effective size — validate on sizing, not
+exact membership: a signature merging 14% of 2,000 customers sized within -15%
+and flagged 0% of no-drift windows, yet membership validation refused it). With
+no signature, a keyless window assumes the training design (`entity_design`:
+each column's ICC at training's rows per entity). An artifact without stored
+sizes estimates them, the ICCs and the signature from its frozen holdout, else
+its original dataset (`dataset_path` or `drift --reference-data`), else the
+window's own keyed rows (`with_estimated_reference_sizes`). Keyless no-drift windows had been flagged in 42-83%, old
 artifacts in up to 97%; both now 0%, at unchanged power. Recovery must link
 rows on all signature columns at once: per-column runs chained neighbouring
 customers and merged 20% of them. What remains is power the data does not
@@ -355,7 +360,7 @@ autoeng/
 
 ## Current state
 
-287 tests passing. Detection 10/10 on unambiguous cases (iris is genuinely
+300 tests passing. Detection 10/10 on unambiguous cases (iris is genuinely
 ambiguous and excluded). Successive halving gives 7.4× speedup with an
 identical winner.
 

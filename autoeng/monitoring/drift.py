@@ -303,12 +303,37 @@ def _combined_size(n_window: float | None, n_reference: float | None) -> float:
     return 1.0 / inverse if inverse > 0 else 0.0
 
 
-def _mean_shift_p(values: np.ndarray, reference: dict[str, Any], groups: Any) -> float | None:
+@dataclass
+class _Sizing:
+    """
+    How a window's independent observations are counted.
+
+    From entity keys (sent, or recovered through a validated signature) when
+    there are any; otherwise, for a grouped model, from the design measured at
+    training — each column's ICC at training's rows per entity. The assumption
+    is stated in the report: a window with more rows per entity than training
+    is still over-read, one with fewer is read conservatively.
+    """
+    groups: Any = None
+    mean_entity_size: float | None = None
+
+    def count(self, values: pd.Series, reference: dict[str, Any], bins: Any = None, mean: bool = False) -> float:
+        if self.groups is not None or not self.mean_entity_size:
+            return effective_sample_size(values, self.groups, bins=bins)
+        n = int(pd.Series(values).notna().sum())
+        icc = reference.get("icc_mean" if mean else "icc_bins") or 0.0
+        return n / (1.0 + (float(self.mean_entity_size) - 1.0) * float(icc))
+
+    def subset(self, present: np.ndarray) -> "_Sizing":
+        groups = None if self.groups is None else np.asarray(self.groups, dtype=object)[present]
+        return _Sizing(groups=groups, mean_entity_size=self.mean_entity_size)
+
+
+def _mean_shift_p(values: np.ndarray, reference: dict[str, Any], n_window: float) -> float | None:
     """Two-sample z-test on the mean, each side sized in independent observations."""
     ref_mean, ref_std = reference.get("mean"), reference.get("std")
-    if ref_mean is None or ref_std is None or len(values) < 2:
+    if ref_mean is None or ref_std is None or len(values) < 2 or not n_window:
         return None
-    n_window = effective_sample_size(pd.Series(values), groups)
     n_reference = reference.get("n_effective_mean") or reference.get("n_observed")
     if not n_reference:
         return None
@@ -318,7 +343,7 @@ def _mean_shift_p(values: np.ndarray, reference: dict[str, Any], groups: Any) ->
     return float(2.0 * stats.norm.sf(abs(float(values.mean()) - float(ref_mean)) / se))
 
 
-def _detectable_shift_sd(values: pd.Series, reference: dict[str, Any], groups: Any, n_tests: int) -> float | None:
+def _detectable_shift_sd(values: pd.Series, reference: dict[str, Any], sizing: "_Sizing", n_tests: int) -> float | None:
     """
     The mean shift, in reference sds, caught DETECTION_POWER of the time.
 
@@ -331,8 +356,7 @@ def _detectable_shift_sd(values: pd.Series, reference: dict[str, Any], groups: A
     n_reference = reference.get("n_effective_mean") or reference.get("n_observed")
     if present.sum() < 2 or not n_reference or not reference.get("std"):
         return None
-    window_groups = None if groups is None else np.asarray(groups, dtype=object)[present]
-    n_window = effective_sample_size(pd.Series(values.to_numpy()[present]), window_groups)
+    n_window = sizing.subset(present).count(pd.Series(values.to_numpy()[present]), reference, mean=True)
     alpha = FDR_ALPHA / (2.0 * max(n_tests, 1))
     df = max(min(n_window, float(n_reference)) - 1.0, 1.0)
     multiplier = float(stats.t.isf(alpha / 2.0, df) + stats.t.isf(1.0 - DETECTION_POWER, df))
@@ -341,7 +365,7 @@ def _detectable_shift_sd(values: pd.Series, reference: dict[str, Any], groups: A
 
 def _numeric_drift(
     values: pd.Series, reference: dict[str, Any], column: str, n_effective: float | None = None,
-    n_reference: float | None = None, groups: Any = None,
+    n_reference: float | None = None, sizing: "_Sizing | None" = None,
 ) -> tuple[float | None, float | None, float | None, str, int]:
     """PSI (None when the column cannot be measured honestly), KS statistic, p-value, detail, bins."""
     edges, cumulative, masses, reason = _numeric_bins(reference)
@@ -352,7 +376,6 @@ def _numeric_drift(
     observed = numeric[present]
     if observed.empty:
         return None, None, None, "no non-null values in the window", 0
-    window_groups = None if groups is None else np.asarray(groups, dtype=object)[present]
     array = observed.to_numpy(dtype=float)
 
     binned = np.searchsorted(edges, array, side="left")
@@ -368,7 +391,8 @@ def _numeric_drift(
     p_ks = float(stats.kstwobign.sf(statistic * np.sqrt(n_combined)))
     # The distributional test has little power for a location shift on a small
     # sample; the mean test has a lot. Either may speak, Bonferroni-doubled.
-    p_mean = _mean_shift_p(array, reference, window_groups)
+    n_mean = (sizing or _Sizing()).subset(present).count(pd.Series(array), reference, mean=True)
+    p_mean = _mean_shift_p(array, reference, n_mean)
     p_value = p_ks if p_mean is None else min(1.0, 2.0 * min(p_ks, p_mean))
 
     outside = int((observed < edges[0]).sum() + (observed > edges[-1]).sum())
@@ -381,7 +405,7 @@ def _numeric_drift(
 
 def _categorical_drift(
     values: pd.Series, reference: dict[str, Any], column: str, n_effective: float | None = None,
-    n_reference: float | None = None, groups: Any = None,
+    n_reference: float | None = None, sizing: "_Sizing | None" = None,
 ) -> tuple[float | None, float | None, float | None, str, int]:
     ref_freq = reference.get("frequencies") or {}
     observed = values.dropna().astype(str)
@@ -526,23 +550,45 @@ def check_data_drift(
     group_column = (schema.get("feature_roles") or {}).get("group_column")
     if groups is None and group_column and group_column in observed.columns:
         groups = observed[group_column].to_numpy(dtype=object)
+        if reference_sizes_missing(schema):
+            # No holdout or dataset supplied the sizes, but this window carries
+            # the key: its own clustering is the estimate, at its rows per entity.
+            schema = with_estimated_reference_sizes(
+                schema, reference_data=observed, source="this window's own keyed rows (assuming "
+                "training had as many rows per entity)")
+            column_meta = schema.get("columns") or {}
+    sizing = _Sizing(groups=groups)
     if group_column and groups is None:
         signature = schema.get("entity_signature")
-        groups = recover_entities(observed, signature)
-        if groups is not None:
+        design = schema.get("entity_design") or {}
+        recovered = recover_entities(observed, signature)
+        if recovered is not None:
+            sizing = _Sizing(groups=recovered)
+            error = signature.get("sizing_error")
+            checked = (f"sized every column within {error[0]:+.0%} to {error[1]:+.0%} of its true "
+                       f"effective size" if error else
+                       f"split {signature.get('split_rate', 0):.1%} and merged "
+                       f"{signature.get('merge_rate', 0):.1%} of entities")
             notes.append(
-                f"This window carries no '{group_column}', so {len(set(groups))} entities were "
-                f"recovered from {', '.join(signature['columns'])} over {len(observed)} rows. That "
-                f"signature split {signature['split_rate']:.1%} and merged "
-                f"{signature['merge_rate']:.1%} of entities where the key was known."
+                f"This window carries no '{group_column}', so {len(set(recovered))} entities were "
+                f"recovered from {', '.join(signature['columns'])} over {len(observed)} rows. Where "
+                f"the key was known, that signature {checked}."
+            )
+        elif design.get("mean_entity_size"):
+            sizing = _Sizing(mean_entity_size=design["mean_entity_size"])
+            notes.append(
+                f"This window carries no '{group_column}' and no feature identifies an entity, so "
+                f"its effective sizes assume training's design: {design['mean_entity_size']:.1f} "
+                f"rows per entity at each column's training ICC. A window with more rows per "
+                f"entity than that is still over-read; one with fewer is read conservatively."
             )
         else:
             notes.append(
                 f"The model groups rows by '{group_column}', but this window carries no "
-                f"'{group_column}' and no validated entity signature can stand in for it, so its "
-                f"rows are read as independent observations. If entities recur in the window, "
-                f"drift is over-read: 300 rows from 60 customers were flagged in 42% of no-drift "
-                f"windows this way."
+                f"'{group_column}', no validated entity signature can stand in for it and the "
+                f"artifact records no training design, so its rows are read as independent "
+                f"observations. If entities recur in the window, drift is over-read: 300 rows from "
+                f"60 customers were flagged in 42% of no-drift windows this way."
             )
     if schema.get("reference_sizes_estimated_from"):
         notes.append(
@@ -563,12 +609,11 @@ def check_data_drift(
             continue
 
         if kind == "categorical":
-            n_window = effective_sample_size(observed[column], groups)
+            n_window = sizing.count(observed[column], reference)
         else:
             # Sized over the bins PSI compares: bin membership is what clusters.
             edges = _numeric_bins(reference)[0]
-            n_window = effective_sample_size(pd.to_numeric(observed[column], errors="coerce"), groups,
-                                             bins=edges)
+            n_window = sizing.count(pd.to_numeric(observed[column], errors="coerce"), reference, bins=edges)
         n_reference = reference.get("n_effective")
         if n_reference is None or (kind == "numeric" and reference.get("n_effective_mean") is None):
             if group_column:
@@ -578,7 +623,7 @@ def check_data_drift(
 
         drift_of = _categorical_drift if kind == "categorical" else _numeric_drift
         psi, statistic, p_value, detail, n_bins = drift_of(
-            observed[column], reference, column, n_window, n_reference, groups,
+            observed[column], reference, column, n_window, n_reference, sizing,
         )
         if psi is None:
             # Reported as unmeasured, never as a zero: a zero reads as
@@ -612,7 +657,7 @@ def check_data_drift(
         if feature.kind == "numeric":
             reference = (column_meta.get(feature.column) or {}).get("reference") or {}
             feature.detectable_shift_sd = _detectable_shift_sd(
-                pd.to_numeric(observed[feature.column], errors="coerce"), reference, groups, len(features),
+                pd.to_numeric(observed[feature.column], errors="coerce"), reference, sizing, len(features),
             )
 
     weighted_psi = float(sum(f.weighted_psi for f in features))
@@ -674,18 +719,46 @@ def check_data_drift(
     )
 
 
-def with_estimated_reference_sizes(schema: dict[str, Any], holdout: pd.DataFrame | None) -> dict[str, Any]:
-    """
-    Fill in what an artifact written before effective sizes lacks, from its frozen holdout.
+def reference_sizes_missing(schema: dict[str, Any]) -> bool:
+    """Does a grouped artifact lack the effective sizes drift reads (written before they were stored)?"""
+    if not (schema.get("feature_roles") or {}).get("group_column"):
+        return False
+    for meta in (schema.get("columns") or {}).values():
+        reference = meta.get("reference") or {}
+        if reference.get("kind") in ("numeric", "categorical") and reference.get("n_effective") is None:
+            return True
+        if reference.get("kind") == "numeric" and reference.get("n_effective_mean") is None:
+            return True
+    return False
 
-    The holdout carries the entity key and comes from the same population, split
-    by whole entities, so its design effect per column is an estimate of the
-    reference's: n_effective = n_observed / design effect. An entity signature is
-    learned from it too. Returns a copy; the artifact on disk is not touched.
+
+def with_estimated_reference_sizes(
+    schema: dict[str, Any],
+    holdout: pd.DataFrame | None = None,
+    reference_data: pd.DataFrame | None = None,
+    source: str | None = None,
+) -> dict[str, Any]:
+    """
+    Fill in what an artifact written before effective sizes lacks.
+
+    From the first frame that carries the entity key: the frozen holdout, else
+    `reference_data` (the original dataset the schema's `dataset_path` names, or
+    one supplied). Either comes from the training population with the key, so
+    its design effect per column estimates the reference's:
+    n_effective = n_observed / design effect. The ICCs, rows per entity and an
+    entity signature are taken from it too. Returns a copy; nothing on disk changes.
     """
     group_column = (schema.get("feature_roles") or {}).get("group_column")
-    if not group_column or holdout is None or holdout.empty or group_column not in holdout.columns:
+    if not group_column:
         return schema
+    frame, label = None, source
+    for candidate, name in ((holdout, "the frozen holdout"), (reference_data, "the reference data")):
+        if candidate is not None and not candidate.empty and group_column in candidate.columns:
+            frame, label = candidate, source or name
+            break
+    if frame is None:
+        return schema
+    holdout = frame
     groups = holdout[group_column].to_numpy(dtype=object)
     out = copy.deepcopy(schema)
     estimated: list[str] = []
@@ -708,18 +781,35 @@ def with_estimated_reference_sizes(schema: dict[str, Any], holdout: pd.DataFrame
             if reference.get("n_effective_mean") is None:
                 reference["n_effective_mean"] = n / design_effect(values, groups)
                 changed = True
+        if kind == "numeric":
+            values = pd.to_numeric(holdout[column], errors="coerce")
+            edges = _numeric_bins(reference)[0]
+            mean_size = values.notna().sum() / max(len(set(map(str, groups[values.notna().to_numpy()]))), 1)
+            if reference.get("icc_bins") is None and edges is not None and mean_size > 1:
+                reference["icc_bins"] = min(1.0, max(0.0, (design_effect(values, groups, bins=edges) - 1) / (mean_size - 1)))
+                changed = True
+            if reference.get("icc_mean") is None and mean_size > 1:
+                reference["icc_mean"] = min(1.0, max(0.0, (design_effect(values, groups) - 1) / (mean_size - 1)))
+                changed = True
+        elif kind == "categorical" and reference.get("icc_bins") is None:
+            mean_size = holdout[column].notna().sum() / max(len(set(map(str, groups))), 1)
+            if mean_size > 1:
+                reference["icc_bins"] = min(1.0, max(0.0, (design_effect(holdout[column], groups) - 1) / (mean_size - 1)))
+                changed = True
         if changed:
-            reference["n_effective_source"] = "frozen holdout"
+            reference["n_effective_source"] = label
             estimated.append(column)
+    n_entities = len(set(map(str, groups)))
+    if not out.get("entity_design") and n_entities:
+        out["entity_design"] = {"mean_entity_size": len(holdout) / n_entities, "n_entities": n_entities,
+                                "estimated_from": label}
     if not out.get("entity_signature"):
         features = [c for c in (out.get("feature_columns") or []) if c in holdout.columns]
         signature = learn_entity_signature(holdout, groups, features)
         if signature is not None:
-            out["entity_signature"] = {**signature, "learned_from": "frozen holdout"}
+            out["entity_signature"] = {**signature, "learned_from": label}
     if estimated:
-        out["reference_sizes_estimated_from"] = (
-            f"the frozen holdout ({len(set(map(str, groups)))} entities, {len(holdout)} rows)"
-        )
+        out["reference_sizes_estimated_from"] = f"{label} ({n_entities} entities, {len(holdout)} rows)"
     return out
 
 

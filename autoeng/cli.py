@@ -81,6 +81,10 @@ def main(argv: list[str] | None = None) -> int:
                          help="Restrict to one model version; drift across a deploy boundary "
                               "mixes two models and attributes it to neither.")
     drift_p.add_argument("--json", action="store_true", help="Emit JSON instead of Markdown.")
+    drift_p.add_argument("--reference-data", default=None,
+                         help="The dataset the model was trained on, with its group column. Used to "
+                              "estimate effective sizes for an artifact that predates storing them "
+                              "and has no frozen holdout; defaults to the schema's dataset_path.")
 
     gate_p = sub.add_parser(
         "gate", help="Decide whether a retrained challenger replaces the champion.")
@@ -155,8 +159,17 @@ def main(argv: list[str] | None = None) -> int:
                  if args.since_days else None)
         # The frozen holdout lets an artifact from before stored effective sizes
         # estimate them rather than over-read drift on grouped data.
+        from autoeng.ingestion.loader import load_raw_dataset
+        from autoeng.monitoring.drift import reference_sizes_missing
+
+        holdout = load_holdout(model_dir)
+        reference_data = None
+        if reference_sizes_missing(schema) and (holdout is None or args.reference_data):
+            path = args.reference_data or schema.get("dataset_path")
+            if path and Path(path).is_file():
+                reference_data, _ = load_raw_dataset(path)
         report = run_drift_report(store, schema, since=since, model_version=args.model_version,
-                                  holdout=load_holdout(model_dir))
+                                  holdout=holdout, reference_data=reference_data)
 
         print(_json.dumps(report.as_dict(), indent=2, default=str) if args.json
               else report.as_markdown())

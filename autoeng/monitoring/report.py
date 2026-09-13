@@ -112,6 +112,7 @@ def run_drift_report(
     model_version: str | None = None,
     baseline: dict[str, float] | None = None,
     holdout: pd.DataFrame | None = None,
+    reference_data: pd.DataFrame | None = None,
 ) -> DriftReport:
     """
     Run all three checks over one window of the prediction log.
@@ -119,7 +120,7 @@ def run_drift_report(
     `holdout` (the artifact's frozen holdout) lets an artifact written before
     effective sizes were stored estimate them instead of over-reading drift.
     """
-    schema = with_estimated_reference_sizes(schema, holdout)
+    schema = with_estimated_reference_sizes(schema, holdout, reference_data)
     served = store.prediction_frame(since=since, model_version=model_version)
     labelled = store.labelled_frame(since=since, model_version=model_version)
     notes: list[str] = []
