@@ -49,30 +49,35 @@ def _icc(x: np.ndarray, codes: np.ndarray, sizes: np.ndarray) -> float:
     return float(min(1.0, max(0.0, (ms_between - ms_within) / denominator)))
 
 
-def effective_sample_size(values: pd.Series, groups: Any = None, bins: Any = None) -> float:
+def entity_codes(groups: Any, present: np.ndarray | None = None) -> np.ndarray:
+    """Integer entity codes; a row with no key is its own entity, as in group_values."""
+    labels = pd.Series(np.asarray(groups, dtype=object)).reset_index(drop=True)
+    if present is not None:
+        labels = labels[present]
+    missing = labels.isna().to_numpy()
+    labels = labels.astype(str).to_numpy(dtype=object)
+    labels[missing] = [f"__ungrouped_row_{i}" for i in np.flatnonzero(missing)]
+    return pd.factorize(labels)[0]
+
+
+def design_effect(values: pd.Series, groups: Any = None, bins: Any = None) -> float:
     """
-    Independent observations in `values`, given the entity each row belongs to.
+    Variance inflation from clustering, >= 1.
 
     Categorical values, and numeric values when `bins` (sorted edges, binned as
-    drift bins them) is given, are sized by the Rao-Scott mean design effect
-    over their cells. Numeric values without bins are sized by their own ICC.
+    drift bins them) is given, take the Rao-Scott mean over their cells. Numeric
+    values without bins take their own ICC.
     """
     series = pd.Series(values).reset_index(drop=True)
     present = series.notna().to_numpy()
     n = int(present.sum())
     if groups is None or n == 0:
-        return float(n)
-
-    labels = pd.Series(np.asarray(groups, dtype=object)).reset_index(drop=True)[present]
+        return 1.0
+    codes = entity_codes(groups, present)
     series = series[present]
-    # A row with no entity key is its own entity — the same rule group_values uses.
-    missing = labels.isna().to_numpy()
-    labels = labels.astype(str).to_numpy(dtype=object)
-    labels[missing] = [f"__ungrouped_row_{i}" for i in np.flatnonzero(missing)]
-    codes, uniques = pd.factorize(labels)
-    k = len(uniques)
+    k = int(codes.max()) + 1 if len(codes) else 0
     if k >= n or k < 2:
-        return float(n)
+        return 1.0
     sizes = np.bincount(codes, minlength=k).astype(float)
     mean_size = n / k
 
@@ -80,21 +85,30 @@ def effective_sample_size(values: pd.Series, groups: Any = None, bins: Any = Non
     if numeric and bins is None:
         x = series.to_numpy(dtype=float)
         icc = _icc(x, codes, sizes) if np.ptp(x) > 0 else 0.0
-        design_effect = 1.0 + (mean_size - 1.0) * icc
+        return 1.0 + (mean_size - 1.0) * icc
+
+    if numeric:
+        cells = pd.Series(np.searchsorted(np.asarray(bins, dtype=float), series.to_numpy(dtype=float), side="left"))
     else:
-        if numeric:
-            cells = pd.Series(np.searchsorted(np.asarray(bins, dtype=float), series.to_numpy(dtype=float), side="left"))
-        else:
-            cells = series.astype(str)
-        frequent = cells.value_counts().index[:MAX_LEVELS_FOR_ICC]
-        cells = cells.where(cells.isin(frequent), "__pooled__")
-        effects, weights = [], []
-        for level in cells.unique():
-            x = (cells == level).to_numpy(dtype=float)
-            p = float(x.mean())
-            if p in (0.0, 1.0):
-                continue
-            effects.append(1.0 + (mean_size - 1.0) * _icc(x, codes, sizes))
-            weights.append(1.0 - p)
-        design_effect = float(np.average(effects, weights=weights)) if effects else 1.0
-    return float(min(n, max(k, n / design_effect)))
+        cells = series.astype(str).reset_index(drop=True)
+    frequent = cells.value_counts().index[:MAX_LEVELS_FOR_ICC]
+    cells = cells.where(cells.isin(frequent), "__pooled__")
+    effects, weights = [], []
+    for level in cells.unique():
+        x = (cells == level).to_numpy(dtype=float)
+        p = float(x.mean())
+        if p in (0.0, 1.0):
+            continue
+        effects.append(1.0 + (mean_size - 1.0) * _icc(x, codes, sizes))
+        weights.append(1.0 - p)
+    return float(np.average(effects, weights=weights)) if effects else 1.0
+
+
+def effective_sample_size(values: pd.Series, groups: Any = None, bins: Any = None) -> float:
+    """Independent observations in `values`, given the entity each row belongs to."""
+    series = pd.Series(values)
+    n = int(series.notna().sum())
+    if groups is None or n == 0:
+        return float(n)
+    k = len(set(entity_codes(groups, series.notna().to_numpy())))
+    return float(min(n, max(min(k, n), n / design_effect(values, groups, bins))))

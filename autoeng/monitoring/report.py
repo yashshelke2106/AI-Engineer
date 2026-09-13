@@ -32,8 +32,9 @@ import pandas as pd
 
 from autoeng.monitoring.drift import (
     DataDriftReport, DriftSeverity, SimpleDriftReport, check_concept_drift,
-    check_data_drift, check_prediction_drift,
+    check_data_drift, check_prediction_drift, with_estimated_reference_sizes,
 )
+from autoeng.common.entities import recover_entities
 
 # Concept drift is the only check that measures degradation directly, so it
 # outranks the leading indicators when it has the labels to speak.
@@ -105,8 +106,15 @@ def run_drift_report(
     since: datetime | None = None,
     model_version: str | None = None,
     baseline: dict[str, float] | None = None,
+    holdout: pd.DataFrame | None = None,
 ) -> DriftReport:
-    """Run all three checks over one window of the prediction log."""
+    """
+    Run all three checks over one window of the prediction log.
+
+    `holdout` (the artifact's frozen holdout) lets an artifact written before
+    effective sizes were stored estimate them instead of over-reading drift.
+    """
+    schema = with_estimated_reference_sizes(schema, holdout)
     served = store.prediction_frame(since=since, model_version=model_version)
     labelled = store.labelled_frame(since=since, model_version=model_version)
     notes: list[str] = []
@@ -159,8 +167,8 @@ def run_drift_report(
             else:
                 prediction = check_prediction_drift(
                     live["probability"].to_numpy(), reference["probability"].to_numpy(),
-                    observed_groups=_entity_keys(live, group_column),
-                    reference_groups=_entity_keys(reference, group_column),
+                    observed_groups=_entity_keys(live, group_column, schema.get("entity_signature")),
+                    reference_groups=_entity_keys(reference, group_column, schema.get("entity_signature")),
                 )
 
     resolved_baseline = baseline or schema.get("baseline_metrics") or {}
@@ -197,9 +205,11 @@ def _earliest_reference(store, model_version: str | None, size: int = 500) -> pd
     return scored.head(size)
 
 
-def _entity_keys(frame: pd.DataFrame, group_column: str | None):
+def _entity_keys(frame: pd.DataFrame, group_column: str | None, signature: dict[str, Any] | None = None):
     if group_column and group_column in frame.columns:
         return frame[group_column].to_numpy(dtype=object)
+    if group_column:
+        return recover_entities(frame, signature)
     return None
 
 

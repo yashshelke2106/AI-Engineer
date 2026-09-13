@@ -116,9 +116,15 @@ class TestNoDriftStaysQuiet:
         windows = [_entities(300 // visits, visits, rng) for _ in range(30)]
         assert _non_ok(grouped_reference, windows) <= 1
 
-    def test_without_the_key_it_says_why_it_may_over_read(self, grouped_reference):
+    def test_without_the_key_or_a_signature_it_says_why_it_may_over_read(self, grouped_reference):
+        """With a validated entity signature the entities are recovered instead
+        (tests/test_drift_entities.py); without one, the report says so."""
+        import copy
+
+        unsigned = copy.deepcopy(grouped_reference)
+        unsigned["entity_signature"] = None
         window = _entities(60, 5, np.random.default_rng(30)).drop(columns=[KEY])
-        report = check_data_drift(window, grouped_reference, IMPORTANCES)
+        report = check_data_drift(window, unsigned, IMPORTANCES)
         assert any(KEY in note and "independent" in note for note in report.notes), report.notes
 
     def test_an_artifact_without_effective_sizes_says_so(self, grouped_reference):

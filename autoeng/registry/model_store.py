@@ -60,6 +60,7 @@ import numpy as np
 import pandas as pd
 
 from autoeng.common.roles import FeatureRoleAssignment
+from autoeng.common.entities import learn_entity_signature
 from autoeng.common.sampling import effective_sample_size
 from autoeng.profiling.profiler import DatasetProfile, SemanticType
 
@@ -335,9 +336,15 @@ def build_training_schema(
         # and the training target is the honest one.
         target["reference"] = _column_reference(y_train, target_semantic, groups)
 
+    # Which feature columns identify an entity, validated against the key. Drift
+    # uses it to group a window whose payloads arrived without the key.
+    entity_signature = (learn_entity_signature(X_train, groups, [str(c) for c in X_train.columns])
+                        if groups is not None else None)
+
     return {
         "schema_version": SCHEMA_VERSION,
         "created_utc": datetime.now(timezone.utc).isoformat(),
+        "entity_signature": entity_signature,
         "dataset_path": dataset_path,
         "problem_type": problem_type,
         "n_training_rows": int(len(X_train)),

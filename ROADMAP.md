@@ -243,7 +243,11 @@ mass; tied quantiles got equal masses) and severity was read beyond a sampling
 noise floor sized in independent observations (see CLAUDE.md 7d). Prediction
 drift was later found blind to predictions beyond its reference's range (PSI
 0.000 for every prediction at 0.97) and diluted by its own baseline; it now uses
-the same bins, floor and sizing. Per-feature PSI is reported raw and
+the same bins, floor and sizing. Drift p-values were then made two-sample and
+cluster-aware (significant in 62-100% of no-drift windows before, 0-6% after),
+and grouped windows without the entity key, and artifacts predating stored
+sizes, recover their entities from a validated signature or the frozen holdout
+(no-drift flags 42-97% -> 0%). Per-feature PSI is reported raw and
 importance-weighted, the verdict is not the maximum of the three checks, and
 UNKNOWN is never OK — see CLAUDE.md 7d-7f. Concept drift originally assumed
 integer binary labels: regression outcomes shifted three standard deviations
@@ -464,7 +468,7 @@ Roughly 2,300 lines and 40 tests across all fourteen items; Tier 0 alone is
 about 530 lines and closes the gap between what the report claims and what the
 model does.
 
-Current state: 269 tests passing, 10/10 on unambiguous problem-type detection,
+Current state: 284 tests passing, 10/10 on unambiguous problem-type detection,
 7.4× search speedup from successive halving. **Tiers 0 and 1 are complete.**
 A trained model is persisted with its schema and a frozen holdout (T0-1),
 decides at an out-of-fold threshold (T0-2), and is split entity-aware (T0-3);

@@ -145,7 +145,7 @@ def main(argv: list[str] | None = None) -> int:
 
         from autoeng.monitoring.drift import DriftSeverity
         from autoeng.monitoring.report import run_drift_report
-        from autoeng.registry.model_store import SCHEMA_FILENAME, load_training_schema
+        from autoeng.registry.model_store import SCHEMA_FILENAME, load_holdout, load_training_schema
         from autoeng.serving.store import PredictionStore
 
         model_dir = Path(args.model_dir)
@@ -153,7 +153,10 @@ def main(argv: list[str] | None = None) -> int:
         store = PredictionStore(args.log or (model_dir / "predictions.db"))
         since = (datetime.now(timezone.utc) - timedelta(days=args.since_days)
                  if args.since_days else None)
-        report = run_drift_report(store, schema, since=since, model_version=args.model_version)
+        # The frozen holdout lets an artifact from before stored effective sizes
+        # estimate them rather than over-read drift on grouped data.
+        report = run_drift_report(store, schema, since=since, model_version=args.model_version,
+                                  holdout=load_holdout(model_dir))
 
         print(_json.dumps(report.as_dict(), indent=2, default=str) if args.json
               else report.as_markdown())

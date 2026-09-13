@@ -65,6 +65,7 @@ raise a quiet report to `investigate` (never `alarm`).
 """
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Sequence
@@ -73,7 +74,8 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 
-from autoeng.common.sampling import effective_sample_size
+from autoeng.common.entities import learn_entity_signature, recover_entities
+from autoeng.common.sampling import design_effect, effective_sample_size
 
 # Conventional PSI reading: below 0.1 the distributions are equivalent for
 # practical purposes, 0.1-0.2 is worth a look, above 0.2 is a real shift.
@@ -499,11 +501,27 @@ def check_data_drift(
     if groups is None and group_column and group_column in observed.columns:
         groups = observed[group_column].to_numpy(dtype=object)
     if group_column and groups is None:
+        signature = schema.get("entity_signature")
+        groups = recover_entities(observed, signature)
+        if groups is not None:
+            notes.append(
+                f"This window carries no '{group_column}', so {len(set(groups))} entities were "
+                f"recovered from {', '.join(signature['columns'])} over {len(observed)} rows. That "
+                f"signature split {signature['split_rate']:.1%} and merged "
+                f"{signature['merge_rate']:.1%} of entities where the key was known."
+            )
+        else:
+            notes.append(
+                f"The model groups rows by '{group_column}', but this window carries no "
+                f"'{group_column}' and no validated entity signature can stand in for it, so its "
+                f"rows are read as independent observations. If entities recur in the window, "
+                f"drift is over-read: 300 rows from 60 customers were flagged in 42% of no-drift "
+                f"windows this way."
+            )
+    if schema.get("reference_sizes_estimated_from"):
         notes.append(
-            f"The model groups rows by '{group_column}', but this window carries no "
-            f"'{group_column}', so its rows are read as independent observations. If entities "
-            f"recur in the window, drift is over-read: 300 rows from 60 customers alarmed in 88% "
-            f"of no-drift windows when rows were counted instead of customers."
+            f"This artifact predates stored effective sizes; they were estimated from "
+            f"{schema['reference_sizes_estimated_from']}."
         )
 
     features: list[FeatureDrift] = []
@@ -613,6 +631,55 @@ def check_data_drift(
         n_rows=len(observed), summary=summary, notes=notes,
         weighted_excess_psi=weighted_excess, significant_importance=significant_importance,
     )
+
+
+def with_estimated_reference_sizes(schema: dict[str, Any], holdout: pd.DataFrame | None) -> dict[str, Any]:
+    """
+    Fill in what an artifact written before effective sizes lacks, from its frozen holdout.
+
+    The holdout carries the entity key and comes from the same population, split
+    by whole entities, so its design effect per column is an estimate of the
+    reference's: n_effective = n_observed / design effect. An entity signature is
+    learned from it too. Returns a copy; the artifact on disk is not touched.
+    """
+    group_column = (schema.get("feature_roles") or {}).get("group_column")
+    if not group_column or holdout is None or holdout.empty or group_column not in holdout.columns:
+        return schema
+    groups = holdout[group_column].to_numpy(dtype=object)
+    out = copy.deepcopy(schema)
+    estimated: list[str] = []
+    for column, meta in (out.get("columns") or {}).items():
+        reference = meta.get("reference") or {}
+        kind, n = reference.get("kind"), reference.get("n_observed") or 0
+        if column not in holdout.columns or kind not in ("numeric", "categorical") or not n:
+            continue
+        changed = False
+        if kind == "categorical":
+            if reference.get("n_effective") is None:
+                reference["n_effective"] = n / design_effect(holdout[column], groups)
+                changed = True
+        else:
+            values = pd.to_numeric(holdout[column], errors="coerce")
+            edges = _numeric_bins(reference)[0]
+            if reference.get("n_effective") is None and edges is not None:
+                reference["n_effective"] = n / design_effect(values, groups, bins=edges)
+                changed = True
+            if reference.get("n_effective_mean") is None:
+                reference["n_effective_mean"] = n / design_effect(values, groups)
+                changed = True
+        if changed:
+            reference["n_effective_source"] = "frozen holdout"
+            estimated.append(column)
+    if not out.get("entity_signature"):
+        features = [c for c in (out.get("feature_columns") or []) if c in holdout.columns]
+        signature = learn_entity_signature(holdout, groups, features)
+        if signature is not None:
+            out["entity_signature"] = {**signature, "learned_from": "frozen holdout"}
+    if estimated:
+        out["reference_sizes_estimated_from"] = (
+            f"the frozen holdout ({len(set(map(str, groups)))} entities, {len(holdout)} rows)"
+        )
+    return out
 
 
 def _sample_reference(values: np.ndarray, n_bins: int, n_effective: float) -> dict[str, Any]:

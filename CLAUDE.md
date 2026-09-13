@@ -14,7 +14,7 @@ everything to MLflow, and writes a report.
 python -m autoeng.cli run data/any.csv          # infer everything
 python -m autoeng.cli run data.csv --target y   # or pin the target
 python -m autoeng.cli ask <run_id> "why did you reject random_forest?"
-pytest tests/ -q                                # 269 tests, ~220s
+pytest tests/ -q                                # 284 tests, ~220s
 python scripts/calibrate_detection.py           # detection accuracy, 10/10 expected
 ```
 
@@ -126,7 +126,15 @@ against an interpolated CDF: that found a "significant" feature in 62% of
 no-drift 800-row windows and 100% of 5,000-row ones), paired with a mean test;
 Rao-Scott chi-square for categoricals. Honest, they may raise a quiet report to
 `investigate` when significant features hold >= 25% of importance — never to
-`alarm`.
+`alarm`. When the entities are not visible, learn them rather than assume:
+a keyless window is grouped by the `entity_signature` learned at training
+(`autoeng/common/entities.py`, kept only if it splits and merges <= 5% of the
+known entities), and an artifact without stored sizes estimates them and the
+signature from its frozen holdout (`with_estimated_reference_sizes`; the CLI
+passes the holdout). Keyless no-drift windows had been flagged in 42-83%, old
+artifacts in up to 97%; both now 0%, at unchanged power. Recovery must link
+rows on all signature columns at once: per-column runs chained neighbouring
+customers and merged 20% of them.
 
 **7e. UNKNOWN is not OK.** No labels arriving and a healthy model look
 identical if you collapse them, and they mean opposite things. Concept drift
@@ -342,7 +350,7 @@ autoeng/
 
 ## Current state
 
-269 tests passing. Detection 10/10 on unambiguous cases (iris is genuinely
+284 tests passing. Detection 10/10 on unambiguous cases (iris is genuinely
 ambiguous and excluded). Successive halving gives 7.4× speedup with an
 identical winner.
 
