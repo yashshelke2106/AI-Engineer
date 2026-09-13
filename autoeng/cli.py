@@ -86,6 +86,19 @@ def main(argv: list[str] | None = None) -> int:
                               "estimate effective sizes for an artifact that predates storing them "
                               "and has no frozen holdout; defaults to the schema's dataset_path.")
 
+    retrain_p = sub.add_parser(
+        "retrain", help="Retrain a challenger on the champion's data plus the outcomes logged since.")
+    retrain_p.add_argument("champion_dir", help="The champion's model directory.")
+    retrain_p.add_argument("--dataset", default=None,
+                           help="The data the champion was trained on (default: the schema's dataset_path).")
+    retrain_p.add_argument("--log", default=None,
+                           help="Prediction log with outcomes (default: predictions.db in the champion's directory).")
+    retrain_p.add_argument("--output-dir", default="./runs")
+    retrain_p.add_argument("--name", default=None, help="Run name for the challenger.")
+    retrain_p.add_argument("--hpo-trials", type=int, default=20)
+    retrain_p.add_argument("--scheduled", action="store_true",
+                           help="Retrain without a drift alarm, as a schedule would. New labels are still required.")
+
     gate_p = sub.add_parser(
         "gate", help="Decide whether a retrained challenger replaces the champion.")
     gate_p.add_argument("champion_dir", help="The champion's model directory.")
@@ -179,6 +192,54 @@ def main(argv: list[str] | None = None) -> int:
         # check could not run — neither is evidence the model is broken.
         return 1 if report.severity == DriftSeverity.ALARM else 0
 
+    if args.command == "retrain":
+        from autoeng.lifecycle.retrain import retrain, should_retrain
+        from autoeng.monitoring.report import run_drift_report
+        from autoeng.registry.model_store import SCHEMA_FILENAME, load_holdout, load_training_schema
+        from autoeng.serving.store import PredictionStore
+
+        champion_dir = Path(args.champion_dir)
+        schema = load_training_schema(champion_dir / SCHEMA_FILENAME)
+        log_path = Path(args.log) if args.log else champion_dir / "predictions.db"
+        if not log_path.is_file():
+            print(f"No prediction log at {log_path}. A retrain needs served traffic with outcomes.")
+            return 2
+        dataset = args.dataset or schema.get("dataset_path")
+        if not dataset or not Path(dataset).is_file():
+            print(f"The champion's training data was not found ({dataset}); pass it with --dataset.")
+            return 2
+        store = PredictionStore(log_path)
+
+        # The trigger reads the same drift check `drift` prints: an alarm, or a
+        # schedule, and enough labels that did not exist at training time.
+        report = run_drift_report(store, schema, holdout=load_holdout(champion_dir))
+        decision = should_retrain(report, store, scheduled=args.scheduled)
+        print(f"Drift verdict: {report.severity.value}. {decision.reason}")
+        if not decision.triggered:
+            if not args.scheduled:
+                print("Nothing retrained. Pass --scheduled to retrain without a drift alarm.")
+            return 2
+
+        name = args.name or f"{champion_dir.name}_challenger"
+        result = retrain(dataset, schema, store, args.output_dir, decision, run_name=name,
+                         champion_model_dir=champion_dir, hpo_trials=args.hpo_trials)
+        if result.error:
+            print(f"Retraining failed: {result.error}")
+            return 1
+        frame = result.frame_report
+        print(f"Challenger: {result.challenger_model_dir}")
+        print(f"Trained on {frame.get('n_total_rows')} rows: {frame.get('n_new_rows')} new labelled rows added, "
+              f"{frame.get('n_holdout_rows_excluded', 0)} champion holdout rows and "
+              f"{frame.get('n_new_rows_of_holdout_entities_excluded', 0) + frame.get('n_new_rows_repeating_holdout_excluded', 0)} "
+              f"logged rows of holdout customers kept out.")
+        for warning in frame.get("warnings") or []:
+            print(f"  note: {warning}")
+        print(f"Manifest: {result.manifest_path}")
+        print("Next: serve more (new) traffic for the gate's forward window, then run\n"
+              f"  python -m autoeng.cli gate {champion_dir} {result.challenger_model_dir} "
+              f"--models-root {Path(args.output_dir) / 'production'} --apply")
+        return 0
+
     if args.command == "gate":
         import json as _json
 
@@ -209,6 +270,15 @@ def main(argv: list[str] | None = None) -> int:
             from autoeng.tracking.mlflow_tracker import log_promotion_decision
             log_promotion_decision(args.tracking_uri, run_id, record)
         if args.apply:
+            from autoeng.registry.champion import read_champion, write_champion
+
+            if read_champion(args.models_root) is None:
+                # The first gate against this champion: record it as production
+                # before deciding, so a result that promotes nothing still leaves
+                # a pointer naming the model that stays. Recording is not a move.
+                write_champion(args.models_root, champion_dir,
+                               reason="initial champion, recorded by the first gate against it")
+                print(f"No production pointer in {args.models_root}; recorded {champion_dir} as the champion.")
             after = apply_gate_decision(args.models_root, record, challenger_dir, run_id)
             print(f"Production model: {(after or {}).get('model_dir')}")
         # Distinct codes so a scheduled job can tell "worse" from "cannot tell yet"

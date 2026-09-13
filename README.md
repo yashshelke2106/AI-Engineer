@@ -24,9 +24,11 @@ python -m autoeng.cli serve runs/models/<run_name>         # score rows over HTT
 python scripts/replay_traffic.py data/<dataset>.csv --times 2  # (2nd terminal) fill the log
 python scripts/replay_traffic.py data/<dataset>.csv --times 2 --shift measure_a=+1sd  # watch drift fire
 python -m autoeng.cli drift runs/models/<run_name>         # data / prediction / concept drift
+python -m autoeng.cli retrain runs/models/<run_name>       # on a drift alarm (or --scheduled)
+python scripts/generate_grouped.py --customers 200 --out data/new_customers.csv  # fresh traffic
 python -m autoeng.cli gate <champion> <challenger> --models-root runs/production --apply
 
-pytest tests/ -q                                           # 317 tests, ~220s
+pytest tests/ -q                                           # 320 tests, ~220s
 python scripts/calibrate_detection.py                      # detection accuracy harness
 ```
 
@@ -482,7 +484,7 @@ autoeng/
   reporting/       Markdown report generation
   pipeline.py      end-to-end orchestration
   cli.py           command-line entry point
-tests/             317 tests: planted leaks, regressions for every shipped bug, unit tests
+tests/             320 tests: planted leaks, regressions for every shipped bug, unit tests
 scripts/           detection calibration harness
 data/              synthetic + real validation datasets
 runs/              reports + MLflow store from the validation runs
