@@ -440,6 +440,17 @@ def combine_windows(windows: dict[str, GateDecision], notes: list[str] | None = 
                 f"Challenger promoted on the forward window. {forward.reason}",
                 windows, FORWARD_WINDOW, notes,
             )
+        if holdout is not None and holdout.verdict == GateVerdict.INCONCLUSIVE:
+            # Neither window decides. The forward window still leads, so its
+            # evidence is the headline: quoting a 150-row holdout over a
+            # 1,300-row forward window read as if the gate had used the weaker one.
+            notes.append(f"The frozen holdout could not separate them either: {holdout.reason}")
+            return LifecycleGateDecision(
+                GateVerdict.INCONCLUSIVE, False,
+                f"Challenger not promoted: neither window shows it is better beyond the noise. "
+                f"On the forward window, the world as it is now: {forward.reason}",
+                windows, FORWARD_WINDOW, notes,
+            )
         notes.append(f"The forward window could not separate the models: {forward.reason}")
     elif forward is not None:
         notes.append(f"The forward window is too small to decide on: {forward.reason}")

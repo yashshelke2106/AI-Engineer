@@ -165,6 +165,27 @@ class TestCombiningWindows:
         })
         assert decision.verdict == GateVerdict.REJECTED and not decision.promote
 
+    def test_when_neither_window_decides_the_headline_quotes_the_forward_window(self):
+        """Found reading a real gate: both windows inconclusive, and the reason and the
+        top-level comparison quoted a 150-row holdout while a 1,300-row forward window
+        held the evidence. The forward window leads whenever it speaks."""
+        decision = combine_windows({
+            FROZEN_HOLDOUT: self._decision(GateVerdict.INCONCLUSIVE, -0.05, rows=150),
+            FORWARD_WINDOW: self._decision(GateVerdict.INCONCLUSIVE, -0.005, rows=1300),
+        })
+        assert decision.verdict == GateVerdict.INCONCLUSIVE and not decision.promote
+        assert decision.primary_window == FORWARD_WINDOW
+        assert decision.as_dict()["comparison"]["n_rows"] == 1300
+        assert "(-0.01)" in decision.reason and "(-0.05)" not in decision.reason
+        assert any("(-0.05)" in note for note in decision.notes), "the holdout's view is still reported"
+
+    def test_a_silent_forward_window_leaves_an_undecided_holdout_primary(self):
+        decision = combine_windows({
+            FROZEN_HOLDOUT: self._decision(GateVerdict.INCONCLUSIVE, -0.05, rows=150),
+            FORWARD_WINDOW: self._decision(GateVerdict.INCONCLUSIVE, rows=None),
+        })
+        assert decision.primary_window == FROZEN_HOLDOUT
+
     def test_a_too_small_forward_window_defers_to_the_holdout(self):
         decision = combine_windows({
             FROZEN_HOLDOUT: self._decision(GateVerdict.REJECTED, -0.10),
