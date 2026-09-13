@@ -90,6 +90,8 @@ NOISE_QUANTILE = 0.95
 # Significant features (BH-adjusted) carrying at least this share of importance
 # raise an otherwise-quiet data-drift report to investigate.
 SIGNIFICANT_IMPORTANCE = 0.25
+# The power a reported detectable shift is stated at.
+DETECTION_POWER = 0.80
 # Below this many labelled rows, concept drift is UNKNOWN rather than OK.
 MIN_LABELS_FOR_CONCEPT = 30
 # Below this many rows a window is too small to read anything from.
@@ -134,6 +136,9 @@ class FeatureDrift:
     excess_psi: float = 0.0
     n_effective: float | None = None
     n_effective_reference: float | None = None
+    # The mean shift, in reference sds, this window would catch DETECTION_POWER
+    # of the time after the same corrections as the p-value. Numeric only.
+    detectable_shift_sd: float | None = None
 
     def as_dict(self) -> dict[str, Any]:
         d = dict(self.__dict__)
@@ -311,6 +316,27 @@ def _mean_shift_p(values: np.ndarray, reference: dict[str, Any], groups: Any) ->
     if not np.isfinite(se) or se <= 0:
         return None
     return float(2.0 * stats.norm.sf(abs(float(values.mean()) - float(ref_mean)) / se))
+
+
+def _detectable_shift_sd(values: pd.Series, reference: dict[str, Any], groups: Any, n_tests: int) -> float | None:
+    """
+    The mean shift, in reference sds, caught DETECTION_POWER of the time.
+
+    Mirrors the test: the mean test is Bonferroni-doubled against KS, and one
+    real shift among `n_tests` features must clear Benjamini-Hochberg at rank
+    one, i.e. p < alpha / n_tests. t quantiles on the smaller effective sample
+    keep small windows conservative; z quantiles caught 73% at 30 customers.
+    """
+    present = values.notna().to_numpy()
+    n_reference = reference.get("n_effective_mean") or reference.get("n_observed")
+    if present.sum() < 2 or not n_reference or not reference.get("std"):
+        return None
+    window_groups = None if groups is None else np.asarray(groups, dtype=object)[present]
+    n_window = effective_sample_size(pd.Series(values.to_numpy()[present]), window_groups)
+    alpha = FDR_ALPHA / (2.0 * max(n_tests, 1))
+    df = max(min(n_window, float(n_reference)) - 1.0, 1.0)
+    multiplier = float(stats.t.isf(alpha / 2.0, df) + stats.t.isf(1.0 - DETECTION_POWER, df))
+    return multiplier * float(np.sqrt(1.0 / n_window + 1.0 / float(n_reference)))
 
 
 def _numeric_drift(
@@ -582,6 +608,12 @@ def check_data_drift(
 
     for feature, adjusted in zip(features, _benjamini_hochberg([f.p_value for f in features])):
         feature.p_value_adjusted = adjusted
+    for feature in features:
+        if feature.kind == "numeric":
+            reference = (column_meta.get(feature.column) or {}).get("reference") or {}
+            feature.detectable_shift_sd = _detectable_shift_sd(
+                pd.to_numeric(observed[feature.column], errors="coerce"), reference, groups, len(features),
+            )
 
     weighted_psi = float(sum(f.weighted_psi for f in features))
     weighted_excess = float(sum(f.excess_psi * f.importance for f in features))
@@ -618,6 +650,15 @@ def check_data_drift(
     else:
         summary = (f"No feature moved beyond sampling noise across {len(observed)} rows "
                    f"(max PSI {max_psi:.3f}).")
+    sized = [f for f in features if f.detectable_shift_sd is not None]
+    if severity == DriftSeverity.OK and sized:
+        # A quiet verdict is only as reassuring as the window is large.
+        lead = max(sized, key=lambda f: f.importance)
+        summary += (
+            f" At this window's size, a mean shift in {lead.column} smaller than "
+            f"{lead.detectable_shift_sd:.2f} sd would be caught less than "
+            f"{DETECTION_POWER:.0%} of the time."
+        )
     if escalated:
         summary += (
             f" Shifts in {', '.join(f.column for f in significant)} are statistically significant "

@@ -24,7 +24,7 @@ python -m autoeng.cli serve runs/models/<run_name>         # score rows over HTT
 python -m autoeng.cli drift runs/models/<run_name>         # data / prediction / concept drift
 python -m autoeng.cli gate <champion> <challenger> --models-root runs/production --apply
 
-pytest tests/ -q                                           # 284 tests, ~220s
+pytest tests/ -q                                           # 287 tests, ~220s
 python scripts/calibrate_detection.py                      # detection accuracy harness
 ```
 
@@ -367,6 +367,12 @@ part:
   artifact estimates its sizes and signature from its frozen holdout. Those
   windows read `ok` (0% flagged); the champion's traffic reads `ok` with exactly
   its 60 customers recovered. Shifts are caught as before.
+- **A quiet report now says what it could not have seen.** Some limits are the
+  data's: 30 customers cannot reliably show a 0.5 sd shift, and no test fixes
+  that. So each numeric feature reports the smallest mean shift its window
+  would catch 80% of the time (0.6-1.0 sd for 30 customers against 120, checked
+  by simulation), and an `ok` verdict names it for the most important feature
+  rather than implying nothing moved.
 - **A customer is not a row in the lifecycle either.** A frozen-holdout customer
   coming back on a new visit has a new vector, so the check for repeated holdout
   rows passed it. Retrained on 150 such visits, a challenger was promoted on the
@@ -470,7 +476,7 @@ autoeng/
   reporting/       Markdown report generation
   pipeline.py      end-to-end orchestration
   cli.py           command-line entry point
-tests/             284 tests: planted leaks, regressions for every shipped bug, unit tests
+tests/             287 tests: planted leaks, regressions for every shipped bug, unit tests
 scripts/           detection calibration harness
 data/              synthetic + real validation datasets
 runs/              reports + MLflow store from the validation runs

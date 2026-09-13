@@ -82,11 +82,12 @@ class DriftReport:
             lines.append(self.data.summary + "\n")
             for note in self.data.notes:
                 lines.append(f"> {note}\n")
-            lines.append("| Feature | PSI | Noise floor | Importance | Weighted | Severity |")
-            lines.append("|---|---|---|---|---|---|")
+            lines.append("| Feature | PSI | Noise floor | Importance | Weighted | Severity | Detectable shift |")
+            lines.append("|---|---|---|---|---|---|---|")
             for f in self.data.features:
+                detectable = "—" if f.detectable_shift_sd is None else f"{f.detectable_shift_sd:.2f} sd"
                 lines.append(f"| {f.column} | {f.psi:.4f} | {f.noise_floor:.4f} | {f.importance:.1%} | "
-                             f"{f.weighted_psi:.4f} | {f.severity.value} |")
+                             f"{f.weighted_psi:.4f} | {f.severity.value} | {detectable} |")
             lines.append("")
             lines.append(
                 "*A feature can be flagged individually while the verdict stays quiet: that "
@@ -96,6 +97,10 @@ class DriftReport:
                 "*Severity counts only PSI beyond the noise floor: two samples of one "
                 "distribution never score zero, and a small or entity-clustered sample "
                 "scores well above it by chance.*\n"
+            )
+            lines.append(
+                "*Detectable shift: the mean shift, in training standard deviations, this window "
+                "would catch 80% of the time. Smaller shifts may be present and unseen.*\n"
             )
         return "\n".join(lines)
 

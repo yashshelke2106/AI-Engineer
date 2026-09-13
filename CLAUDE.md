@@ -14,7 +14,7 @@ everything to MLflow, and writes a report.
 python -m autoeng.cli run data/any.csv          # infer everything
 python -m autoeng.cli run data.csv --target y   # or pin the target
 python -m autoeng.cli ask <run_id> "why did you reject random_forest?"
-pytest tests/ -q                                # 284 tests, ~220s
+pytest tests/ -q                                # 287 tests, ~220s
 python scripts/calibrate_detection.py           # detection accuracy, 10/10 expected
 ```
 
@@ -134,7 +134,12 @@ signature from its frozen holdout (`with_estimated_reference_sizes`; the CLI
 passes the holdout). Keyless no-drift windows had been flagged in 42-83%, old
 artifacts in up to 97%; both now 0%, at unchanged power. Recovery must link
 rows on all signature columns at once: per-column runs chained neighbouring
-customers and merged 20% of them.
+customers and merged 20% of them. What remains is power the data does not
+have (a 0.5 sd shift behind 30 customers is caught 58% of the time), so every
+numeric feature reports `detectable_shift_sd` — the shift caught 80% of the time
+at this window's effective size, under the same corrections — and a quiet
+report names it for its most important feature. Never let `ok` on a small
+window read as proof of no drift.
 
 **7e. UNKNOWN is not OK.** No labels arriving and a healthy model look
 identical if you collapse them, and they mean opposite things. Concept drift
@@ -350,7 +355,7 @@ autoeng/
 
 ## Current state
 
-284 tests passing. Detection 10/10 on unambiguous cases (iris is genuinely
+287 tests passing. Detection 10/10 on unambiguous cases (iris is genuinely
 ambiguous and excluded). Successive halving gives 7.4× speedup with an
 identical winner.
 
