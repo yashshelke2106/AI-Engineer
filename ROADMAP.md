@@ -240,7 +240,10 @@ and `alarm` when a feature carrying 35.5% of importance moved (weighted PSI
 1.89, live F1 0.609 -> 0.308), re-measured on fresh generator rows after the
 numeric bins were fixed (tails beyond the training range had zero reference
 mass; tied quantiles got equal masses) and severity was read beyond a sampling
-noise floor sized in independent observations (see CLAUDE.md 7d). Per-feature PSI is reported raw and
+noise floor sized in independent observations (see CLAUDE.md 7d). Prediction
+drift was later found blind to predictions beyond its reference's range (PSI
+0.000 for every prediction at 0.97) and diluted by its own baseline; it now uses
+the same bins, floor and sizing. Per-feature PSI is reported raw and
 importance-weighted, the verdict is not the maximum of the three checks, and
 UNKNOWN is never OK — see CLAUDE.md 7d-7f. Concept drift originally assumed
 integer binary labels: regression outcomes shifted three standard deviations
@@ -461,7 +464,7 @@ Roughly 2,300 lines and 40 tests across all fourteen items; Tier 0 alone is
 about 530 lines and closes the gap between what the report claims and what the
 model does.
 
-Current state: 256 tests passing, 10/10 on unambiguous problem-type detection,
+Current state: 262 tests passing, 10/10 on unambiguous problem-type detection,
 7.4× search speedup from successive halving. **Tiers 0 and 1 are complete.**
 A trained model is persisted with its schema and a frozen holdout (T0-1),
 decides at an out-of-fold threshold (T0-2), and is split entity-aware (T0-3);

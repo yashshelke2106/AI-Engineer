@@ -1,5 +1,5 @@
 """
-How many independent observations a column actually holds.
+How many independent observations a sample actually holds.
 
 Rows from the same entity are not independent. A customer's `home_region` is
 the same on all five of their visits, so five visits are one observation of it;
@@ -8,14 +8,17 @@ noise, a test's standard error — has to use the count that behaves like n.
 
 Measured on this project's grouped data, reading rows as independent made the
 gate's bootstrap interval about 2x too narrow and made drift alarm on 88% of
-windows with no drift in them. The Kish design effect from a one-way ANOVA
-intraclass correlation is the standard correction:
+windows with no drift in them.
 
-    n_effective = n / (1 + (m - 1) * ICC)       m = mean rows per entity
-
-bounded to [number of entities, n]. A categorical column takes the largest ICC
-over its levels' indicators, since one clustered level is enough to cluster the
-column's frequencies.
+For a statistic over CELLS (PSI's bins, a categorical's levels) the right
+correction is Rao-Scott's first-order one: the mean design effect over the cell
+indicators, weighted by 1 - p, with each design effect 1 + (m - 1) * ICC from a
+one-way ANOVA intraclass correlation. What gets clustered is bin membership, not
+the raw value: two visits of one customer can straddle a bin edge. Measured on
+the grouped model's predictions (no drift, 60 customers against 100), the 95%
+PSI noise floor sized from the raw value's ICC was 0.50, from the most clustered
+bin 0.39, and from the Rao-Scott mean 0.27 — against an observed 95th
+percentile of 0.28. The first two cost a 1 sd shift almost all its alarms.
 """
 from __future__ import annotations
 
@@ -24,8 +27,9 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-# Levels beyond this many are folded away for the ICC. The most frequent levels
-# carry the frequencies PSI compares; a thousand-level tail would only cost time.
+# Levels beyond this many are pooled into one cell for the design effect. The
+# most frequent levels carry the frequencies PSI compares; a thousand-level
+# tail would only cost time.
 MAX_LEVELS_FOR_ICC = 20
 
 
@@ -45,8 +49,14 @@ def _icc(x: np.ndarray, codes: np.ndarray, sizes: np.ndarray) -> float:
     return float(min(1.0, max(0.0, (ms_between - ms_within) / denominator)))
 
 
-def effective_sample_size(values: pd.Series, groups: Any = None) -> float:
-    """Independent observations in `values`, given the entity each row belongs to."""
+def effective_sample_size(values: pd.Series, groups: Any = None, bins: Any = None) -> float:
+    """
+    Independent observations in `values`, given the entity each row belongs to.
+
+    Categorical values, and numeric values when `bins` (sorted edges, binned as
+    drift bins them) is given, are sized by the Rao-Scott mean design effect
+    over their cells. Numeric values without bins are sized by their own ICC.
+    """
     series = pd.Series(values).reset_index(drop=True)
     present = series.notna().to_numpy()
     n = int(present.sum())
@@ -64,13 +74,27 @@ def effective_sample_size(values: pd.Series, groups: Any = None) -> float:
     if k >= n or k < 2:
         return float(n)
     sizes = np.bincount(codes, minlength=k).astype(float)
+    mean_size = n / k
 
-    if pd.api.types.is_numeric_dtype(series) and not pd.api.types.is_bool_dtype(series):
-        columns = [series.to_numpy(dtype=float)]
+    numeric = pd.api.types.is_numeric_dtype(series) and not pd.api.types.is_bool_dtype(series)
+    if numeric and bins is None:
+        x = series.to_numpy(dtype=float)
+        icc = _icc(x, codes, sizes) if np.ptp(x) > 0 else 0.0
+        design_effect = 1.0 + (mean_size - 1.0) * icc
     else:
-        text = series.astype(str)
-        columns = [(text == level).to_numpy(dtype=float)
-                   for level in text.value_counts().index[:MAX_LEVELS_FOR_ICC]]
-    icc = max((_icc(x, codes, sizes) for x in columns if np.ptp(x) > 0), default=0.0)
-    design_effect = 1.0 + (n / k - 1.0) * icc
+        if numeric:
+            cells = pd.Series(np.searchsorted(np.asarray(bins, dtype=float), series.to_numpy(dtype=float), side="left"))
+        else:
+            cells = series.astype(str)
+        frequent = cells.value_counts().index[:MAX_LEVELS_FOR_ICC]
+        cells = cells.where(cells.isin(frequent), "__pooled__")
+        effects, weights = [], []
+        for level in cells.unique():
+            x = (cells == level).to_numpy(dtype=float)
+            p = float(x.mean())
+            if p in (0.0, 1.0):
+                continue
+            effects.append(1.0 + (mean_size - 1.0) * _icc(x, codes, sizes))
+            weights.append(1.0 - p)
+        design_effect = float(np.average(effects, weights=weights)) if effects else 1.0
     return float(min(n, max(k, n / design_effect)))

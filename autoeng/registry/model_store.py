@@ -161,11 +161,11 @@ def _library_versions() -> dict[str, str]:
     return {lib: v for lib in TRACKED_LIBRARIES if (v := _version_or_none(lib)) is not None}
 
 
-def _n_effective(series: pd.Series, groups: Any) -> float:
+def _n_effective(series: pd.Series, groups: Any, bins: Any = None) -> float:
     """Independent observations behind the reference. Drift reads PSI against
     the sampling noise of BOTH samples, and on grouped data a customer's five
     visits are one observation of anything constant per customer."""
-    return effective_sample_size(series, groups)
+    return effective_sample_size(series, groups, bins=bins)
 
 
 def _numeric_reference(series: pd.Series, groups: Any = None) -> dict[str, Any]:
@@ -174,7 +174,7 @@ def _numeric_reference(series: pd.Series, groups: Any = None) -> dict[str, Any]:
     ref: dict[str, Any] = {
         "kind": "numeric",
         "n_observed": int(len(observed)),
-        "n_effective": _n_effective(numeric, groups),
+        "n_effective": float(len(observed)),
         "missing_ratio": float(series.isna().mean()) if len(series) else 0.0,
         "quantiles": {},
     }
@@ -188,6 +188,9 @@ def _numeric_reference(series: pd.Series, groups: Any = None) -> dict[str, Any]:
     # at seven levels, and drift has to know F(0) is 0.7 rather than guess 0.6.
     values = observed.to_numpy(dtype=float)
     ref["cdf"] = {key: float(np.mean(values <= edge)) for key, edge in ref["quantiles"].items()}
+    # Sized over the decile bins drift will compare, not the raw value: what
+    # clusters within an entity is bin membership.
+    ref["n_effective"] = _n_effective(numeric, groups, bins=sorted(set(ref["quantiles"].values())))
     ref["min"] = float(observed.min())
     ref["max"] = float(observed.max())
     ref["mean"] = float(observed.mean())

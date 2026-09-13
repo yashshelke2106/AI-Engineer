@@ -479,8 +479,13 @@ def check_data_drift(
             notes.append(f"'{column}' has a {kind} reference distribution, which is not compared.")
             continue
 
-        values = observed[column] if kind == "categorical" else pd.to_numeric(observed[column], errors="coerce")
-        n_window = effective_sample_size(values, groups)
+        if kind == "categorical":
+            n_window = effective_sample_size(observed[column], groups)
+        else:
+            # Sized over the bins PSI compares: bin membership is what clusters.
+            edges = _numeric_bins(reference)[0]
+            n_window = effective_sample_size(pd.to_numeric(observed[column], errors="coerce"), groups,
+                                             bins=edges)
         n_reference = reference.get("n_effective")
         if n_reference is None:
             n_reference = reference.get("n_observed")
@@ -553,8 +558,22 @@ def check_data_drift(
     )
 
 
+def _sample_reference(values: np.ndarray, n_bins: int, n_effective: float) -> dict[str, Any]:
+    """A reference record built from a sample, in the shape `_numeric_bins` reads."""
+    quantiles = {f"{q:.2f}": float(np.quantile(values, q)) for q in np.linspace(0.0, 1.0, n_bins + 1)}
+    return {
+        "kind": "numeric", "n_observed": int(len(values)), "n_effective": n_effective,
+        "quantiles": quantiles,
+        "cdf": {key: float(np.mean(values <= edge)) for key, edge in quantiles.items()},
+    }
+
+
 def check_prediction_drift(
-    observed: Sequence[float], reference: Sequence[float], n_bins: int = 10,
+    observed: Sequence[float],
+    reference: Sequence[float],
+    n_bins: int = 10,
+    observed_groups: Any = None,
+    reference_groups: Any = None,
 ) -> SimpleDriftReport:
     """
     PSI on the model's output distribution.
@@ -562,11 +581,21 @@ def check_prediction_drift(
     Worth having separately because it catches what per-feature checks cannot:
     every input can look individually unremarkable while their joint
     configuration pushes the model somewhere it never went in training.
+
+    Binned exactly as numeric data drift is (`_numeric_bins`), which fixes what
+    an np.histogram over the reference's [min, max] got wrong: it DROPPED every
+    prediction outside that range, so a model whose output moved wholly beyond
+    its reference read PSI 0.000. Severity is read beyond sampling noise, with
+    `*_groups` (the entity behind each prediction) sizing both samples.
     """
     observed = np.asarray(observed, dtype=float)
     reference = np.asarray(reference, dtype=float)
-    observed = observed[np.isfinite(observed)]
-    reference = reference[np.isfinite(reference)]
+    observed_ok, reference_ok = np.isfinite(observed), np.isfinite(reference)
+    observed, reference = observed[observed_ok], reference[reference_ok]
+    if observed_groups is not None:
+        observed_groups = np.asarray(observed_groups, dtype=object)[observed_ok]
+    if reference_groups is not None:
+        reference_groups = np.asarray(reference_groups, dtype=object)[reference_ok]
 
     if len(observed) < MIN_ROWS_FOR_DATA_DRIFT or len(reference) < MIN_ROWS_FOR_DATA_DRIFT:
         return SimpleDriftReport(
@@ -574,27 +603,34 @@ def check_prediction_drift(
             summary=f"Too few predictions to compare ({len(observed)} live, {len(reference)} reference).",
         )
 
-    edges = np.unique(np.quantile(reference, np.linspace(0, 1, n_bins + 1)))
-    if len(edges) < 3:
-        # A near-constant reference has no bins; fall back to comparing means
-        # rather than reporting a meaningless zero.
+    edges, _, masses, _ = _numeric_bins(_sample_reference(reference, n_bins, float(len(reference))))
+    if edges is None:
+        # A constant reference has no bins; fall back to comparing means rather
+        # than reporting a meaningless zero.
         moved = abs(float(observed.mean()) - float(reference.mean()))
         severity = DriftSeverity.ALARM if moved > 0.1 else DriftSeverity.OK
         return SimpleDriftReport(
             severity=severity, psi=0.0, n_rows=len(observed),
-            summary=f"Reference predictions are near-constant; mean moved by {moved:.4f}.",
+            summary=f"Reference predictions are constant; mean moved by {moved:.4f}.",
         )
 
-    ref_hist = np.histogram(reference, bins=edges)[0] / len(reference)
-    obs_hist = np.histogram(observed, bins=edges)[0] / len(observed)
-    psi = population_stability_index(ref_hist, obs_hist)
-    severity = _severity_from_psi(psi)
+    n_observed = effective_sample_size(pd.Series(observed), observed_groups, bins=edges)
+    n_reference = effective_sample_size(pd.Series(reference), reference_groups, bins=edges)
+    counts = np.bincount(np.searchsorted(edges, observed, side="left"), minlength=len(edges) + 1)
+    psi = population_stability_index(masses, counts / counts.sum(), n_observed=n_observed)
+    floor = noise_floor(len(masses), n_reference, n_observed)
+    severity = _severity_from_psi(max(0.0, psi - floor))
+    beyond = int((observed < edges[0]).sum() + (observed > edges[-1]).sum())
+    summary = (f"Prediction distribution PSI {psi:.3f} against a noise floor of {floor:.3f} over "
+               f"{len(observed)} predictions (mean {observed.mean():.4f} against "
+               f"{reference.mean():.4f}) -> {severity.value}.")
+    if beyond:
+        summary += f" {beyond} prediction(s) fall outside the reference's range."
     return SimpleDriftReport(
         severity=severity, psi=float(psi), n_rows=len(observed),
-        observed={"mean": float(observed.mean())},
-        baseline={"mean": float(reference.mean())},
-        summary=(f"Prediction distribution PSI {psi:.3f} over {len(observed)} predictions "
-                 f"(mean {observed.mean():.4f} against {reference.mean():.4f}) -> {severity.value}."),
+        observed={"mean": float(observed.mean()), "n_effective": n_observed, "outside_reference_range": beyond},
+        baseline={"mean": float(reference.mean()), "n_effective": n_reference, "noise_floor": floor},
+        summary=summary,
     )
 
 

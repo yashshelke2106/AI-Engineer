@@ -24,7 +24,7 @@ python -m autoeng.cli serve runs/models/<run_name>         # score rows over HTT
 python -m autoeng.cli drift runs/models/<run_name>         # data / prediction / concept drift
 python -m autoeng.cli gate <champion> <challenger> --models-root runs/production --apply
 
-pytest tests/ -q                                           # 256 tests, ~220s
+pytest tests/ -q                                           # 262 tests, ~220s
 python scripts/calibrate_detection.py                      # detection accuracy harness
 ```
 
@@ -342,6 +342,14 @@ part:
   rows. A 150-row holdout of 30 customers is 30 customers' worth of evidence:
   resampled by row, its interval was 2.07x too narrow and a comparison the data
   could not decide read as a rejection. Entities are now resampled together.
+- **The prediction monitor was blind to the move that matters most.** It binned
+  the model's output with `np.histogram` over the reference's range, which drops
+  anything outside it: every prediction at 0.97, against a reference that never
+  went above 0.70, read PSI 0.000 and `ok`. It also compared all logged
+  predictions against the first 500 of them, so a real shift was diluted
+  ninefold. It now shares data drift's bins and noise floor: that stream reads
+  PSI 10.1 and `alarm`, no-drift 100-prediction windows went from 57% flagged to
+  under 1%, and a grouped model's recurring customers no longer look like drift.
 - **A customer is not a row in the lifecycle either.** A frozen-holdout customer
   coming back on a new visit has a new vector, so the check for repeated holdout
   rows passed it. Retrained on 150 such visits, a challenger was promoted on the
@@ -445,7 +453,7 @@ autoeng/
   reporting/       Markdown report generation
   pipeline.py      end-to-end orchestration
   cli.py           command-line entry point
-tests/             256 tests: planted leaks, regressions for every shipped bug, unit tests
+tests/             262 tests: planted leaks, regressions for every shipped bug, unit tests
 scripts/           detection calibration harness
 data/              synthetic + real validation datasets
 runs/              reports + MLflow store from the validation runs

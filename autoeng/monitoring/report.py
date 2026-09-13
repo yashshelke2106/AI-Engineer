@@ -134,19 +134,34 @@ def run_drift_report(
     prediction = None
     target_reference = ((schema.get("target") or {}).get("reference") or {})
     if "probability" in served.columns and served["probability"].notna().any():
-        live = served["probability"].dropna().to_numpy()
         # The reference for prediction drift is the earliest slice of this
         # model's own live predictions. Using the training target distribution
         # instead would compare a probability against a label and read as
         # permanent drift.
         reference = _earliest_reference(store, version)
-        if reference is not None and len(reference) >= 50:
-            prediction = check_prediction_drift(live, reference)
-        else:
+        group_column = (schema.get("feature_roles") or {}).get("group_column")
+        if reference is None or len(reference) < 50:
             notes.append(
                 "Prediction drift needs an earlier baseline window of this model's own "
                 "output; not enough history yet."
             )
+        else:
+            # The baseline slice is never also the live window. Comparing every
+            # logged prediction against the first 500 of them diluted 500 shifted
+            # predictions ninefold (PSI 0.228 against 2.04).
+            live = served[served["probability"].notna()
+                          & ~served["request_id"].isin(reference["request_id"])]
+            if len(live) < 50:
+                notes.append(
+                    "Every prediction in this window belongs to the baseline slice prediction "
+                    "drift is measured against, so there is nothing to compare yet."
+                )
+            else:
+                prediction = check_prediction_drift(
+                    live["probability"].to_numpy(), reference["probability"].to_numpy(),
+                    observed_groups=_entity_keys(live, group_column),
+                    reference_groups=_entity_keys(reference, group_column),
+                )
 
     resolved_baseline = baseline or schema.get("baseline_metrics") or {}
     concept = None
@@ -171,14 +186,21 @@ def run_drift_report(
     )
 
 
-def _earliest_reference(store, model_version: str | None, size: int = 500) -> np.ndarray | None:
+def _earliest_reference(store, model_version: str | None, size: int = 500) -> pd.DataFrame | None:
+    """The first `size` scored predictions, with their request ids and entity keys."""
     frame = store.prediction_frame(model_version=model_version)
     if frame.empty or "probability" not in frame.columns:
         return None
-    values = frame["probability"].dropna()
-    if len(values) < size * 2:
+    scored = frame[frame["probability"].notna()]
+    if len(scored) < size * 2:
         return None
-    return values.head(size).to_numpy()
+    return scored.head(size)
+
+
+def _entity_keys(frame: pd.DataFrame, group_column: str | None):
+    if group_column and group_column in frame.columns:
+        return frame[group_column].to_numpy(dtype=object)
+    return None
 
 
 def _combine(data, prediction, concept) -> tuple[DriftSeverity, str]:
