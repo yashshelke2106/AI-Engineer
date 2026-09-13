@@ -191,6 +191,9 @@ def _numeric_reference(series: pd.Series, groups: Any = None) -> dict[str, Any]:
     # Sized over the decile bins drift will compare, not the raw value: what
     # clusters within an entity is bin membership.
     ref["n_effective"] = _n_effective(numeric, groups, bins=sorted(set(ref["quantiles"].values())))
+    # And over the raw value, for the test on the mean: a customer's visits are
+    # one observation of anything the customer holds constant.
+    ref["n_effective_mean"] = _n_effective(numeric, groups)
     ref["min"] = float(observed.min())
     ref["max"] = float(observed.max())
     ref["mean"] = float(observed.mean())

@@ -24,7 +24,7 @@ python -m autoeng.cli serve runs/models/<run_name>         # score rows over HTT
 python -m autoeng.cli drift runs/models/<run_name>         # data / prediction / concept drift
 python -m autoeng.cli gate <champion> <challenger> --models-root runs/production --apply
 
-pytest tests/ -q                                           # 262 tests, ~220s
+pytest tests/ -q                                           # 269 tests, ~220s
 python scripts/calibrate_detection.py                      # detection accuracy harness
 ```
 
@@ -350,6 +350,13 @@ part:
   ninefold. It now shares data drift's bins and noise floor: that stream reads
   PSI 10.1 and `alarm`, no-drift 100-prediction windows went from 57% flagged to
   under 1%, and a grouped model's recurring customers no longer look like drift.
+- **The drift p-values were decoration.** A one-sample KS against a CDF
+  interpolated between stored deciles found a "significant" feature in 62% of
+  no-drift 800-row windows and every 5,000-row one. They are now two-sample
+  tests with effective sizes (KS at the stored CDF points plus a mean test;
+  Rao-Scott chi-square for categoricals), significant in 0-6% of no-drift
+  windows. Honest, they add power PSI lacks: a 0.5 sd shift behind 30 customers
+  is flagged in 58% of windows instead of 30%, behind 60 in 87% instead of 59%.
 - **A customer is not a row in the lifecycle either.** A frozen-holdout customer
   coming back on a new visit has a new vector, so the check for repeated holdout
   rows passed it. Retrained on 150 such visits, a challenger was promoted on the
@@ -453,7 +460,7 @@ autoeng/
   reporting/       Markdown report generation
   pipeline.py      end-to-end orchestration
   cli.py           command-line entry point
-tests/             262 tests: planted leaks, regressions for every shipped bug, unit tests
+tests/             269 tests: planted leaks, regressions for every shipped bug, unit tests
 scripts/           detection calibration harness
 data/              synthetic + real validation datasets
 runs/              reports + MLflow store from the validation runs
