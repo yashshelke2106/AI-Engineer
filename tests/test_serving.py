@@ -229,6 +229,14 @@ class TestThresholdIsApplied:
 
 
 class TestIntrospection:
+    def test_the_root_sends_a_browser_to_the_docs(self, served):
+        """Opening the server's address used to show a bare 404."""
+        client, _, _, _ = served
+        response = client.get("/", follow_redirects=False)
+        assert response.status_code in (302, 307)
+        assert response.headers["location"] == "/docs"
+        assert client.get("/docs").status_code == 200
+
     def test_model_endpoint_publishes_the_full_contract(self, served):
         client, _, X, _ = served
         contract = client.get("/model").json()

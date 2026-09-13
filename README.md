@@ -20,11 +20,12 @@ python -m autoeng.cli run path/to/any_dataset.csv          # infer everything
 python -m autoeng.cli run data.csv --target revenue        # or tell it the target
 python -m autoeng.cli ask <run_id> "why did you reject random_forest?"
 python -m autoeng.cli list-runs
-python -m autoeng.cli serve runs/models/<run_name>         # score rows over HTTP
+python -m autoeng.cli serve runs/models/<run_name>         # score rows over HTTP; docs at /docs
+python scripts/replay_traffic.py data/<dataset>.csv --times 2  # (2nd terminal) fill the log
 python -m autoeng.cli drift runs/models/<run_name>         # data / prediction / concept drift
 python -m autoeng.cli gate <champion> <challenger> --models-root runs/production --apply
 
-pytest tests/ -q                                           # 300 tests, ~220s
+pytest tests/ -q                                           # 301 tests, ~220s
 python scripts/calibrate_detection.py                      # detection accuracy harness
 ```
 
@@ -480,7 +481,7 @@ autoeng/
   reporting/       Markdown report generation
   pipeline.py      end-to-end orchestration
   cli.py           command-line entry point
-tests/             300 tests: planted leaks, regressions for every shipped bug, unit tests
+tests/             301 tests: planted leaks, regressions for every shipped bug, unit tests
 scripts/           detection calibration harness
 data/              synthetic + real validation datasets
 runs/              reports + MLflow store from the validation runs

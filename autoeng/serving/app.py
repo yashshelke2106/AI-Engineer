@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 
 from autoeng.registry.champion import read_champion
@@ -213,6 +214,12 @@ def create_app(
                 # silently develops holes.
                 payload["warnings"].append(f"Prediction was not logged ({type(e).__name__}: {e}).")
         return payload
+
+    @app.get("/", include_in_schema=False)
+    def root() -> RedirectResponse:
+        # A browser pointed at the server should land on the interactive docs,
+        # not a bare 404 that reads as "the server is broken".
+        return RedirectResponse(url="/docs")
 
     @app.get("/health")
     def health() -> dict[str, Any]:

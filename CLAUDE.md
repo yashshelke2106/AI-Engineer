@@ -14,7 +14,7 @@ everything to MLflow, and writes a report.
 python -m autoeng.cli run data/any.csv          # infer everything
 python -m autoeng.cli run data.csv --target y   # or pin the target
 python -m autoeng.cli ask <run_id> "why did you reject random_forest?"
-pytest tests/ -q                                # 300 tests, ~220s
+pytest tests/ -q                                # 301 tests, ~220s
 python scripts/calibrate_detection.py           # detection accuracy, 10/10 expected
 ```
 
@@ -360,7 +360,7 @@ autoeng/
 
 ## Current state
 
-300 tests passing. Detection 10/10 on unambiguous cases (iris is genuinely
+301 tests passing. Detection 10/10 on unambiguous cases (iris is genuinely
 ambiguous and excluded). Successive halving gives 7.4× speedup with an
 identical winner.
 

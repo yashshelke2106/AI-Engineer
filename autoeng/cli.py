@@ -138,6 +138,7 @@ def main(argv: list[str] | None = None) -> int:
         # here, with a message, rather than as a 500 on the first request.
         application = create_app(args.model_dir)
         print(f"Serving {args.model_dir} on http://{args.host}:{args.port}")
+        print(f"  GET  /docs     interactive API docs (http://{args.host}:{args.port}/ redirects here)")
         print(f"  GET  /model    the feature contract callers must satisfy")
         print(f"  POST /predict  one row (422 names any column that is missing)")
         uvicorn.run(application, host=args.host, port=args.port)
