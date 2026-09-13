@@ -14,7 +14,7 @@ everything to MLflow, and writes a report.
 python -m autoeng.cli run data/any.csv          # infer everything
 python -m autoeng.cli run data.csv --target y   # or pin the target
 python -m autoeng.cli ask <run_id> "why did you reject random_forest?"
-pytest tests/ -q                                # 320 tests, ~220s
+pytest tests/ -q                                # 335 tests, ~220s
 python scripts/calibrate_detection.py           # detection accuracy, 10/10 expected
 ```
 
@@ -190,6 +190,11 @@ the regression stated. Do not "tighten" this back. The one exception is a
 COLLAPSE (the challenger losing at least half of the champion's holdout
 score): that pair is also exactly what a corrupted label feed looks like, so
 it is inconclusive with `needs_review` and `gate` exits 3.
+For binary models each window compares ROC-AUC beside F1 at each model's own
+threshold (`with_ranking`): either rejecting rejects, either promoting with
+neither rejecting promotes. Collapse stays defined on F1 alone — a reversed
+relationship makes a correct challenger rank the old holdout below chance, and
+counting that would send a genuine regime change to review.
 
 **7i. Production is `CHAMPION.json`, and only a promotion moves it.** Serving
 follows the pointer; rejections and inconclusive verdicts are logged to
@@ -305,6 +310,17 @@ inside each fold (T2-2).
   against the first 500 of them, so the baseline was inside the live window and
   diluted a real shift ninefold. Never bin with np.histogram against reference
   edges; never let a baseline slice also be the window it is compared with.
+- **F1 at a near-trivial threshold cannot see a model degrade.** The grouped
+  champion's F1-optimal threshold labelled 83-94% of rows positive, so its F1
+  (0.645) sat barely above labelling everything positive (0.621). Under a
+  concept change its ranking fell to ROC-AUC 0.50 while live F1 read 0.643: drift
+  said ok, and the gate called a challenger ranking at 0.65 against 0.47
+  inconclusive. Threshold selection now stores the out-of-fold ROC-AUC and its
+  entity-resampled standard error and flags `near_trivial`; concept drift reads
+  live ROC-AUC as skill lost beyond both samples' noise; the gate compares it.
+  The baseline's own noise matters: without it, 3 of 12 no-drift windows read
+  investigate. On a model with little skill and few training entities, drift
+  still sees a concept change only sometimes — the paired gate is where it shows.
 - **A guard against one failure reopened another.** Content exclusion needs to
   know whether an identical feature vector is the same observation. The first
   guard judged that by how often training rows repeated, but recurring
@@ -360,7 +376,7 @@ autoeng/
 
 ## Current state
 
-320 tests passing. Detection 10/10 on unambiguous cases (iris is genuinely
+335 tests passing. Detection 10/10 on unambiguous cases (iris is genuinely
 ambiguous and excluded). Successive halving gives 7.4× speedup with an
 identical winner.
 

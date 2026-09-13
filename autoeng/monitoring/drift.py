@@ -73,6 +73,7 @@ from typing import Any, Sequence
 import numpy as np
 import pandas as pd
 from scipy import stats
+from sklearn.metrics import roc_auc_score
 
 from autoeng.common.entities import learn_entity_signature, recover_entities
 from autoeng.common.sampling import design_effect, effective_sample_size
@@ -890,7 +891,7 @@ def check_prediction_drift(
 
 
 _REGRESSION_METRICS = {"r2", "rmse", "mae"}
-_CLASSIFICATION_METRICS = {"precision", "recall", "f1", "accuracy", "f1_macro"}
+_CLASSIFICATION_METRICS = {"precision", "recall", "f1", "accuracy", "f1_macro", "roc_auc"}
 # Error metrics carry the target's scale, so their degradation is judged
 # relative to the baseline rather than in absolute units.
 _LOWER_IS_BETTER = {"rmse", "mae"}
@@ -936,6 +937,50 @@ def _live_metrics(y_true, y_pred, regression: bool, binary: bool, positive_label
     return metrics
 
 
+# A ranking drop is read as the share of skill above chance that was lost:
+# this much reads as the same drop as `tolerance` on the other metrics.
+ROC_AUC_SKILL_LOSS_PER_TOLERANCE = 0.25
+# One-sided 95%: only the part of a ranking drop beyond both samples' noise counts.
+ROC_AUC_NOISE_Z = 1.645
+
+
+def _drop(metric: str, baseline: float, observed: float, tolerance: float, noise: float = 0.0) -> float:
+    """How much worse, on one scale for every metric: `tolerance` investigates, twice it alarms."""
+    if metric in _LOWER_IS_BETTER:
+        return (observed - baseline) / baseline if baseline else observed
+    if metric == "roc_auc":
+        # 0.5 is chance, so 0.70 -> 0.60 loses half the model's skill while an
+        # absolute 0.10 would read as a mild dip. And both AUCs are samples.
+        beyond_noise = max(0.0, baseline - observed - noise)
+        return beyond_noise / max(baseline - 0.5, 0.05) * tolerance / ROC_AUC_SKILL_LOSS_PER_TOLERANCE
+    return baseline - observed
+
+
+def _live_roc_auc(frame: pd.DataFrame, actual_column: str, probability_column: str,
+                  positive_label: Any, groups: Any = None) -> tuple[float, float | None] | None:
+    """
+    Threshold-free performance, when probabilities were logged.
+
+    At a near-trivial threshold F1 barely depends on the model: the grouped
+    champion labelled 90% of rows positive, its ranking collapsed to ROC-AUC 0.50
+    under a concept change, and live F1 read 0.643 against a 0.645 baseline — ok.
+    """
+    if probability_column not in frame.columns:
+        return None
+    present = frame[probability_column].notna().to_numpy()
+    usable = frame[present]
+    if len(usable) < MIN_LABELS_FOR_CONCEPT:
+        return None
+    from autoeng.modeling.threshold import binary_indicator, roc_auc_standard_error
+
+    indicator, _ = binary_indicator(usable[actual_column].to_numpy(), positive_label)
+    if len(np.unique(indicator)) < 2:
+        return None
+    scores = usable[probability_column].to_numpy(dtype=float)
+    window_groups = None if groups is None else np.asarray(groups, dtype=object)[present]
+    return float(roc_auc_score(indicator, scores)), roc_auc_standard_error(indicator, scores, window_groups)
+
+
 def check_concept_drift(
     labelled: pd.DataFrame,
     baseline: dict[str, float],
@@ -944,6 +989,8 @@ def check_concept_drift(
     tolerance: float = 0.10,
     problem_type: str | None = None,
     positive_label: Any = None,
+    probability_column: str = "probability",
+    groups: Any = None,
 ) -> SimpleDriftReport:
     """
     Rolling performance on the labelled window against the training baseline.
@@ -965,7 +1012,10 @@ def check_concept_drift(
             severity=DriftSeverity.UNKNOWN, n_rows=0, baseline=dict(baseline),
             summary="No labelled predictions in the window, so live performance is unknown.",
         )
-    usable = labelled.dropna(subset=[prediction_column, actual_column])
+    keep = labelled[[prediction_column, actual_column]].notna().all(axis=1).to_numpy()
+    usable = labelled[keep]
+    if groups is not None:
+        groups = np.asarray(groups, dtype=object)[keep]
     if len(usable) < MIN_LABELS_FOR_CONCEPT:
         return SimpleDriftReport(
             severity=DriftSeverity.UNKNOWN, n_rows=len(usable), baseline=dict(baseline),
@@ -981,6 +1031,10 @@ def check_concept_drift(
     binary = not regression and problem_type in (None, "binary_classification")
     observed = _live_metrics(usable[actual_column].to_numpy(), usable[prediction_column].to_numpy(),
                              regression, binary, positive_label)
+    ranked = _live_roc_auc(usable, actual_column, probability_column, positive_label, groups) if binary else None
+    live_auc_se = None
+    if ranked is not None:
+        observed["roc_auc"], live_auc_se = ranked
 
     comparable = sorted(m for m in baseline if m in observed
                         and isinstance(baseline[m], (int, float)) and np.isfinite(baseline[m]))
@@ -992,11 +1046,9 @@ def check_concept_drift(
                      f"live performance cannot be compared. Reported as unknown rather than healthy."),
         )
 
-    drops = {
-        m: ((observed[m] - baseline[m]) / baseline[m] if baseline[m] else observed[m])
-        if m in _LOWER_IS_BETTER else baseline[m] - observed[m]
-        for m in comparable
-    }
+    auc_noise = ROC_AUC_NOISE_Z * float(np.hypot(baseline.get("roc_auc_se") or 0.0, live_auc_se or 0.0))
+    drops = {m: _drop(m, baseline[m], observed[m], tolerance, auc_noise if m == "roc_auc" else 0.0)
+             for m in comparable}
     worst = max(drops.values())
     if worst >= tolerance * 2:
         severity = DriftSeverity.ALARM
@@ -1006,6 +1058,8 @@ def check_concept_drift(
         severity = DriftSeverity.OK
 
     described = ", ".join(f"{m} {observed[m]:.3f} against baseline {baseline[m]:.3f}" for m in comparable)
+    if "roc_auc" in comparable and auc_noise:
+        described += f" (ROC-AUC read beyond a noise margin of {auc_noise:.3f})"
     return SimpleDriftReport(
         severity=severity, n_rows=len(usable), observed=observed, baseline=dict(baseline),
         summary=f"Live performance over {len(usable)} labelled predictions: {described} -> {severity.value}.",

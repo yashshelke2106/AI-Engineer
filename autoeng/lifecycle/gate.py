@@ -34,6 +34,14 @@ frozen holdout decides otherwise. See `combine_windows` for why the obvious
 rule — "a regression on either window disqualifies" — would block exactly the
 retrains that genuine concept drift makes necessary.
 
+**Binary models are compared on ranking as well as F1.** F1 at each model's
+threshold is the decision actually deployed, but at a near-trivial threshold it
+barely depends on the model: the grouped champion labelled 90% of rows positive,
+its ranking collapsed to ROC-AUC 0.47 under a concept change, and a challenger
+ranking at 0.65 still read F1-inconclusive. So each window also compares
+ROC-AUC on the same resampled rows or entities. Either metric rejecting
+rejects; either promoting, with neither rejecting, promotes.
+
 **With repeated entities, entities are resampled, not rows.** A customer's rows
 share a label and near-identical features, so a grouped holdout's effective
 sample size is its number of customers. Resampling rows treated 150 correlated
@@ -53,6 +61,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
+from sklearn.metrics import roc_auc_score
 
 # Enough resamples that the interval endpoints are stable to ~0.001; beyond
 # this the cost grows and the answer does not change.
@@ -115,9 +124,14 @@ def _neg_rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     return -float(np.sqrt(((y_true - y_pred) ** 2).mean()))
 
 
+def _roc_auc(y_true: np.ndarray, scores: np.ndarray) -> float:
+    # A resample holding one class has no ranking to score; NaN, skipped by the bootstrap.
+    return float(roc_auc_score(y_true, scores)) if len(np.unique(y_true)) == 2 else float("nan")
+
+
 METRICS: dict[str, Callable[[np.ndarray, np.ndarray], float]] = {
     "f1": _f1, "accuracy": _accuracy, "recall": _recall, "precision": _precision,
-    "r2": _r2, "neg_rmse": _neg_rmse,
+    "r2": _r2, "neg_rmse": _neg_rmse, "roc_auc": _roc_auc,
 }
 # These score class 1 as the positive class, so labels must be mapped onto it.
 _POSITIVE_CLASS_METRICS = {"f1", "precision", "recall"}
@@ -153,6 +167,8 @@ class GateDecision:
     reason: str
     comparison: Comparison | None = None
     notes: list[str] = field(default_factory=list)
+    # The ROC-AUC decision on the same rows, for binary models with probabilities.
+    ranking: "GateDecision | None" = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -161,6 +177,7 @@ class GateDecision:
             "reason": self.reason,
             "notes": self.notes,
             "comparison": self.comparison.as_dict() if self.comparison else None,
+            "ranking": self.ranking.as_dict() if self.ranking else None,
         }
 
 
@@ -203,7 +220,13 @@ def bootstrap_paired_difference(
             idx = np.concatenate([blocks[j] for j in rng.integers(0, len(blocks), len(blocks))])
         differences[i] = score(y_true[idx], challenger_pred[idx]) - score(y_true[idx], champion_pred[idx])
 
-    low, high = np.percentile(differences, [100 * alpha / 2, 100 * (1 - alpha / 2)])
+    # A metric undefined on a resample (ROC-AUC with one class) contributes no
+    # difference; if most resamples are undefined the comparison says nothing.
+    finite = differences[np.isfinite(differences)]
+    if len(finite) < n_bootstrap / 2:
+        low, high = -np.inf, np.inf
+    else:
+        low, high = np.percentile(finite, [100 * alpha / 2, 100 * (1 - alpha / 2)])
     return Comparison(
         metric=metric, champion_score=float(champion_score),
         challenger_score=float(challenger_score),
@@ -315,7 +338,56 @@ def compare_saved_models(
         y, champion_pred, challenger_pred = (
             (np.asarray(a) == positive_label).astype(int) for a in (y, champion_pred, challenger_pred)
         )
-    return evaluate_gate(y, champion_pred, challenger_pred, metric=metric, notes=notes, **kwargs)
+    decision = evaluate_gate(y, champion_pred, challenger_pred, metric=metric, notes=notes, **kwargs)
+    ranking = _ranking_decision(champion_estimator, challenger_estimator, X, X, y_true, **kwargs)
+    return with_ranking(decision, ranking)
+
+
+def _ranking_decision(champion_estimator, challenger_estimator, X_champion, X_challenger, y_true,
+                      **kwargs: Any) -> GateDecision | None:
+    """ROC-AUC on the same rows (and entity groups), for two binary models with probabilities."""
+    classes = list(getattr(champion_estimator, "classes_", []))
+    if (len(classes) != 2 or list(getattr(challenger_estimator, "classes_", [])) != classes
+            or not hasattr(champion_estimator, "predict_proba") or not hasattr(challenger_estimator, "predict_proba")):
+        return None
+    y = (np.asarray(y_true) == classes[1]).astype(int)
+    champion_scores = np.asarray(champion_estimator.predict_proba(X_champion))[:, 1]
+    challenger_scores = np.asarray(challenger_estimator.predict_proba(X_challenger))[:, 1]
+    options = {k: v for k, v in kwargs.items() if k in ("n_bootstrap", "alpha", "groups")}
+    return evaluate_gate(y, champion_scores, challenger_scores, metric="roc_auc", **options)
+
+
+def with_ranking(decision: GateDecision, ranking: GateDecision | None) -> GateDecision:
+    """
+    One window's verdict from its F1 decision and its ROC-AUC decision.
+
+    Either rejecting rejects: a challenger that ranks measurably worse is worse,
+    whatever F1 at a near-trivial threshold shows, and one that decides worse is
+    worse however it ranks. Either promoting, with neither rejecting, promotes.
+    The F1 comparison stays the window's `comparison`: it is the deployed decision.
+    """
+    if ranking is None or ranking.comparison is None:
+        return decision
+    verdicts = {decision.verdict, ranking.verdict}
+    notes = list(decision.notes)
+    if GateVerdict.REJECTED in verdicts:
+        verdict = GateVerdict.REJECTED
+        lead = decision if decision.verdict == GateVerdict.REJECTED else ranking
+    elif GateVerdict.PROMOTED in verdicts:
+        verdict = GateVerdict.PROMOTED
+        lead = decision if decision.verdict == GateVerdict.PROMOTED else ranking
+    else:
+        verdict, lead = GateVerdict.INCONCLUSIVE, decision
+    other = ranking if lead is decision else decision
+    if lead is ranking:
+        reason = (f"Decided on ranking (ROC-AUC), which F1 at these thresholds did not show. "
+                  f"{ranking.reason} F1: {decision.reason}")
+    elif verdict == GateVerdict.INCONCLUSIVE:
+        reason = f"{decision.reason} Ranking (ROC-AUC) could not separate them either: {ranking.reason}"
+    else:
+        reason = f"{decision.reason} Ranking (ROC-AUC): {other.reason}"
+    return GateDecision(verdict=verdict, promote=verdict == GateVerdict.PROMOTED, reason=reason,
+                        comparison=decision.comparison, notes=notes, ranking=ranking)
 
 
 @dataclass
@@ -351,7 +423,11 @@ def _label(window: str) -> str:
 
 def _holdout_collapse(holdout: GateDecision | None) -> float | None:
     """Share of the champion's frozen-holdout score the challenger lost, if it regressed."""
-    if holdout is None or holdout.verdict != GateVerdict.REJECTED or holdout.comparison is None:
+    # Measured on the F1 comparison alone, and only where F1 itself regressed. A
+    # ranking loss on the old holdout is what a reversed relationship looks like:
+    # counting it would send a genuine regime change to review.
+    if (holdout is None or holdout.verdict != GateVerdict.REJECTED or holdout.comparison is None
+            or holdout.comparison.ci_high >= 0):
         return None
     champion = holdout.comparison.champion_score
     if champion <= 0:
@@ -548,8 +624,12 @@ def gate_challenger(
         n_pred = _predict_with_threshold(challenger.estimator, frame[challenger_features], challenger_threshold)
         if positive is not None and metric in _POSITIVE_CLASS_METRICS:
             yy, c_pred, n_pred = ((np.asarray(a) == positive).astype(int) for a in (yy, c_pred, n_pred))
-        return evaluate_gate(yy, c_pred, n_pred, metric=metric, n_bootstrap=n_bootstrap, alpha=alpha,
-                             groups=groups)
+        decision = evaluate_gate(yy, c_pred, n_pred, metric=metric, n_bootstrap=n_bootstrap, alpha=alpha,
+                                 groups=groups)
+        ranking = _ranking_decision(champion.estimator, challenger.estimator, frame[champion_features],
+                                    frame[challenger_features], y, n_bootstrap=n_bootstrap, alpha=alpha,
+                                    groups=groups)
+        return with_ranking(decision, ranking)
 
     windows: dict[str, GateDecision] = {}
 

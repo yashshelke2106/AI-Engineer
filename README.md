@@ -27,8 +27,9 @@ python -m autoeng.cli drift runs/models/<run_name>         # data / prediction /
 python -m autoeng.cli retrain runs/models/<run_name>       # on a drift alarm (or --scheduled)
 python scripts/generate_grouped.py --customers 200 --out data/new_customers.csv  # fresh traffic
 python -m autoeng.cli gate <champion> <challenger> --models-root runs/production --apply
+python scripts/generate_grouped.py --customers 300 --concept 0.7 --out data/concept.csv  # a real concept change
 
-pytest tests/ -q                                           # 320 tests, ~220s
+pytest tests/ -q                                           # 335 tests, ~220s
 python scripts/calibrate_detection.py                      # detection accuracy harness
 ```
 
@@ -381,6 +382,17 @@ part:
   would catch 80% of the time (0.6-1.0 sd for 30 customers against 120, checked
   by simulation), and an `ok` verdict names it for the most important feature
   rather than implying nothing moved.
+- **F1 alone called a useless model healthy.** The grouped champion's
+  F1-optimal threshold labelled nearly every row positive, so F1 barely depended
+  on the model. When the relationship changed (`generate_grouped.py --concept
+  0.7`), its ranking fell to ROC-AUC 0.50 and live F1 moved from 0.645 to 0.643:
+  drift read `ok`, and the gate called a retrained challenger inconclusive though
+  it ranked new customers at 0.654 against 0.474. Training now warns about
+  near-trivial thresholds and stores a ranking baseline with its uncertainty;
+  concept drift reads ROC-AUC beyond noise (`investigate` on that traffic); the
+  gate compares ranking beside F1 and promotes that challenger (CI [+0.106,
+  +0.252]). Re-run across every earlier scenario, it also rejects two shift
+  challengers that rank measurably worse, and every other verdict is unchanged.
 - **A customer is not a row in the lifecycle either.** A frozen-holdout customer
   coming back on a new visit has a new vector, so the check for repeated holdout
   rows passed it. Retrained on 150 such visits, a challenger was promoted on the
@@ -484,7 +496,7 @@ autoeng/
   reporting/       Markdown report generation
   pipeline.py      end-to-end orchestration
   cli.py           command-line entry point
-tests/             320 tests: planted leaks, regressions for every shipped bug, unit tests
+tests/             335 tests: planted leaks, regressions for every shipped bug, unit tests
 scripts/           detection calibration harness
 data/              synthetic + real validation datasets
 runs/              reports + MLflow store from the validation runs

@@ -184,6 +184,8 @@ def run_drift_report(
         concept = check_concept_drift(
             labelled, resolved_baseline, problem_type=schema.get("problem_type"),
             positive_label=labels[1] if len(labels) == 2 else None,
+            groups=(_entity_keys(labelled, (schema.get("feature_roles") or {}).get("group_column"),
+                                 schema.get("entity_signature")) if not labelled.empty else None),
         )
         if schema.get("baseline_source"):
             notes.append(f"Concept-drift baseline: {schema['baseline_source']}.")

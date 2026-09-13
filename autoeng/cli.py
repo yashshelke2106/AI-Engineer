@@ -139,6 +139,13 @@ def main(argv: list[str] | None = None) -> int:
         if result.decision_threshold:
             print(f"Decision threshold: {result.decision_threshold['threshold']:.4f} "
                   f"({result.decision_threshold['objective']})")
+            if result.decision_threshold.get("near_trivial"):
+                chosen = result.decision_threshold
+                print(f"  Warning: at this threshold the model labels {chosen['positive_rate']:.0%} of rows "
+                      f"positive, and its F1 is barely above labelling every row positive "
+                      f"({chosen['metrics']['f1']:.3f} against {chosen['all_positive_f1']:.3f}). F1 alone "
+                      f"cannot show this model degrading, so drift and the gate also compare ROC-AUC "
+                      f"({chosen['metrics'].get('roc_auc', float('nan')):.3f} out of fold).")
         print(f"Report written to: {result.report_path}")
         return 0
 

@@ -36,6 +36,7 @@ from typing import Any, Literal
 import numpy as np
 import pandas as pd
 from sklearn.base import clone
+from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import StratifiedGroupKFold, StratifiedKFold, cross_val_predict
 
 DEFAULT_THRESHOLD = 0.5
@@ -44,6 +45,11 @@ DEFAULT_PRECISION_FLOOR = 0.5
 # Sampled operating points kept for the report. The full sweep has one entry
 # per distinct predicted probability, which is per-row and far too many.
 CURVE_POINTS = 25
+# An operating point whose F1 is within this of labelling every row positive is
+# near-trivial: its F1 barely depends on the features, so F1 alone cannot show
+# the model degrading. Measured on the grouped champion (0.645 against 0.621):
+# its ranking collapsed to ROC-AUC 0.50 under a concept change and F1 did not move.
+NEAR_TRIVIAL_F1_MARGIN = 0.05
 
 Objective = Literal["f1", "recall_at_precision", "expected_cost"]
 
@@ -61,6 +67,11 @@ class ThresholdChoice:
     # The label predict_proba column 1 refers to, so a reader can tell which
     # class the precision and recall describe.
     positive_label: Any = None
+    # Share of rows labelled positive at this threshold, the F1 of labelling
+    # every row positive, and whether this operating point is too close to that.
+    positive_rate: float | None = None
+    all_positive_f1: float | None = None
+    near_trivial: bool = False
 
     @property
     def recall_gain(self) -> float:
@@ -76,6 +87,9 @@ class ThresholdChoice:
             "reasoning": self.reasoning,
             "curve": self.curve,
             "positive_label": self.positive_label,
+            "positive_rate": self.positive_rate,
+            "all_positive_f1": self.all_positive_f1,
+            "near_trivial": self.near_trivial,
         }
 
 
@@ -196,6 +210,14 @@ def _select_threshold_on_indicator(
 
     metrics = dict(best)
     threshold = float(metrics.pop("threshold"))
+    # Threshold-free, and stored with the operating point so drift and the gate
+    # have a ranking baseline: F1 at a near-trivial threshold cannot see a model
+    # stop ranking at all.
+    metrics["roc_auc"] = float(roc_auc_score(y_true, y_proba))
+    base_rate = float(y_true.mean())
+    all_positive_f1 = 2.0 * base_rate / (1.0 + base_rate)
+    positive_rate = (metrics["tp"] + metrics["fp"]) / len(y_true)
+    near_trivial = metrics["f1"] - all_positive_f1 < NEAR_TRIVIAL_F1_MARGIN
 
     if objective == "expected_cost":
         objective_desc = (
@@ -217,11 +239,21 @@ def _select_threshold_on_indicator(
         f"{default_metrics['precision']:.3f}, recall {default_metrics['recall']:.3f}, F1 "
         f"{default_metrics['f1']:.3f}." + fallback_note
     )
+    if near_trivial:
+        reasoning += (
+            f" Warning: this operating point labels {positive_rate:.0%} of rows positive, and its F1 "
+            f"({metrics['f1']:.3f}) is within {NEAR_TRIVIAL_F1_MARGIN:.2f} of labelling every row "
+            f"positive ({all_positive_f1:.3f}). F1 here barely depends on what the model knows, so "
+            f"monitoring and the champion gate also compare ROC-AUC ({metrics['roc_auc']:.3f} "
+            f"out of fold)."
+        )
 
     return ThresholdChoice(
         threshold=threshold, objective=objective, metrics=metrics,
         default_metrics=default_metrics, n_candidates=len(candidates),
         reasoning=reasoning, curve=_build_curve(y_true, y_proba, candidates),
+        positive_rate=float(positive_rate), all_positive_f1=float(all_positive_f1),
+        near_trivial=bool(near_trivial),
     )
 
 
@@ -244,6 +276,34 @@ def binary_indicator(y, positive_label: Any = None) -> tuple[np.ndarray, Any]:
     return (values == positive_label).astype(int), positive_label
 
 
+def roc_auc_standard_error(y_indicator, scores, groups=None, n_bootstrap: int = 300,
+                           random_state: int = 0) -> float | None:
+    """
+    Bootstrap standard error of ROC-AUC, resampling whole entities when groups are given.
+
+    A ranking baseline is a sample. The grouped champion's out-of-fold ROC-AUC
+    of 0.64 came from 120 customers, and a drift check that treated it as exact
+    read ordinary sampling wobble as lost skill: 3 of 12 no-drift windows of
+    300 customers reported investigate.
+    """
+    y = np.asarray(y_indicator).astype(int)
+    s = np.asarray(scores, dtype=float)
+    if len(y) < 2 or len(np.unique(y)) < 2:
+        return None
+    rng = np.random.default_rng(random_state)
+    blocks = None
+    if groups is not None:
+        labels = pd.Series(np.asarray(groups, dtype=object)).astype(str).to_numpy()
+        blocks = [np.flatnonzero(labels == g) for g in np.unique(labels)]
+    values = []
+    for _ in range(n_bootstrap):
+        idx = (rng.integers(0, len(y), len(y)) if blocks is None
+               else np.concatenate([blocks[j] for j in rng.integers(0, len(blocks), len(blocks))]))
+        if len(np.unique(y[idx])) == 2:
+            values.append(roc_auc_score(y[idx], s[idx]))
+    return float(np.std(values, ddof=1)) if len(values) > 10 else None
+
+
 def select_threshold(
     y_true,
     y_proba,
@@ -252,10 +312,14 @@ def select_threshold(
     cost_false_negative: float = 10.0,
     cost_false_positive: float = 1.0,
     positive_label: Any = None,
+    groups=None,
 ) -> ThresholdChoice:
     """
     Choose an operating point from out-of-fold predictions, for any binary
     label type. Never pass held-out probabilities here (CLAUDE.md #5).
+
+    `groups` (the entity of each row) sizes the uncertainty of the stored
+    ROC-AUC baseline in entities rather than rows.
     """
     indicator, positive = binary_indicator(y_true, positive_label)
     choice = _select_threshold_on_indicator(
@@ -263,4 +327,8 @@ def select_threshold(
         cost_false_negative=cost_false_negative, cost_false_positive=cost_false_positive,
     )
     choice.positive_label = positive
+    if "roc_auc" in choice.metrics:
+        standard_error = roc_auc_standard_error(indicator, y_proba, groups)
+        if standard_error is not None:
+            choice.metrics["roc_auc_se"] = standard_error
     return choice

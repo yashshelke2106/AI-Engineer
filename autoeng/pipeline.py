@@ -96,6 +96,7 @@ def _select_operating_point(
         choice = select_threshold(
             y_train, proba, objective=objective, precision_floor=precision_floor,
             cost_false_negative=cost_false_negative, cost_false_positive=cost_false_positive,
+            groups=groups,
         )
         return choice.as_dict()
     except Exception as e:  # noqa: BLE001 - falls back to the 0.5 default, reported below
