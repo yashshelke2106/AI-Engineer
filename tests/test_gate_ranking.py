@@ -64,6 +64,10 @@ def test_a_better_ranker_is_promoted_when_near_trivial_thresholds_hide_it_from_f
     assert decision.verdict == GateVerdict.PROMOTED
     assert decision.ranking.verdict == GateVerdict.PROMOTED
     assert "ROC-AUC" in decision.reason
+    # Found in a real promotion: quoting F1's own verdict sentence put "The champion
+    # stays" and "not promoted" inside a decision that promoted.
+    assert "champion stays" not in decision.reason and "not promoted" not in decision.reason
+    assert "did not separate the models" in decision.reason
     assert decision.as_dict()["ranking"]["comparison"]["metric"] == "roc_auc"
 
 
@@ -72,6 +76,7 @@ def test_a_worse_ranker_is_rejected_even_when_f1_ties():
     decision = compare_saved_models(_Scores(informed), _Scores(blind), X, y,
                                     champion_threshold=0.0, challenger_threshold=0.0, n_bootstrap=400)
     assert decision.verdict == GateVerdict.REJECTED and not decision.promote
+    assert "champion stays" not in decision.reason
 
 
 def test_equal_rankers_stay_inconclusive_and_say_both_were_checked():
@@ -111,3 +116,17 @@ def test_a_ranking_loss_on_the_old_holdout_is_not_a_collapse():
     forward = GateDecision(GateVerdict.PROMOTED, True, "promoted", comparison=f1_forward)
     decision = combine_windows({FROZEN_HOLDOUT: holdout, FORWARD_WINDOW: forward})
     assert decision.verdict == GateVerdict.PROMOTED and not decision.needs_review
+
+
+def test_a_promotion_across_windows_never_says_the_champion_stays():
+    """The frozen holdout's inconclusive reading is quoted as evidence, not as a verdict."""
+    X, y, blind, informed = _data(seed=5)
+    forward = compare_saved_models(_Scores(blind), _Scores(informed), X, y,
+                                   champion_threshold=0.0, challenger_threshold=0.0, n_bootstrap=300)
+    X2, y2, _, informed2 = _data(n=300, seed=6)
+    holdout = compare_saved_models(_Scores(informed2), _Scores(informed2), X2, y2,
+                                   champion_threshold=0.5, challenger_threshold=0.5, n_bootstrap=300)
+    decision = combine_windows({FROZEN_HOLDOUT: holdout, FORWARD_WINDOW: forward})
+    assert decision.verdict == GateVerdict.PROMOTED
+    text = " ".join([decision.reason, *decision.notes])
+    assert "champion stays" not in text and "not promoted" not in text, text

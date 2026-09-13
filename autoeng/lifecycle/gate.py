@@ -169,12 +169,17 @@ class GateDecision:
     notes: list[str] = field(default_factory=list)
     # The ROC-AUC decision on the same rows, for binary models with probabilities.
     ranking: "GateDecision | None" = None
+    # The measurement alone — scores, interval, rows — without a verdict sentence.
+    # Quoted wherever this decision is supporting evidence for a different
+    # verdict: quoting `reason` put "The champion stays" inside a promotion.
+    evidence: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "verdict": self.verdict.value,
             "promote": self.promote,
             "reason": self.reason,
+            "evidence": self.evidence,
             "notes": self.notes,
             "comparison": self.comparison.as_dict() if self.comparison else None,
             "ranking": self.ranking.as_dict() if self.ranking else None,
@@ -272,18 +277,18 @@ def evaluate_gate(
 
     if comparison.ci_low > 0:
         return GateDecision(
-            verdict=GateVerdict.PROMOTED, promote=True, comparison=comparison, notes=notes,
+            verdict=GateVerdict.PROMOTED, promote=True, comparison=comparison, notes=notes, evidence=interval,
             reason=(f"Challenger promoted: {interval}. The interval excludes zero, so the "
                     f"improvement is larger than the noise in the comparison."),
         )
     if comparison.ci_high < 0:
         return GateDecision(
-            verdict=GateVerdict.REJECTED, promote=False, comparison=comparison, notes=notes,
+            verdict=GateVerdict.REJECTED, promote=False, comparison=comparison, notes=notes, evidence=interval,
             reason=(f"Challenger rejected: it is worse. {interval}. The whole interval lies "
                     f"below zero, so this is a real regression rather than an unlucky sample."),
         )
     return GateDecision(
-        verdict=GateVerdict.INCONCLUSIVE, promote=False, comparison=comparison, notes=notes,
+        verdict=GateVerdict.INCONCLUSIVE, promote=False, comparison=comparison, notes=notes, evidence=interval,
         reason=(f"Challenger not promoted: {interval}. The interval spans zero, so the "
                 f"difference is within the noise of the comparison and the two models are "
                 f"not distinguishable on this data. The champion stays — replacing a known "
@@ -379,15 +384,29 @@ def with_ranking(decision: GateDecision, ranking: GateDecision | None) -> GateDe
     else:
         verdict, lead = GateVerdict.INCONCLUSIVE, decision
     other = ranking if lead is decision else decision
-    if lead is ranking:
-        reason = (f"Decided on ranking (ROC-AUC), which F1 at these thresholds did not show. "
-                  f"{ranking.reason} F1: {decision.reason}")
-    elif verdict == GateVerdict.INCONCLUSIVE:
-        reason = f"{decision.reason} Ranking (ROC-AUC) could not separate them either: {ranking.reason}"
+    if other.verdict == lead.verdict:
+        relation = "agrees"
+    elif other.verdict == GateVerdict.INCONCLUSIVE:
+        relation = "did not separate the models"
     else:
-        reason = f"{decision.reason} Ranking (ROC-AUC): {other.reason}"
+        relation = "pointed the other way"
+    if verdict == GateVerdict.INCONCLUSIVE:
+        reason = f"{decision.reason} Ranking (ROC-AUC) could not separate them either: {_evidence(ranking)}."
+    elif lead is ranking:
+        reason = (f"{ranking.reason} Decided on ranking (ROC-AUC); F1 at these thresholds {relation}: "
+                  f"{_evidence(decision)}.")
+    else:
+        reason = f"{decision.reason} Ranking (ROC-AUC) {relation}: {_evidence(ranking)}."
     return GateDecision(verdict=verdict, promote=verdict == GateVerdict.PROMOTED, reason=reason,
-                        comparison=decision.comparison, notes=notes, ranking=ranking)
+                        comparison=decision.comparison, notes=notes, ranking=ranking,
+                        evidence=f"{_evidence(decision)}; {_evidence(ranking)}")
+
+
+def _evidence(decision: GateDecision | None) -> str:
+    """A decision as supporting evidence: its measurement, not its verdict sentence."""
+    if decision is None:
+        return ""
+    return decision.evidence or decision.reason
 
 
 @dataclass
@@ -495,8 +514,8 @@ def combine_windows(windows: dict[str, GateDecision], notes: list[str] | None = 
                 return LifecycleGateDecision(
                     GateVerdict.INCONCLUSIVE, False,
                     f"Challenger not promoted: needs human review. It is better on recent labels "
-                    f"({forward.reason}) but has collapsed on the frozen holdout, losing "
-                    f"{collapse:.0%} of the champion's score ({holdout.reason}). That pair is what a "
+                    f"({_evidence(forward)}) but has collapsed on the frozen holdout, losing "
+                    f"{collapse:.0%} of the champion's score ({_evidence(holdout)}). That pair is what a "
                     f"genuine regime change looks like and exactly what a corrupted label feed looks "
                     f"like, and the data cannot tell them apart. The champion stays until a person "
                     f"decides which it is.",
@@ -507,10 +526,10 @@ def combine_windows(windows: dict[str, GateDecision], notes: list[str] | None = 
                     "The challenger is worse on the frozen holdout while better on recent traffic. "
                     "That is what a genuine change in the input-outcome relationship looks like: "
                     "the holdout describes the world the champion was built for, the forward "
-                    f"window the world as it is now. {holdout.reason}"
+                    f"window the world as it is now. On the frozen holdout: {_evidence(holdout)}."
                 )
             elif holdout is not None and holdout.verdict == GateVerdict.INCONCLUSIVE:
-                notes.append(f"The frozen holdout did not confirm the improvement: {holdout.reason}")
+                notes.append(f"The frozen holdout did not confirm the improvement: {_evidence(holdout)}.")
             return LifecycleGateDecision(
                 GateVerdict.PROMOTED, True,
                 f"Challenger promoted on the forward window. {forward.reason}",
@@ -520,14 +539,14 @@ def combine_windows(windows: dict[str, GateDecision], notes: list[str] | None = 
             # Neither window decides. The forward window still leads, so its
             # evidence is the headline: quoting a 150-row holdout over a
             # 1,300-row forward window read as if the gate had used the weaker one.
-            notes.append(f"The frozen holdout could not separate them either: {holdout.reason}")
+            notes.append(f"The frozen holdout could not separate them either: {_evidence(holdout)}.")
             return LifecycleGateDecision(
                 GateVerdict.INCONCLUSIVE, False,
                 f"Challenger not promoted: neither window shows it is better beyond the noise. "
                 f"On the forward window, the world as it is now: {forward.reason}",
                 windows, FORWARD_WINDOW, notes,
             )
-        notes.append(f"The forward window could not separate the models: {forward.reason}")
+        notes.append(f"The forward window could not separate the models: {_evidence(forward)}.")
     elif forward is not None:
         notes.append(f"The forward window is too small to decide on: {forward.reason}")
 
