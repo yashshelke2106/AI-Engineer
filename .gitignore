@@ -19,3 +19,11 @@ models/
 .DS_Store
 .idea/
 .vscode/
+
+# Lifecycle walkthrough outputs (serve / retrain / gate demo) — regenerate them
+# with the README quickstart. Per-dataset validation reports stay tracked.
+runs/production/
+runs/retraining_frame.csv
+runs/*challenger*_report.md
+data/concept_*.csv
+data/new_customers.csv
