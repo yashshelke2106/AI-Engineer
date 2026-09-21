@@ -14,7 +14,7 @@ everything to MLflow, and writes a report.
 python -m autoeng.cli run data/any.csv          # infer everything
 python -m autoeng.cli run data.csv --target y   # or pin the target
 python -m autoeng.cli ask <run_id> "why did you reject random_forest?"
-pytest tests/ -q                                # 336 tests, ~220s
+pytest tests/ -q                                # 343 tests, ~220s
 python scripts/calibrate_detection.py           # detection accuracy, 10/10 expected
 ```
 
@@ -310,6 +310,13 @@ inside each fold (T2-2).
   against the first 500 of them, so the baseline was inside the live window and
   diluted a real shift ninefold. Never bin with np.histogram against reference
   edges; never let a baseline slice also be the window it is compared with.
+- **Calibration must never move a decision.** T2-1 fits Platt scaling (strictly
+  monotone) on out-of-fold probabilities and keeps it only if cross-validated
+  Brier improves >= 2%. Serving still decides raw score vs raw threshold and
+  only reports probability and threshold on the calibrated scale. Do not add
+  isotonic (ties make it weakly monotone, and on 29 positives it cost ROC-AUC
+  0.948 -> 0.921), and do not expect calibration to fix a threshold: every
+  threshold here is a cut through the ranking, which calibration preserves.
 - **F1 at a near-trivial threshold cannot see a model degrade.** The grouped
   champion's F1-optimal threshold labelled 83-94% of rows positive, so its F1
   (0.645) sat barely above labelling everything positive (0.621). Under a
@@ -376,7 +383,7 @@ autoeng/
 
 ## Current state
 
-336 tests passing. Detection 10/10 on unambiguous cases (iris is genuinely
+343 tests passing. Detection 10/10 on unambiguous cases (iris is genuinely
 ambiguous and excluded). Successive halving gives 7.4× speedup with an
 identical winner.
 

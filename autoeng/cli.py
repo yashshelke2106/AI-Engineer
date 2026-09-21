@@ -139,6 +139,14 @@ def main(argv: list[str] | None = None) -> int:
         if result.decision_threshold:
             print(f"Decision threshold: {result.decision_threshold['threshold']:.4f} "
                   f"({result.decision_threshold['objective']})")
+            calibration = result.decision_threshold.get("calibration") or {}
+            if calibration.get("method") == "platt":
+                print(f"Probability calibration: Platt scaling (out-of-fold Brier "
+                      f"{calibration['brier_before']:.4f} -> {calibration['brier_after']:.4f}, calibration error "
+                      f"{calibration['ece_before']:.4f} -> {calibration['ece_after']:.4f})")
+            elif calibration:
+                reason = calibration["reasoning"].split(": ", 1)[-1].split(". ")[0]
+                print(f"Probability calibration: none — {reason}.")
             if result.decision_threshold.get("near_trivial"):
                 chosen = result.decision_threshold
                 print(f"  Warning: at this threshold the model labels {chosen['positive_rate']:.0%} of rows "

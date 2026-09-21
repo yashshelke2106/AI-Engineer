@@ -22,6 +22,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from autoeng.modeling.calibration import apply_calibration
 from autoeng.modeling.threshold import DEFAULT_THRESHOLD
 
 
@@ -76,10 +77,23 @@ def threshold_from_schema(schema: dict[str, Any] | None) -> tuple[float | None, 
     return float(value), block.get("objective")
 
 
+def calibration_from_schema(schema: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The stored probability calibration (T2-1), or None if the run chose none."""
+    calibration = ((schema or {}).get("decision_threshold") or {}).get("calibration")
+    return calibration if calibration and calibration.get("method") == "platt" else None
+
+
 def predict_frame(estimator, frame: pd.DataFrame, schema: dict[str, Any] | None) -> PredictionBatch:
-    """Score a validated frame, applying the stored threshold where one exists."""
+    """
+    Score a validated frame, applying the stored threshold where one exists.
+
+    With a stored calibration the reported probability, and the threshold beside
+    it, are calibrated; the decision still compares the raw score with the raw
+    threshold, so calibration can never move a label.
+    """
     notes: list[str] = []
     threshold, objective = threshold_from_schema(schema)
+    calibration = calibration_from_schema(schema)
     class_labels = ((schema or {}).get("target") or {}).get("class_labels")
     is_binary = bool(class_labels) and len(class_labels) == 2
 
@@ -94,8 +108,19 @@ def predict_frame(estimator, frame: pd.DataFrame, schema: dict[str, Any] | None)
         # any estimator whose classes_ came back in a different order.
         classes = list(getattr(estimator, "classes_", class_labels))
         positive, negative = classes[1], classes[0]
-        rule = (f"predict_proba >= {threshold:.6f}" +
-                (f" (threshold selected by maximising {objective} out-of-fold)" if objective else ""))
+        reported = apply_calibration(proba, calibration)
+        reported_threshold = float(apply_calibration([threshold], calibration)[0])
+        if calibration:
+            rule = (f"calibrated probability >= {reported_threshold:.6f} (raw predict_proba >= {threshold:.6f})"
+                    + (f", threshold selected by maximising {objective} out-of-fold" if objective else ""))
+            notes.append(
+                "Probabilities are calibrated (Platt scaling fitted out-of-fold at training time), so they "
+                "can be read as probabilities. Calibration is monotone: every label is exactly the one the "
+                "raw score gives at the stored threshold."
+            )
+        else:
+            rule = (f"predict_proba >= {threshold:.6f}" +
+                    (f" (threshold selected by maximising {objective} out-of-fold)" if objective else ""))
         notes.append(
             f"Labels come from the stored decision threshold {threshold:.6f}, not the 0.5 "
             f"default that estimator.predict() would use. This is the operating point the "
@@ -104,8 +129,8 @@ def predict_frame(estimator, frame: pd.DataFrame, schema: dict[str, Any] | None)
         return PredictionBatch(
             predictions=[
                 Prediction(prediction=_jsonable(positive if p >= threshold else negative),
-                           probability=float(p), threshold=float(threshold), decision_rule=rule)
-                for p in proba
+                           probability=float(q), threshold=reported_threshold, decision_rule=rule)
+                for p, q in zip(proba, reported)
             ],
             notes=notes,
         )
@@ -126,7 +151,7 @@ def predict_frame(estimator, frame: pd.DataFrame, schema: dict[str, Any] | None)
     labels = estimator.predict(frame)
     proba = None
     if is_binary and hasattr(estimator, "predict_proba"):
-        proba = np.asarray(estimator.predict_proba(frame))[:, 1]
+        proba = apply_calibration(np.asarray(estimator.predict_proba(frame))[:, 1], calibration)
 
     return PredictionBatch(
         predictions=[

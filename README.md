@@ -29,7 +29,7 @@ python scripts/generate_grouped.py --customers 200 --out data/new_customers.csv 
 python -m autoeng.cli gate <champion> <challenger> --models-root runs/production --apply
 python scripts/generate_grouped.py --customers 300 --concept 0.7 --out data/concept.csv  # a real concept change
 
-pytest tests/ -q                                           # 336 tests, ~220s
+pytest tests/ -q                                           # 343 tests, ~220s
 python scripts/calibrate_detection.py                      # detection accuracy harness
 ```
 
@@ -441,9 +441,13 @@ part:
   move in steps of roughly 0.17. The out-of-fold selection uses all 23 training
   positives and is the sounder figure; the held-out table is a sanity check,
   not a precise measurement.
-- **Probabilities are not calibrated.** A tuned threshold assumes the
-  probability scale means something, and boosted trees and SVMs are
-  systematically miscalibrated. `ROADMAP.md` T2-1 pairs with this.
+- **Calibration is chosen, not assumed.** Platt scaling is kept only when
+  cross-validated evidence says it helps (the grouped SVM: calibration error
+  0.105 -> 0.035 on fresh data; logistic regression is left alone). It never
+  changes a decision or a ranking — only the probability the API reports — so it
+  cannot rescue a near-trivial F1 threshold. Isotonic is not offered: on rare
+  positives it cost ranking. A small holdout can disagree with the choice;
+  calibration curves need many rows.
 - **The Q&A is grounded retrieval, not an LLM chat layer.** It answers by
   reading real logged numbers back via keyword routing. Point an LLM at these
   same lookups as tools for the open-ended version; the hard part (answers
@@ -496,7 +500,7 @@ autoeng/
   reporting/       Markdown report generation
   pipeline.py      end-to-end orchestration
   cli.py           command-line entry point
-tests/             336 tests: planted leaks, regressions for every shipped bug, unit tests
+tests/             343 tests: planted leaks, regressions for every shipped bug, unit tests
 scripts/           detection calibration harness
 data/              synthetic + real validation datasets
 runs/              reports + MLflow store from the validation runs

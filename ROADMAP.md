@@ -440,12 +440,52 @@ the logged intervals on each window.
 
 | ID | Item | Size | Note |
 |---|---|---|---|
-| T2-1 | Probability calibration | ~120 ln | `CalibratedClassifierCV` cross-fitted; report Brier + ECE + reliability curve. Pairs with T0-2: a tuned threshold assumes the probabilities mean something, and boosted trees/SVMs are systematically miscalibrated. |
+| ~~T2-1~~ | ~~Probability calibration~~ — **DONE** | | See below. |
 | T2-2 | Fold-aware STL + multi-step forecasting | ~250 ln | Re-fit the decomposition *inside* each training fold (the non-leaky way, and the reason STL was refused earlier). Evaluate at the real forecast horizon. Also: seasonality finds period 3 on weekly CO₂ rather than 52 — detect on raw and differenced series and reconcile. |
 | T2-3 | Real text features | ~100 ln | TF-IDF → `TruncatedSVD` as a pipeline step, fit per fold. Free text currently contributes only length/word count. |
 | T2-4 | Parallelism across candidates | ~60 ln | Parallelise the outer loop, not inside each model's CV where nested parallelism forces `n_jobs=1` at every call site. Compounds with successive halving. |
 | T2-5 | LLM front-end over grounded lookups | ~180 ln | Thin tool-calling wrapper over the existing `qa.py` functions. Deliberately last — the hard part (answers being true) is done; building it earlier gives fluent answers with nothing verifying them. |
 | T2-6 | Model card per run | ~120 ln | Intended use, training window, per-segment results, limitations pulled from the run's own leakage flags and detection confidence, operating point from T0-2. |
+
+### ~~T2-1 · Probability calibration~~ — **DONE**
+
+Built in `autoeng/modeling/calibration.py`, chosen in `_select_operating_point`
+from the same out-of-fold probabilities as the threshold, stored in the
+schema's `decision_threshold.calibration`, applied by serving, reported with a
+reliability table.
+
+**Measured first, on this pipeline's own winners scored on unseen data:**
+
+- **Grouped RBF SVM**, 5,000 fresh rows: expected calibration error 0.105
+  uncalibrated, **0.035** with Platt fitted on its out-of-fold scores, 0.037
+  with sklearn's sigmoid, 0.060 with isotonic.
+- **Rare-fraud logistic regression**: already calibrated; isotonic cost it
+  ranking (ROC-AUC 0.948 -> 0.921).
+- **Breast-cancer QDA**: sklearn's sigmoid calibration made it *worse*
+  (ECE 0.025 -> 0.097).
+
+So calibration is chosen per model, never applied blindly: Platt scaling is
+cross-fitted on the out-of-fold probabilities (entity folds when grouped) and
+kept only if it lowers the cross-validated Brier score by at least 2% (SVM
++4.0%, kept; logistic regression -4.6%, left alone). Isotonic is not offered:
+it cost the rare-positive model ranking, and its ties would let calibration
+change decisions.
+
+**The brief's premise was wrong, and the resolution matters.** It said a tuned
+threshold "assumes the probabilities mean something". It does not: every
+threshold here is a cut through the model's ranking, and a monotone calibration
+preserves the ranking, so thresholds, F1, expected cost, ROC-AUC, PSI and every
+gate comparison are unchanged by it. What calibration fixes is the number the
+API returns — `probability` can now be read as one (served on 5,000 fresh rows:
+ECE 0.088 -> 0.044, every one of the 5,000 labels identical). Serving decides on
+the raw score against the raw threshold and reports both probability and
+threshold on the calibrated scale, so a caller comparing them reaches the label
+returned.
+
+**Known limit:** a calibration curve needs far more rows than a ranking metric.
+On the grouped fixture's 150-row holdout the calibrated probabilities look
+slightly worse, while 5,000 fresh rows show the error
+halved; the report prints the holdout figure with its size and says so.
 
 ---
 
@@ -471,7 +511,7 @@ Roughly 2,300 lines and 40 tests across all fourteen items; Tier 0 alone is
 about 530 lines and closes the gap between what the report claims and what the
 model does.
 
-Current state: 336 tests passing, 10/10 on unambiguous problem-type detection,
+Current state: 343 tests passing, 10/10 on unambiguous problem-type detection,
 7.4× search speedup from successive halving. **Tiers 0 and 1 are complete.**
 A trained model is persisted with its schema and a frozen holdout (T0-1),
 decides at an out-of-fold threshold (T0-2), and is split entity-aware (T0-3);

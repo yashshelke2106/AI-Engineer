@@ -45,6 +45,7 @@ from autoeng.modeling.search import (
     CLASSIFICATION_SCORING, REGRESSION_SCORING, _build_pipeline_for_model,
     run_classification_search, run_regression_search,
 )
+from autoeng.modeling.calibration import apply_calibration, expected_calibration_error, select_calibration
 from autoeng.modeling.threshold import (
     DEFAULT_OBJECTIVE, DEFAULT_PRECISION_FLOOR, DEFAULT_THRESHOLD,
     binary_indicator, operating_point, out_of_fold_probabilities, select_threshold,
@@ -98,7 +99,15 @@ def _select_operating_point(
             cost_false_negative=cost_false_negative, cost_false_positive=cost_false_positive,
             groups=groups,
         )
-        return choice.as_dict()
+        result = choice.as_dict()
+        # Chosen from the same out-of-fold probabilities, so the calibration is
+        # never fitted on the held-out rows either (T2-1).
+        indicator, _ = binary_indicator(y_train, choice.positive_label)
+        calibration = select_calibration(indicator, proba, groups).as_dict()
+        result["calibration"] = calibration
+        if calibration["method"] == "platt":
+            result["calibrated_threshold"] = float(apply_calibration([choice.threshold], calibration)[0])
+        return result
     except Exception as e:  # noqa: BLE001 - falls back to the 0.5 default, reported below
         return {
             "threshold": DEFAULT_THRESHOLD, "objective": objective, "metrics": {},
@@ -108,7 +117,8 @@ def _select_operating_point(
         }
 
 
-def _held_out_operating_point(pipeline, X_test, y_test, threshold: float) -> dict[str, Any] | None:
+def _held_out_operating_point(pipeline, X_test, y_test, threshold: float,
+                              calibration: dict[str, Any] | None = None) -> dict[str, Any] | None:
     """
     What the chosen threshold actually does on data nothing has touched.
 
@@ -123,10 +133,20 @@ def _held_out_operating_point(pipeline, X_test, y_test, threshold: float) -> dic
     # Column 1 is classes_[1]. Comparing against the literal 1 would score zero
     # true positives at every threshold on a string target.
     y, _ = binary_indicator(y_test, classes[1] if len(classes) == 2 else None)
-    return {
+    result = {
         "at_selected_threshold": operating_point(y, proba, threshold),
         "at_default_threshold": operating_point(y, proba, DEFAULT_THRESHOLD),
     }
+    if calibration and calibration.get("method") == "platt" and len(np.unique(y)) == 2:
+        from sklearn.metrics import brier_score_loss
+
+        calibrated = apply_calibration(proba, calibration)
+        result["calibration"] = {
+            "brier_raw": float(brier_score_loss(y, proba)), "brier_calibrated": float(brier_score_loss(y, calibrated)),
+            "ece_raw": expected_calibration_error(y, proba), "ece_calibrated": expected_calibration_error(y, calibrated),
+            "n_rows": int(len(y)),
+        }
+    return result
 
 
 def _persist_final_model(
@@ -516,6 +536,7 @@ def run_pipeline(
         if threshold_choice is not None:
             held_out_operating_point = _held_out_operating_point(
                 final_pipeline, X_test, y_test, threshold_choice["threshold"],
+                threshold_choice.get("calibration"),
             )
         explanation = explain_winner(
             leaderboard.results, final_name, final_pipeline, X_test, y_test,
