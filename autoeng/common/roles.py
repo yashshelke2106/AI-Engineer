@@ -103,7 +103,10 @@ def assign_feature_roles(
             continue
         if col.semantic_type == SemanticType.TEXT_FREE:
             text_cols.append(name)
-            reasoning[name] = "Routed to text feature extraction (length/word-count stats), not modeled raw."
+            reasoning[name] = (
+                "Routed to text feature extraction: TF-IDF reduced to SVD components (what the "
+                "words say) plus length/word-count stats, fit per fold. Not modeled raw."
+            )
             continue
         if col.semantic_type == SemanticType.DATETIME:
             datetime_cols.append(name)

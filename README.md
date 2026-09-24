@@ -29,7 +29,7 @@ python scripts/generate_grouped.py --customers 200 --out data/new_customers.csv 
 python -m autoeng.cli gate <champion> <challenger> --models-root runs/production --apply
 python scripts/generate_grouped.py --customers 300 --concept 0.7 --out data/concept.csv  # a real concept change
 
-pytest tests/ -q                                           # 343 tests, ~220s
+pytest tests/ -q                                           # 400 tests, ~690s
 python scripts/calibrate_detection.py                      # detection accuracy harness
 ```
 
@@ -54,9 +54,11 @@ Supports CSV/TSV, Parquet, JSON/JSON-Lines, and Excel.
 5. **Clean** — duplicate rows and constant columns dropped dataset-wide (safe
    pre-split); imputation and IQR outlier capping are `fit`/`transform`
    pipeline steps, so their statistics come from the training fold only.
-6. **Engineer features** — datetime decomposition, text length/word-count
-   stats, numeric interactions pruned by mutual information, and
-   cardinality-appropriate categorical encoding (one-hot / `TargetEncoder`).
+6. **Engineer features** — datetime decomposition, free text as TF-IDF reduced
+   to SVD components (plus length/word-count stats), numeric interactions pruned
+   by mutual information, and cardinality-appropriate categorical encoding
+   (one-hot / `TargetEncoder`). The text vocabulary is learned per fold like
+   every other statistic.
 7. **Scan for leakage** — pre-training (features suspiciously correlated with
    the target, train/test row overlap, temporal ordering violations, entities
    spanning the split) and post-training (implausibly perfect held-out metrics,
@@ -376,6 +378,25 @@ part:
   before. Where no feature identifies a customer at all, a keyless window
   assumes training's rows per customer and each column's clustering: flagged
   0% at training's visit pattern, 10% at twice it (22% before).
+- **Free text was being paid for and not used.** Length and word count are all
+  the pipeline took from a text column, and a repetitive one (support tickets,
+  product titles) was not even seen as text — below 95% unique it became a
+  high-cardinality category and got target-encoded, which measured no better
+  than deleting the column (0.646 vs 0.650 for logistic regression). TF-IDF
+  reduced to 50 SVD components, fit per fold, took real newsgroup posts from
+  ROC-AUC 0.674 to 0.995 (6 topics: 0.591 to 0.985), and the same posts shuffled
+  against the label stayed at chance, so it invents nothing. A chi-square screen
+  to skip boilerplate text was measured and *refused*: on the posts where the
+  components are worth 0.32 ROC-AUC, only one term cleared Bonferroni, so the
+  screen would have rejected the case it was for.
+- **A header made of sentences was read as data.** `csv.Sniffer().has_header`
+  votes by comparing row one with the rows below, and free text — never the same
+  length twice — casts no vote, so a file whose every column is text was declared
+  headerless: the header became a data row and the columns became `col_0`,
+  `col_1`. Running the pipeline on newsgroup posts is what surfaced it. Row one
+  is now judged on whether it reads like names; over every dataset plus a
+  header-stripped copy of each, the sniffer scored 31/34 and the replacement
+  34/34.
 - **A quiet report now says what it could not have seen.** Some limits are the
   data's: 30 customers cannot reliably show a 0.5 sd shift, and no test fixes
   that. So each numeric feature reports the smallest mean shift its window
@@ -500,7 +521,7 @@ autoeng/
   reporting/       Markdown report generation
   pipeline.py      end-to-end orchestration
   cli.py           command-line entry point
-tests/             343 tests: planted leaks, regressions for every shipped bug, unit tests
+tests/             400 tests: planted leaks, regressions for every shipped bug, unit tests
 scripts/           detection calibration harness
 data/              synthetic + real validation datasets
 runs/              reports + MLflow store from the validation runs

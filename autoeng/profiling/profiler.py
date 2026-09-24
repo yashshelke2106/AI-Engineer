@@ -31,8 +31,15 @@ class SemanticType(str, Enum):
     CATEGORICAL_HIGH_CARD = "categorical_high_card"
     DATETIME = "datetime"
     IDENTIFIER = "identifier"                      # near-unique, looks like an ID/key
-    TEXT_FREE = "text_free"                        # near-unique, looks like free text
+    TEXT_FREE = "text_free"                        # free text: near-unique, or prose that repeats
     UNKNOWN = "unknown"
+
+
+#: What separates prose from a category label. A repeated multi-word sentence is
+#: still prose (see the routing measurement in _infer_semantic_type); "Mumbai" or
+#: "premium tier" is a label however many rows it covers.
+MIN_WORDS_FOR_PROSE = 5
+MIN_CHARS_FOR_PROSE = 25
 
 
 @dataclass
@@ -160,6 +167,25 @@ def _infer_semantic_type(series: pd.Series, n_rows: int) -> tuple[SemanticType, 
     if n_unique <= cardinality_cap:
         reasoning.append(f"{n_unique} distinct values <= cap {cardinality_cap} -> low-cardinality categorical.")
         return SemanticType.CATEGORICAL_LOW_CARD, reasoning
+
+    # Prose that repeats is still prose. Short free text — support tickets, product
+    # titles, error messages — often falls well short of the 95%-unique bar above,
+    # and as a high-cardinality categorical it is target-encoded from a handful of
+    # rows per category. Measured on data/synthetic_text.csv (900 tickets, 55%
+    # unique, so 499 categories): target encoding scored ROC-AUC 0.646 / 0.564 /
+    # 0.578 for logistic regression / random forest / hist gradient boosting,
+    # against 0.650 / 0.532 / 0.586 with the column DROPPED — it was worth
+    # essentially nothing — while routing it to TF-IDF -> SVD gave 0.695 / 0.636 /
+    # 0.642. Only ever diverts what would otherwise be high-cardinality: a
+    # low-cardinality column of long answers is a category and stays one.
+    avg_words = non_null.astype(str).str.split().map(len).mean()
+    avg_len = non_null.astype(str).str.len().mean()
+    if avg_words >= MIN_WORDS_FOR_PROSE and avg_len >= MIN_CHARS_FOR_PROSE:
+        reasoning.append(
+            f"{n_unique} distinct values > cap {cardinality_cap}, averaging {avg_words:.1f} words / "
+            f"{avg_len:.0f} chars -> repetitive free text, not a category to encode."
+        )
+        return SemanticType.TEXT_FREE, reasoning
 
     reasoning.append(f"{n_unique} distinct values > cap {cardinality_cap} -> high-cardinality categorical.")
     return SemanticType.CATEGORICAL_HIGH_CARD, reasoning

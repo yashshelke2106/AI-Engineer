@@ -442,10 +442,78 @@ the logged intervals on each window.
 |---|---|---|---|
 | ~~T2-1~~ | ~~Probability calibration~~ — **DONE** | | See below. |
 | T2-2 | Fold-aware STL + multi-step forecasting | ~250 ln | Re-fit the decomposition *inside* each training fold (the non-leaky way, and the reason STL was refused earlier). Evaluate at the real forecast horizon. Also: seasonality finds period 3 on weekly CO₂ rather than 52 — detect on raw and differenced series and reconcile. |
-| T2-3 | Real text features | ~100 ln | TF-IDF → `TruncatedSVD` as a pipeline step, fit per fold. Free text currently contributes only length/word count. |
+| ~~T2-3~~ | ~~Real text features~~ — **DONE** | | See below. |
 | T2-4 | Parallelism across candidates | ~60 ln | Parallelise the outer loop, not inside each model's CV where nested parallelism forces `n_jobs=1` at every call site. Compounds with successive halving. |
 | T2-5 | LLM front-end over grounded lookups | ~180 ln | Thin tool-calling wrapper over the existing `qa.py` functions. Deliberately last — the hard part (answers being true) is done; building it earlier gives fluent answers with nothing verifying them. |
 | T2-6 | Model card per run | ~120 ln | Intended use, training window, per-segment results, limitations pulled from the run's own leakage flags and detection confidence, operating point from T0-2. |
+
+### ~~T2-3 · Real text features~~ — **DONE**
+
+`TextVectorFeaturizer` in `autoeng/features/transformers.py`: TF-IDF reduced by
+`TruncatedSVD`, inserted before the stats step so length and word count survive
+beside the meaning. A Pipeline step, so the vocabulary, the document frequencies
+and the projection are learned from the training fold only (invariant 1) and a
+word appearing solely in held-out rows is ignored rather than given a column.
+
+**Measured on real 20-newsgroups posts through this pipeline, before building:**
+
+| | stats only (before) | + TF-IDF -> SVD |
+|---|---|---|
+| 2 topics, 1,961 posts, logistic regression | 0.674 | **0.995** |
+| 6 topics, 5,796 posts, logistic regression | 0.591 | **0.985** |
+| 6 topics, random forest | 0.557 | **0.980** |
+| the same posts shuffled against the label | 0.485 | 0.490 (no false signal) |
+
+End to end through the CLI on the 2-topic set: held-out ROC-AUC **0.9965**,
+accuracy 0.964, with a threshold and a Platt calibration both selected.
+
+**50 components, because that is where the curve flattens** (6 topics): 10 ->
+0.977, 20 -> 0.983, 50 -> 0.985, 100 -> 0.986, 200 -> 0.985, while the cost does
+not flatten at all (46s -> 84s -> 145s). English stop words measured slightly
+better (0.985 vs 0.981) and `min_df` made no difference (0.9848 vs 0.9847).
+
+**A significance screen was considered and refuted by measurement.** Boilerplate
+text (`data/synthetic_classification.csv`: "customer feedback text goes here
+number N") produces no significant terms, so a chi-square screen before the SVD
+looked attractive. But on the 2-topic newsgroups set — where the components are
+worth 0.674 -> 0.995 — exactly **one** term cleared a Bonferroni threshold. The
+screen would have rejected the case it exists for. Not added; boilerplate is
+cheap anyway, because a 6-term vocabulary yields 5 components.
+
+**Routing changed too, and this was the larger finding.** Free text was only
+recognised at >= 95% unique. Real short text repeats, and below that bar it
+became a high-cardinality categorical and was target-encoded from a few rows per
+category. On `data/synthetic_text.csv` (900 tickets, 499 distinct):
+
+| | logistic regression | random forest | hist gradient boosting |
+|---|---|---|---|
+| column dropped entirely | 0.650 | 0.532 | 0.586 |
+| target-encoded (before) | 0.646 | 0.564 | 0.578 |
+| TF-IDF -> SVD (now) | **0.695** | **0.636** | **0.642** |
+
+Target encoding was worth essentially nothing over deleting the column. Prose
+with more than 5 words and 25 characters now routes to text when it would
+otherwise be high-cardinality — never from low-cardinality, so a handful of long
+survey answers stays a category. Detection still scores 10/10.
+
+**What it costs, and the optimisation that was refused.** Text columns are now
+vectorised on every fit, and on a dataset whose text is boilerplate that is pure
+overhead: the four heaviest test files take 209s with the step against 152s
+without it, +38%. Skipping thin vocabularies looked like a free fix — the
+templated notes in `data/synthetic_classification.csv` prune to 6 terms and are
+worth 0.705 -> 0.707. It was **rejected**, because the length-matched corpus in
+`tests/test_text_features.py` prunes to *ten* terms and goes 0.50 -> 0.95 on
+them. A small vocabulary is not a useless one, and no cheap test told the two
+apart: the per-term chi-square screen fails the same way (above), and a
+mutual-information screen over the components — the `NumericInteractionFeaturizer`
+pattern — is the remaining candidate, unbuilt because it needs its own
+measurement on small datasets before it can be trusted to drop features.
+
+**Known limit:** a text column's drift reference stores only length and word
+count (`_text_reference`), so a *vocabulary* shift — new slang, new product
+names, a new error message — moves nothing the monitor watches even though the
+model now reads the words. Prediction drift catches it only indirectly. Adding
+term-frequency drift is the natural follow-up.
 
 ### ~~T2-1 · Probability calibration~~ — **DONE**
 
@@ -511,7 +579,7 @@ Roughly 2,300 lines and 40 tests across all fourteen items; Tier 0 alone is
 about 530 lines and closes the gap between what the report claims and what the
 model does.
 
-Current state: 343 tests passing, 10/10 on unambiguous problem-type detection,
+Current state: 400 tests passing, 10/10 on unambiguous problem-type detection,
 7.4× search speedup from successive halving. **Tiers 0 and 1 are complete.**
 A trained model is persisted with its schema and a frozen holdout (T0-1),
 decides at an out-of-fold threshold (T0-2), and is split entity-aware (T0-3);

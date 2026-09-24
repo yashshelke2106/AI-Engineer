@@ -10,6 +10,12 @@ per fold — the same leakage-safety argument as the cleaning transformer.
   fit statistic), so leakage isn't even a risk here.
 - TextStatsFeaturizer: cheap free-text signal (length, word count) without
   needing an embedding model. Also stateless.
+- TextVectorFeaturizer: what the words actually say — TF-IDF reduced by
+  TruncatedSVD (latent semantic analysis). This one is stateful (a vocabulary,
+  document frequencies and a projection), so it is exactly the kind of thing
+  invariant 1 exists for: as a Pipeline step the vocabulary is learned from the
+  training fold only, and a word that appears solely in the held-out fold is
+  ignored rather than given a column of its own.
 - NumericInteractionFeaturizer: this one DOES need y, and DOES need to be
   fit-only-on-train — it searches pairwise products/ratios of the most
   target-relevant numeric columns and keeps only the ones that carry
@@ -20,11 +26,13 @@ from __future__ import annotations
 
 import itertools
 import warnings
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
 from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.decomposition import TruncatedSVD
+from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.feature_selection import mutual_info_classif, mutual_info_regression
 
 _EPOCH = pd.Timestamp("1970-01-01")
@@ -91,6 +99,125 @@ class TextStatsFeaturizer(BaseEstimator, TransformerMixin):
             out[f"{col}__avg_word_len"] = out[f"{col}__avg_word_len"].fillna(0.0)
             out = out.drop(columns=[col])
         return out
+
+
+#: Measured on 20-newsgroups posts through this pipeline (6 topics, 5,796 posts,
+#: logistic regression, 5-fold ROC-AUC): 10 components -> 0.977, 20 -> 0.983,
+#: 50 -> 0.985, 100 -> 0.986, 200 -> 0.985, against 0.591 with no components at
+#: all. The curve is flat past 50 while the cost is not (46s -> 84s -> 145s), so
+#: 50 is the knee, not a round number.
+TEXT_SVD_COMPONENTS = 50
+TEXT_MIN_DOCUMENT_FREQUENCY = 2
+TEXT_MAX_VOCABULARY = 20_000
+
+#: A minimum-vocabulary floor was tried here and REJECTED by measurement. The
+#: templated notes in data/synthetic_classification.csv prune to 6 terms, are
+#: worth nothing (ROC-AUC 0.705 -> 0.707) and cost 38% of the suite's runtime, so
+#: skipping thin vocabularies looked free. But tests/test_text_features.py's
+#: length-matched corpus prunes to TEN terms and goes 0.50 -> 0.95 on them: a
+#: small vocabulary is not a useless one. Cost documented instead; see the trap in
+#: CLAUDE.md.
+
+
+class TextVectorFeaturizer(BaseEstimator, TransformerMixin):
+    """
+    Turns each free-text column into `n_components` latent semantic dimensions.
+
+    TF-IDF gives one column per word — tens of thousands, sparse, and unusable by
+    most of the zoo — so it is projected down with TruncatedSVD, which works on
+    the sparse matrix directly. The raw column is left in place for
+    TextStatsFeaturizer to consume and drop, so length and word count survive
+    alongside the meaning.
+
+    A column whose vocabulary is too thin to decompose is *recorded* in
+    `skipped_` and left to the stats features, rather than raising: one
+    unusable text column must not take down a run that has twelve good ones.
+    """
+
+    def __init__(self, text_columns: list[str] | None = None,
+                 n_components: int = TEXT_SVD_COMPONENTS,
+                 min_document_frequency: int = TEXT_MIN_DOCUMENT_FREQUENCY,
+                 max_vocabulary: int = TEXT_MAX_VOCABULARY,
+                 random_state: int = 0):
+        self.text_columns = text_columns  # verbatim — see note in DatetimeFeaturizer
+        self.n_components = n_components
+        self.min_document_frequency = min_document_frequency
+        self.max_vocabulary = max_vocabulary
+        self.random_state = random_state
+
+    @staticmethod
+    def _as_text(column: pd.Series) -> pd.Series:
+        # A null is an empty document, not the string "nan": TF-IDF would otherwise
+        # learn "nan" as a token and score missingness as a word.
+        return column.astype("object").where(column.notna(), "").astype(str)
+
+    def _vectorize(self, text: pd.Series):
+        """TF-IDF with English stop words, falling back to keeping them.
+
+        Stop words measured better on real posts (0.985 vs 0.981), but a corpus of
+        short, formulaic notes can be *made* of them, and pruning then leaves an
+        empty vocabulary.
+        """
+        attempts = [
+            {"stop_words": "english", "min_df": self.min_document_frequency},
+            {"stop_words": None, "min_df": 1},
+        ]
+        last_error = None
+        for kwargs in attempts:
+            try:
+                vectorizer = TfidfVectorizer(max_features=self.max_vocabulary, sublinear_tf=True, **kwargs)
+                return vectorizer, vectorizer.fit_transform(text), None
+            except ValueError as exc:  # "empty vocabulary", "after pruning no terms remain"
+                last_error = exc
+        return None, None, f"no usable vocabulary ({last_error})"
+
+    def fit(self, X: pd.DataFrame, y=None):
+        self.vectorizers_: dict[str, tuple[Any, Any]] = {}
+        self.skipped_: dict[str, str] = {}
+        for col in (self.text_columns or []):
+            if col not in X.columns:
+                continue
+            text = self._as_text(X[col])
+            # A column of one repeated document has nothing to decompose: SVD on a
+            # rank-1 matrix divides by a zero total variance and returns components
+            # that are constant for every row.
+            n_distinct = int(text.nunique())
+            if n_distinct < 3:
+                self.skipped_[col] = (
+                    f"only {n_distinct} distinct value(s) in this column, which is not a corpus; "
+                    f"length and word-count stats only"
+                )
+                continue
+            vectorizer, matrix, error = self._vectorize(text)
+            if error:
+                self.skipped_[col] = error
+                continue
+            # SVD needs strictly fewer components than either dimension of the matrix.
+            n_components = min(self.n_components, matrix.shape[1] - 1, matrix.shape[0] - 1)
+            if n_components < 2:
+                self.skipped_[col] = (
+                    f"a vocabulary of {matrix.shape[1]} terms over {matrix.shape[0]} rows is too "
+                    f"small to decompose; length and word-count stats only"
+                )
+                continue
+            svd = TruncatedSVD(n_components=n_components, random_state=self.random_state)
+            svd.fit(matrix)
+            self.vectorizers_[col] = (vectorizer, svd)
+        return self
+
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+        made: dict[str, np.ndarray] = {}
+        for col, (vectorizer, svd) in getattr(self, "vectorizers_", {}).items():
+            if col not in X.columns:
+                continue
+            components = svd.transform(vectorizer.transform(self._as_text(X[col])))
+            for i in range(components.shape[1]):
+                made[f"{col}__svd_{i}"] = components[:, i]
+        if not made:
+            return X
+        # One concat rather than n inserts: 50 columns assigned one at a time
+        # fragments the frame and pandas warns about it.
+        return pd.concat([X, pd.DataFrame(made, index=X.index)], axis=1)
 
 
 class NumericInteractionFeaturizer(BaseEstimator, TransformerMixin):

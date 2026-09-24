@@ -84,7 +84,8 @@ def generate_report(
     lines.append(f"- Categorical features (low-card, one-hot): {role_assignment['low_card_categorical_columns'] or '(none)'}")
     lines.append(f"- Categorical features (high-card, target-encoded): {role_assignment['high_card_categorical_columns'] or '(none)'}")
     lines.append(f"- Datetime features (decomposed): {role_assignment['datetime_columns'] or '(none)'}")
-    lines.append(f"- Text features (length/word-count stats): {role_assignment['text_columns'] or '(none)'}")
+    lines.append(f"- Text features (TF-IDF -> SVD components + length/word-count stats): "
+                 f"{role_assignment['text_columns'] or '(none)'}")
     lines.append(f"- Excluded (identifiers/constants): {role_assignment['excluded_columns'] or '(none)'}\n")
 
     if group_decision:

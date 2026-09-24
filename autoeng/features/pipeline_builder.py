@@ -24,7 +24,9 @@ from sklearn.preprocessing import OneHotEncoder, TargetEncoder
 
 from autoeng.cleaning.transformer import AutoCleanerTransformer
 from autoeng.common.roles import FeatureRoleAssignment
-from autoeng.features.transformers import DatetimeFeaturizer, NumericInteractionFeaturizer, TextStatsFeaturizer
+from autoeng.features.transformers import (
+    DatetimeFeaturizer, NumericInteractionFeaturizer, TextStatsFeaturizer, TextVectorFeaturizer,
+)
 
 
 def build_preprocessing_pipeline(
@@ -32,6 +34,7 @@ def build_preprocessing_pipeline(
     problem_kind: Literal["classification", "regression"],
     cap_outliers: bool = True,
     use_interactions: bool = True,
+    vectorize_text: bool = True,
 ) -> Pipeline:
     """
     Returns an unfitted sklearn Pipeline: raw (structurally-cleaned) feature
@@ -40,8 +43,14 @@ def build_preprocessing_pipeline(
     steps = [
         ("clean", AutoCleanerTransformer(column_roles=roles.column_roles, cap_outliers=cap_outliers)),
         ("datetime_features", DatetimeFeaturizer(datetime_columns=roles.datetime_columns)),
-        ("text_features", TextStatsFeaturizer(text_columns=roles.text_columns)),
     ]
+
+    if vectorize_text and roles.text_columns:
+        # Before the stats step, which is what drops the raw text column. The
+        # vocabulary and the projection are fit statistics, so this being a
+        # Pipeline step is what keeps them inside the training fold (invariant 1).
+        steps.append(("text_vectors", TextVectorFeaturizer(text_columns=roles.text_columns)))
+    steps.append(("text_features", TextStatsFeaturizer(text_columns=roles.text_columns)))
 
     if use_interactions:
         steps.append((
