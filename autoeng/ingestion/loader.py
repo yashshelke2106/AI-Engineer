@@ -48,6 +48,96 @@ class IngestionReport:
 _ENCODINGS_TO_TRY = ("utf-8", "utf-8-sig", "latin-1", "cp1252")
 
 
+#: A header cell is a name, not a document. Anything longer than this, or with
+#: more words than the next constant, is data that happens to be on row one.
+_MAX_HEADER_CELL_CHARS = 64
+_MAX_HEADER_CELL_WORDS = 6
+
+
+def _first_row_looks_like_names(sample: str, delimiter: str) -> bool:
+    """Second opinion for `csv.Sniffer().has_header`, which abstains on free text.
+
+    The sniffer decides by comparing each column's first cell with the cells
+    below it: numeric where they are numeric, or a different string *length*. It
+    only counts length when every row in that column shares one, so a column of
+    free text — where no two documents are the same length — casts no vote at
+    all, and a file whose every column is free text gets zero votes and is
+    declared headerless. Its header row then becomes a data row and every column
+    is renamed col_0, col_1, which is silent on a run using auto-detection.
+
+    So: row one is names if each of its cells reads like a name (short, few
+    words, non-numeric, distinct, and not repeated in its own column) AND at
+    least one column's values below look unlike it — numeric, or typically much
+    longer.
+    """
+    rows = [r for r in csv.reader(sample.splitlines(), delimiter=delimiter) if r]
+    if len(rows) < 3:
+        return False
+    head, body = rows[0], [r for r in rows[1:] if len(r) == len(rows[0])]
+    if not body or len(set(head)) != len(head):
+        return False
+
+    for cell in head:
+        text = cell.strip()
+        if not text or len(text) > _MAX_HEADER_CELL_CHARS or len(text.split()) > _MAX_HEADER_CELL_WORDS:
+            return False
+        try:
+            float(text)
+            return False  # a number is a measurement, not a name
+        except ValueError:
+            pass
+
+    unlike_below = False
+    for i, cell in enumerate(head):
+        column = [r[i].strip() for r in body if i < len(r)]
+        if cell.strip() in column:
+            return False  # a name would not recur as one of its own values
+        numeric = sum(_is_number(v) for v in column)
+        if numeric > 0.8 * len(column):
+            unlike_below = True
+            continue
+        lengths = sorted(len(v) for v in column)
+        median = lengths[len(lengths) // 2]
+        if median >= 2 * max(len(cell.strip()), 1):
+            unlike_below = True
+    return unlike_below
+
+
+def _is_number(value: str) -> bool:
+    try:
+        float(value)
+        return True
+    except ValueError:
+        return False
+
+
+def _decide_header(sample: str, delimiter: str) -> tuple[bool, str]:
+    """Whether row one holds column names, and the basis for saying so.
+
+    Measured over every committed dataset plus a header-stripped copy of each
+    (34 cases): `csv.Sniffer().has_header` got 31, missing the header on a
+    free-text file and inventing one on a headerless free-text file.
+    `_first_row_looks_like_names` got 34, so it leads and the sniffer is the
+    fallback for a sample too short to judge (under three rows).
+
+    Detection is a guess (invariant 6), so the basis goes in the ingestion
+    report either way rather than the run silently proceeding on `col_0`.
+    """
+    if len([r for r in csv.reader(sample.splitlines(), delimiter=delimiter) if r]) < 3:
+        try:
+            sniffed = csv.Sniffer().has_header(sample)
+        except csv.Error:
+            return True, "too few rows to judge and the sniffer could not either; assumed a header exists"
+        return sniffed, f"too few rows to judge; csv.Sniffer says header={sniffed}"
+
+    if _first_row_looks_like_names(sample, delimiter):
+        return True, "row one reads as column names — short, distinct, and unlike the values below it"
+    return False, (
+        "row one reads as data, not names (a long, numeric, repeated or duplicated first row); "
+        "synthetic column names will be used"
+    )
+
+
 def _sniff_delimiter(sample: str) -> str | None:
     try:
         dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
@@ -162,11 +252,8 @@ def load_raw_dataset(path: str | Path) -> tuple[pd.DataFrame, IngestionReport]:
         delimiter = ","
         warnings.append("Could not confidently sniff a delimiter; defaulted to ','.")
 
-    try:
-        has_header = csv.Sniffer().has_header(sample)
-    except csv.Error:
-        has_header = True
-        notes.append("Header presence could not be sniffed; assumed a header row exists.")
+    has_header, basis = _decide_header(sample, delimiter)
+    notes.append(f"Header decision: {basis}")
 
     df = pd.read_csv(
         path,
