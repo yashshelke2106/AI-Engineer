@@ -157,6 +157,13 @@ def generate_report(
         if time_series_setup.get("differenced"):
             lines.append("- Predictions are reconstructed onto the original scale before scoring, so the "
                          "numbers below stay directly comparable to the baselines.")
+        horizon = time_series_setup.get("horizon", 1)
+        lines.append(f"- **Forecast horizon:** {horizon} step{'s' if horizon != 1 else ''} ahead — every "
+                     f"model and baseline below forecasts from the series as it stood {horizon} "
+                     f"step{'s' if horizon != 1 else ''} before the target"
+                     + (" (set `--horizon` to the lead time the forecast will be used at)." if horizon == 1 else "."))
+        if time_series_setup.get("stl"):
+            lines.append(f"- **Fold-aware STL:** {time_series_setup['stl']}")
         lines.append("")
 
     if time_series_baselines:
