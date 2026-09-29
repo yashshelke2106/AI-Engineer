@@ -29,7 +29,7 @@ python scripts/generate_grouped.py --customers 200 --out data/new_customers.csv 
 python -m autoeng.cli gate <champion> <challenger> --models-root runs/production --apply
 python scripts/generate_grouped.py --customers 300 --concept 0.7 --out data/concept.csv  # a real concept change
 
-pytest tests/ -q                                           # 400 tests, ~690s
+pytest tests/ -q                                           # 475 tests, ~560s
 python scripts/calibrate_detection.py                      # detection accuracy harness
 ```
 
@@ -469,16 +469,41 @@ part:
   cannot rescue a near-trivial F1 threshold. Isotonic is not offered: on rare
   positives it cost ranking. A small holdout can disagree with the choice;
   calibration curves need many rows.
-- **The Q&A is grounded retrieval, not an LLM chat layer.** It answers by
-  reading real logged numbers back via keyword routing. Point an LLM at these
-  same lookups as tools for the open-ended version; the hard part (answers
-  being true) is what's implemented.
-- **STL decomposition features were deliberately rejected.** Fitting STL on
-  the whole series and using its components at time *t* leaks future
-  information — the decomposition at every point uses the entire series.
-  Doing it correctly needs a re-fit inside each training fold, which the
-  current architecture (lag frame built once, before CV) doesn't support.
-  Shipping the leaky version would have "improved" scores by cheating.
+- **An LLM answers questions only if its numbers check out.** `ask --llm` puts
+  Claude in front of the same grounded lookups the keyword router uses, then
+  checks every number in the answer against what the tools returned. An answer
+  with a number no logged artifact supports is discarded and the keyword
+  answer is shown instead, naming the number. The first draft counted the
+  question as evidence, so "did it score 0.99?" answered "yes, 0.99" verified
+  itself. Every failure — no key, an API error, a refusal — falls back the same
+  way.
+- **STL is fold-aware, and only kept where it helps.** Fitted on the whole
+  series it leaks, which is why it was refused for so long. It is now fitted on
+  each training fold and turned into a per-phase index a future row can look
+  up, offered to the three best models, and kept only where cross-validation
+  says so: +0.04 R² at a 13-step horizon on a daily series with two cycles,
+  nothing to speak of on CO2.
+- **Forecasts are scored at the horizon they will be used at.** `--horizon h`
+  moves every lag, rolling statistic and baseline to the forecast origin. At
+  h=1 nothing changes, term by term.
+- **Outlier capping was clipping the present.** On a trending series the test
+  fold's lags sit above the training fold's IQR cap by construction, so the cap
+  removed the most recent information: ridge 0.814 capped against 0.933
+  uncapped at a 13-week CO2 horizon. Forecasting no longer caps lag features.
+- **Parallel search, measured rather than maxed out.** Candidates run in a pool
+  of a quarter of the cores, the rest as their threads: 196s -> 74s on a full
+  search. A worker per core was slower than no pool at all on a halving search
+  (109s -> 167s). `bagging`'s own process pool cost 18s of every small search
+  for nothing and is gone.
+- **Tuned winners were described at their untuned score.** The explanation read
+  the leaderboard, which holds untuned configurations, so a model selected at
+  0.7007 after tuning was reported at 0.6866 and *behind* its runner-up (margin
+  -0.0033). The selection itself was right; everything describing it was not.
+  Found by reading the first real `ask` answer after T2-5, not by a test.
+- **Every run writes a model card** beside its report: per-segment results
+  judged against their own noise, and limitations pulled from the run's own
+  checks. Intended use comes from `--intended-use` or the card says it was not
+  supplied — it is never guessed.
 
 ## Known limitations
 
@@ -487,11 +512,10 @@ part:
   ≈0.96) over the 3 species clusters. Both are genuinely present; the
   heuristic can't know which one a human wants. `--problem-type clustering`
   settles it.
-- **Seasonality detection finds short-lag structure, not always the true
-  cycle.** On weekly CO2 it detects period 3 rather than the annual 52 — in
-  the *differenced* series the annual amplitude is small relative to
-  short-term autocorrelation. Harmless (it adds one extra lag feature) but not
-  the real seasonality.
+- **Seasonality detection on undated series is a search, and searches find
+  things.** With dates, only calendar periods are checked and 31 of 31 test
+  series come out right (weekly CO2: 52, where it used to say 3). Without dates
+  every lag is a candidate, and about 1% of aperiodic series still get a period.
 - **Interaction search keeps some noise-driven features** on small/noisy data,
   despite the 15%-over-parent mutual-information margin.
 - **Leakage detection is a screen, not a proof.** Association and
@@ -521,7 +545,7 @@ autoeng/
   reporting/       Markdown report generation
   pipeline.py      end-to-end orchestration
   cli.py           command-line entry point
-tests/             400 tests: planted leaks, regressions for every shipped bug, unit tests
+tests/             475 tests: planted leaks, regressions for every shipped bug, unit tests
 scripts/           detection calibration harness
 data/              synthetic + real validation datasets
 runs/              reports + MLflow store from the validation runs

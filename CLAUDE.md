@@ -14,11 +14,13 @@ everything to MLflow, and writes a report.
 python -m autoeng.cli run data/any.csv          # infer everything
 python -m autoeng.cli run data.csv --target y   # or pin the target
 python -m autoeng.cli ask <run_id> "why did you reject random_forest?"
-pytest tests/ -q                                # 400 tests, ~690s
+python -m autoeng.cli ask <run_id> "..." --llm    # Claude over the same lookups, numbers checked
+python -m autoeng.cli run series.csv --horizon 13 # forecasts scored 13 steps ahead
+pytest tests/ -q                                # 475 tests, ~560s
 python scripts/calibrate_detection.py           # detection accuracy, 10/10 expected
 ```
 
-`ROADMAP.md` has the prioritised remaining work. **Tiers 0 and 1 are done; Tier 2 is independent items.**
+`ROADMAP.md` records every item and what measuring it found. **All tiers are done** (Tier 2: calibration, text, forecasting horizon + fold-aware STL, parallel search, the checked LLM front-end, model cards).
 
 ## Invariants — do not break these
 
@@ -212,6 +214,34 @@ follows the pointer; rejections and inconclusive verdicts are logged to
 `gate_log.jsonl` and leave it untouched. "Stays out of production" is only
 checkable because this exists.
 
+**7j. The model card states only what the run measured.** T2-6's card
+(`autoeng/reporting/model_card.py`) is assembled from the run's own numbers and
+checks: leakage flags, detection confidence, `near_trivial`, grouping, the
+text-drift blind spot, held-out size. Intended use is the one thing the system
+cannot know, so it comes from `--intended-use` or the card says *Not supplied* —
+never a plausible-sounding default. A segment is flagged only when its whole 95%
+interval sits on the wrong side of the overall figure (entity-resampled when
+grouped); a segment under 30 held-out rows, or with a class under 5, gets a
+count and a note instead of a number. A clean run's card says "none detected by
+this run's checks", not "no limitations". Library versions and the selection
+source are read from the artifact's `training_schema.json`, so the card and the
+artifact cannot disagree, and the JSON copy lives in the model directory so it
+travels with the model. Like tracking and the model store, a card failure is
+written to `<run>_model_card_error.txt`, never raised after a finished run.
+
+**7k. An LLM answer is shown only if every number in it came from a tool.**
+`ask --llm` (T2-5, `autoeng/explain/llm_qa.py`) puts Claude in front of the
+grounded lookups in `qa.py` (`LOOKUPS`), and `unsupported_numbers` then checks
+the answer: each number must match a tool result at the precision stated, or
+as a percentage of one; integers up to 10 are exempt as counts and ordinals.
+The QUESTION is not evidence — "did it score 0.99?" answered "yes, 0.99" would
+otherwise verify itself. A failed check discards the answer and falls back to
+the keyword router with the offending numbers named, and so does every other
+failure (no SDK, no credentials, API error, refusal, a tool loop past
+`MAX_TOOL_TURNS`). Never loosen the check to make an answer through; never let
+`ask` depend on the API. Adding a lookup means adding its tool to `TOOLS`, and
+a test pins the two sets equal.
+
 **8. Groups, when detected, apply to EVERY split.**
 Held-out partition, search folds, the halving screen's subsample (which samples
 whole entities, not rows), HPO folds, the stack, and the threshold selector's
@@ -234,8 +264,21 @@ exactly when it mattered. `GroupDecision.column` is what splitting uses;
 
 **9. No STL-as-features on the full series.**
 Fitting STL on the whole series and using its components at time *t* leaks the
-future into the past. It was deliberately refused. The correct version re-fits
-inside each fold (T2-2).
+future into the past. T2-2's `_seasonal_index` fits it on ONE training fold's
+levels and turns it into a per-phase index, looked up by a future row's phase
+(known in advance); a test records every fit and requires each saw exactly one
+training window. Phases are numbered from each fold's first row — the first
+prototype added the lag frame's offset, shifted every phase, and still "helped"
+tree models, which is why that bug was invisible until a linear model was
+checked. STL is a CV-chosen `<name>+stl` variant for the top three models, never
+a blanket feature: it cost the best model on some series.
+
+**9a. Forecasts are scored at `horizon`, and so are the baselines.** Every target
+feature is computed on the series as it stood at the forecast origin
+(`build_lag_feature_frame(horizon=h)`), and naive / seasonal-naive / moving
+average forecast from the same origin — invariant 4 at every horizon. h=1 must
+reproduce the one-step frame and baselines exactly; a term-by-term test pins
+that. `target_lag_{h}` is the origin level differencing rebuilds from.
 
 ## Traps that already bit
 
@@ -358,6 +401,38 @@ inside each fold (T2-2).
   message, a renamed product — moves nothing the monitor watches, even though
   the model now reads the words (T2-3). Do not read `ok` on a text-heavy model as
   evidence its language has not changed.
+- **Parallelising a search that already parallelises oversubscribes silently.**
+  Half the zoo asks for every core on its own. T2-4 first capped each pool
+  worker at one thread, and every candidate then ran ~4x slower inside a
+  worker, LightGBM became the critical path, and 16 workers were slower than
+  sequential on a halving search (109s -> 167s). Workers x threads now equals
+  the cores (`inner_max_num_threads`), with a quarter of the cores as workers.
+  Measure on both search paths before changing `WORKER_SHARE_OF_CORES`; repeats
+  of one setting differed by up to 2x on the build machine, so run each twice.
+- **`bagging` was the only zoo member parallelising with processes.** At
+  `n_jobs=-1` a 500-row 5-fold CV took 18.2s against 1.7s at 1, same score —
+  Windows process-pool start-up. The forests use threads and keep `n_jobs=-1`.
+  Check the backend before giving a new estimator `n_jobs=-1`.
+- **Outlier capping clips the present on a trending series.** The IQR cap is
+  fitted on the training fold, and a trending series' test-fold lags sit above
+  it by construction: capping cost ridge 0.933 -> 0.814 at a 13-week CO2
+  horizon. `run_time_series_search` never caps; do not route lag features
+  through `cap_outliers=True`.
+- **Differencing hides long cycles from an ACF.** A period-P cycle survives
+  first differencing scaled by 2*sin(pi/P) — 0.12 at P=52 — so the old detector
+  called weekly CO2 period 3. `detect_seasonal_period` detrends with a moving
+  average instead, checks only calendar periods when there are dates, and
+  requires a peak-to-trough contrast; undated, it also needs harmonic support.
+  A sample of 30 aperiodic series said zero false periods; 181 said ~1%. Size
+  the sample before believing a zero.
+- **A tuned winner was explained at its untuned score.** `explain_winner` read
+  the score from the leaderboard, which only holds untuned configurations, so a
+  real run's winner selected at 0.7007 after tuning was reported at 0.6866 behind
+  a runner-up at 0.6899 — "margin -0.0033" — in the report, `ask` and the model
+  card, while the selection had compared it with that runner-up's tuned 0.6984.
+  Pass the selection's own score (`winner_score`) and the rivals' tuned scores
+  (`tuned_scores`); anything describing "the model" must describe the one that
+  was selected, not its leaderboard row.
 - **Calibration must never move a decision.** T2-1 fits Platt scaling (strictly
   monotone) on out-of-fold probabilities and keeps it only if cross-validated
   Brier improves >= 2%. Serving still decides raw score vs raw threshold and
@@ -432,7 +507,7 @@ autoeng/
 
 ## Current state
 
-400 tests passing. Detection 10/10 on unambiguous cases (iris is genuinely
+475 tests passing. Detection 10/10 on unambiguous cases (iris is genuinely
 ambiguous and excluded). Successive halving gives 7.4× speedup with an
 identical winner.
 
@@ -465,4 +540,4 @@ drift, retrain, gate. The full loop has been run end to end through
 `run_pipeline` — a champion serving through the production pointer, a drift
 check, two retrained challengers, and a gate that rejected the corrupted one
 and promoted the one retrained after a genuine concept change. Invariants
-7g-7i record what that run found. Tier 2 items are independent.
+7g-7i record what that run found. Tier 2 is complete too; invariants 1a and 7j-7k and 9-9a are its rules.

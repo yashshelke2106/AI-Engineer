@@ -27,7 +27,7 @@ T1-4 and T1-5, and still should if any of this is revisited.
 ## Tier 0 — Blockers
 
 All three confirmed absent by grepping the codebase, not assumed.
-**Tier 0 and Tier 1 are complete.** Tier 2 items are independent of each other; see rule 3 below.
+**Every tier is complete.** Tier 2 items were independent of each other; see rule 3 below.
 
 ### ~~T0-1 · Persist the trained model and its schema~~ — **DONE**
 
@@ -441,11 +441,189 @@ the logged intervals on each window.
 | ID | Item | Size | Note |
 |---|---|---|---|
 | ~~T2-1~~ | ~~Probability calibration~~ — **DONE** | | See below. |
-| T2-2 | Fold-aware STL + multi-step forecasting | ~250 ln | Re-fit the decomposition *inside* each training fold (the non-leaky way, and the reason STL was refused earlier). Evaluate at the real forecast horizon. Also: seasonality finds period 3 on weekly CO₂ rather than 52 — detect on raw and differenced series and reconcile. |
+| ~~T2-2~~ | ~~Fold-aware STL + multi-step forecasting~~ — **DONE** | | See below. |
 | ~~T2-3~~ | ~~Real text features~~ — **DONE** | | See below. |
-| T2-4 | Parallelism across candidates | ~60 ln | Parallelise the outer loop, not inside each model's CV where nested parallelism forces `n_jobs=1` at every call site. Compounds with successive halving. |
-| T2-5 | LLM front-end over grounded lookups | ~180 ln | Thin tool-calling wrapper over the existing `qa.py` functions. Deliberately last — the hard part (answers being true) is done; building it earlier gives fluent answers with nothing verifying them. |
-| T2-6 | Model card per run | ~120 ln | Intended use, training window, per-segment results, limitations pulled from the run's own leakage flags and detection confidence, operating point from T0-2. |
+| ~~T2-4~~ | ~~Parallelism across candidates~~ — **DONE** | | See below. |
+| ~~T2-5~~ | ~~LLM front-end over grounded lookups~~ — **DONE** | | See below. |
+| ~~T2-6~~ | ~~Model card per run~~ — **DONE** | | See below. |
+
+### ~~T2-2 · Fold-aware STL + multi-step forecasting~~ — **DONE**
+
+Three changes to `autoeng/modeling/time_series.py`, and a fourth that measurement
+turned up.
+
+**1. The seasonality bug.** The detector read the ACF of the first *difference*.
+Differencing is a high-pass filter — a period-P cycle comes out scaled by
+2·sin(π/P), 0.12 at P=52 — so short-lag noise beat the annual cycle and weekly
+CO2 came out as period 3. Now: with a datetime index, only the calendar periods
+for the sampling interval are checked (hourly 24/168, daily 7/30/365, weekly 52,
+monthly 12, quarterly 4), each on the series detrended by a moving average two
+cycles wide, and a candidate must be a local ACF peak at least 0.2 above the ACF
+near half its period — a real cycle troughs there, a random walk's ACF only
+decays. Without dates, every lag is a candidate but must also peak near twice
+its lag.
+
+| | old | new |
+|---|---|---|
+| 31 dated series with known periods (real CO2 + synthetic) | 17 | **31** |
+| real weekly CO2 | 3 | **52** (ACF 0.89) |
+| 180 undated periodic series | 52 | **156** |
+| 181 undated aperiodic series given a period | 1 | 2 |
+
+A first sample of 30 aperiodic series said the new search gave none of them a
+period; 181 said about 1%, like the old one. The tests bound the rate rather
+than pretend it is zero.
+
+**2. The real horizon.** `run --horizon h` (default 1) scores every model *and
+every baseline* at h steps ahead: each target feature, rolling statistic and
+seasonal lag is computed on the series as it stood at the forecast origin
+(direct strategy), and naive / seasonal-naive / moving-average forecast from the
+same origin. At h=1 the frame and baselines are exactly the old ones (checked
+term by term). A perturbation test changes every value the forecast must not
+see and requires every feature to stay put.
+
+**3. Fold-aware STL.** STL on the whole series leaks, which is why it was refused.
+`_seasonal_index` fits it on one training fold's levels and turns it into a
+per-phase index that a future row looks up by its phase, known in advance; a
+test records every STL fit and requires each saw exactly one training window.
+It is offered to the three best models as `<name>+stl` and kept only where the
+same cross-validation says it helps, because measured it is not a blanket win:
+
+| series | best model without → with STL, h = 1 / 4 / 13 |
+|---|---|
+| daily, weekly + monthly cycles | 0.842 → **0.877** / 0.844 → **0.859** / 0.855 → **0.897** |
+| real weekly CO2 | 0.9835 → 0.9836 / 0.9494 → 0.9508 / 0.8533 → 0.8541 |
+| weekly cycle on a random walk (600 weeks) | not offered: the first fold holds under two cycles |
+
+The first measurement of this was wrong: the prototype looked the index up with
+the lag frame's offset added, shifting every phase. Trees still profited (a
+shifted phase is still a phase to them); linear models could not. The shipped
+code numbers phases from each fold's first row, and the table above is from it.
+
+**4. Lag features are no longer outlier-capped.** Found while explaining why
+ridge scored 0.933 at a 13-week horizon on CO2 in a prototype and 0.814 through
+the pipeline. The per-fold IQR cap is fitted on the training fold, and on a
+trending series the test fold's lags sit above that range by construction — so
+the cap clipped exactly the most recent information. Uncapped: ridge 0.814 →
+0.933, huber 0.717 → 0.944; no effect on a stationary series. Forecasting now
+never caps, for any model.
+
+### ~~T2-4 · Parallelism across candidates~~ — **DONE**
+
+`_evaluate_all` in `autoeng/modeling/search.py` runs the candidates of every
+stage — the full search, the halving screen, and the promoted survivors — in a
+loky pool, returning results in candidate order whatever order they finish in.
+The leaderboard is identical to the sequential one candidate by candidate (a
+test compares every metric at 1e-12, on both paths). `n_jobs=1` is the old
+sequential search; a pool failure falls back to it with a warning instead of
+losing the search.
+
+**The first design was wrong in a way only measurement showed.** Half the zoo
+already asks for every core (`n_jobs=-1` on the forests, XGBoost, LightGBM), so
+workers were capped at one thread each. The per-candidate times said what that
+cost: every candidate ran about 4x slower inside a one-thread worker — even
+logistic regression, whose preprocessing lost its BLAS threads — and LightGBM
+at one thread became the critical path. The cores are now divided: workers ×
+threads never exceeds the machine, which a probe checks from inside a worker.
+
+**How many workers, measured** (16 cores, each setting twice in alternating
+order, mean wall clock):
+
+| | 500-row full search | 12,000-row halving search |
+|---|---|---|
+| sequential | 196s | 109s |
+| 4 workers × 4 threads (**default**) | **74s (2.66x)** | 97s (1.11x) |
+| 8 × 1 | 94s (2.08x) | **69s (1.57x)** |
+| 8 × 2 | 95s (2.06x) | 98s (1.11x) |
+| 16 × 1 | 88s (2.24x) | **167s (0.65x)** |
+
+Repeats of one setting differed by up to 2x on this machine, so 4 × 4 and 8 × 1
+tie (~1.9x on average). What is not noise: a worker per core is *slower than
+doing nothing* on the halving search, whose six survivors are a short critical
+path. The default is a quarter of the cores as workers. The halving path gains
+little — its cost is the survivors, and there are only six.
+
+**Found along the way: `bagging` was paying for processes it did not need.**
+It is the one zoo member that parallelises with processes rather than threads,
+and on 500 rows a 5-fold CV took 18.2s at `n_jobs=-1` against 1.7s at 1, same
+score — almost all of it Windows process-pool start-up. It is now `n_jobs=1`;
+the forests keep theirs (threads, 2-3x faster at 12,000 rows).
+
+### ~~T2-5 · LLM front-end over grounded lookups~~ — **DONE**
+
+`ask <run_id> "<question>" --llm` (`autoeng/explain/llm_qa.py`). The keyword
+router in `qa.py` stays the default and the fallback; `qa.py` gained ten
+grounded lookups (`LOOKUPS`: leaderboard, candidate, winner, leakage, problem
+detection, cleaning, tuning, feature importances, operating point, promotion),
+each a plain function over the run's logged MLflow artifacts, and Claude
+(`claude-opus-5`, strict tool schemas, server-side refusal fallback) calls them
+as tools in a manual loop.
+
+**The roadmap's premise held, and it set the design:** the hard part — answers
+being true — was already done, so the front-end's job is to not undo it. Every
+number in the model's answer must match a number a tool returned, at the
+precision the answer states it or as a percentage of one; integers up to ten are
+exempt as counts and ordinals. An answer that fails is discarded and the keyword
+router answers instead, naming the numbers that could not be verified. Found
+while writing it: the first draft counted the *question* as evidence, so "did
+random_forest score 0.99?" answered "yes, 0.99" verified itself. The question is
+not evidence.
+
+Everything degrades to the router rather than failing: no SDK, no credentials,
+an API error, a refusal, a tool loop past six rounds. Pinned by 19 tests
+against a scripted client and a real MLflow-logged run.
+
+**Not exercised against the live API in this build** — the build machine has no
+Anthropic credentials. The request follows the SDK documentation (beta
+`server-side-fallback-2026-07-01` with `fallbacks: "default"`, effort `medium`),
+and without credentials `ask --llm` falls back to the keyword answer with the
+reason printed. The first run with a key should be read, not assumed.
+
+### ~~T2-6 · Model card per run~~ — **DONE**
+
+Every classification and regression run writes `<run>_model_card.md` beside
+its report and `model_card.json` beside its model
+(`autoeng/reporting/model_card.py`). Sections: model (algorithm, selection,
+artifact, library versions — read from the artifact's own
+`training_schema.json`, so the two cannot disagree), intended use, task,
+training data (rows, features, exclusions, time window, grouping), evaluation
+(held-out beside cross-validated, operating point, calibration), **results by
+segment**, and limitations.
+
+**Nothing in it is written from a template.** Intended use is the one thing the
+system cannot infer, so it comes from `run --intended-use "..."` or the card
+says *Not supplied* and how to supply it — never a plausible default.
+Limitations are pulled from the run's own checks: low detection confidence
+(with the runners-up, and only when the target was inferred rather than
+pinned), leakage flags quoted with their columns, grouping detected but turned
+off, a near-trivial threshold, calibration that looks worse on a small holdout,
+a small holdout, the text-drift blind spot, weak segments, and a model that was
+not persisted. A clean run's card says "none detected by this run's checks.
+That is not the same as none existing."
+
+**Segments are where an aggregate lies, so they are judged against noise.** The
+most important low-cardinality categoricals and the most important numeric
+(split into quartiles) are scored on the held-out set — ROC-AUC for binary,
+accuracy for multiclass, MAE for regression. A segment is flagged only when its
+whole 95% interval sits on the wrong side of the overall figure, with the
+interval bootstrapped by entity when the run is grouped. Under 30 held-out rows,
+or a binary segment with fewer than 5 of a class, gets a count and a note, not a
+number. Tested both ways: a channel whose label is a coin flip is flagged
+(ROC-AUC under 0.65 against the overall), and three channels that differ only
+by sampling noise are not.
+
+**The first real run found what the unit tests had not.** Its winner was
+`linear_svc_balanced`, which has no `predict_proba`: the segment code asked for
+one anyway, the error was caught, and the card simply had no segments section —
+silently, the failure this project keeps finding. ROC-AUC needs a ranking, not a
+probability, so a margin-only model is now segmented on `decision_function`;
+anything that still fails is printed on the card as "could not be computed",
+never dropped. The same run showed the card not saying that no decision
+threshold had been set (the report did); a binary model without one now carries
+that limitation.
+
+A card failure is written to `<run>_model_card_error.txt` and never raised: the
+search, fit and evaluation it describes have already finished.
 
 ### ~~T2-3 · Real text features~~ — **DONE**
 
@@ -579,7 +757,7 @@ Roughly 2,300 lines and 40 tests across all fourteen items; Tier 0 alone is
 about 530 lines and closes the gap between what the report claims and what the
 model does.
 
-Current state: 400 tests passing, 10/10 on unambiguous problem-type detection,
+Current state: 475 tests passing, 10/10 on unambiguous problem-type detection,
 7.4× search speedup from successive halving. **Tiers 0 and 1 are complete.**
 A trained model is persisted with its schema and a frozen holdout (T0-1),
 decides at an out-of-fold threshold (T0-2), and is split entity-aware (T0-3);
