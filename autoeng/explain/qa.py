@@ -175,3 +175,155 @@ def answer_question(tracking_uri: str, run_id: str, question: str) -> str:
         "the detected problem type/target, cleaning actions taken, hyperparameter tuning results, "
         "and feature importances for this run. Try rephrasing, or name a specific model."
     )
+
+
+# ---------------------------------------------------------------------------
+# Grounded lookups (T2-5). The same logged artifacts as the router above, as
+# small functions returning plain dicts, so an LLM front-end can call them as
+# tools and a verifier can check its answer against exactly what they returned.
+# ---------------------------------------------------------------------------
+
+_ARTIFACTS = {
+    "leaderboard": "model_leaderboard.json",
+    "explanation": "model_explanation.json",
+    "leakage_pre": "pre_training_leakage_report.json",
+    "leakage_post": "post_training_leakage_report.json",
+    "problem_decision": "problem_type_decision.json",
+    "structural": "structural_cleaning_report.json",
+    "hpo": "hpo_results.json",
+    "promotion": "promotion_decision.json",
+    "threshold": "decision_threshold.json",
+}
+
+
+class RunRecord:
+    """One run's logged artifacts, fetched on first use and then held."""
+
+    def __init__(self, tracking_uri: str, run_id: str):
+        self.tracking_uri, self.run_id = tracking_uri, run_id
+        self._cache: dict[str, object] = {}
+
+    def get(self, key: str):
+        if key not in self._cache:
+            self._cache[key] = get_run_artifact(self.tracking_uri, self.run_id, _ARTIFACTS[key])
+        return self._cache[key]
+
+    @property
+    def exists(self) -> bool:
+        return self.get("leaderboard") is not None
+
+
+def _missing(what: str) -> dict:
+    return {"available": False, "reason": f"No {what} was logged for this run."}
+
+
+def lookup_leaderboard(record: RunRecord, top_n: int = 10) -> dict:
+    board = record.get("leaderboard")
+    if not board:
+        return _missing("leaderboard")
+    metric = board["primary_metric"]
+    full = [r for r in board["results"] if r.get("status") == "ok" and r.get("evaluation_stage", "full") == "full"]
+    ranked = sorted(full, key=lambda r: r["metrics"].get(metric, float("-inf")), reverse=True)
+    others = [r for r in board["results"] if r not in ranked]
+    return {
+        "available": True, "primary_metric": metric,
+        "note": "Only fully cross-validated candidates are ranked; screened-out ones were scored on a "
+                "subsample and are not comparable.",
+        "ranked": [{"rank": i + 1, "name": r["name"], metric: r["metrics"].get(metric)}
+                   for i, r in enumerate(ranked[:top_n])],
+        "not_ranked": [{"name": r["name"], "status": r.get("status"), "error": r.get("error")} for r in others],
+    }
+
+
+def lookup_candidate(record: RunRecord, model: str) -> dict:
+    board, explanation = record.get("leaderboard"), record.get("explanation") or {}
+    if not board:
+        return _missing("leaderboard")
+    names = [r["name"] for r in board["results"]]
+    match = next((r for r in board["results"] if r["name"] == model), None)
+    if match is None:
+        mentioned = _find_mentioned_model(model, names)
+        match = next((r for r in board["results"] if r["name"] == mentioned), None)
+    if match is None:
+        return {"available": False, "reason": f"No candidate named '{model}'.", "candidates": names}
+    metric = board["primary_metric"]
+    score = match.get("metrics", {}).get(metric)
+    winner, winner_score = explanation.get("winner_name"), explanation.get("winner_score")
+    return {
+        "available": True, "name": match["name"], "status": match.get("status"),
+        "evaluation_stage": match.get("evaluation_stage"), "metrics": match.get("metrics"),
+        "error": match.get("error"), "is_winner": match["name"] == winner, "winner": winner,
+        "primary_metric": metric, "winner_score": winner_score,
+        "gap_to_winner": (winner_score - score) if (score is not None and winner_score is not None) else None,
+    }
+
+
+def lookup_winner(record: RunRecord) -> dict:
+    explanation = record.get("explanation")
+    if not explanation:
+        return _missing("model explanation")
+    keys = ("winner_name", "winner_score", "runner_up_name", "runner_up_score", "margin",
+            "cv_fold_std", "margin_within_noise", "hpo_improvement", "narrative")
+    return {"available": True, **{k: explanation.get(k) for k in keys}}
+
+
+def lookup_leakage(record: RunRecord) -> dict:
+    pre, post = record.get("leakage_pre") or {}, record.get("leakage_post") or {}
+    return {"available": True,
+            "before_training": pre.get("flags", []), "after_training": post.get("flags", [])}
+
+
+def lookup_problem_detection(record: RunRecord) -> dict:
+    decision = record.get("problem_decision")
+    if not decision:
+        return _missing("problem-type decision")
+    return {"available": True, "chosen": decision.get("chosen"), "confidence": decision.get("confidence"),
+            "alternatives": [{"problem_type": a.get("problem_type"), "target_column": a.get("target_column"),
+                              "score": a.get("score")} for a in decision.get("alternatives", [])]}
+
+
+def lookup_cleaning(record: RunRecord) -> dict:
+    structural = record.get("structural")
+    return {"available": True, "actions": (structural or {}).get("actions", [])} if structural \
+        else _missing("cleaning report")
+
+
+def lookup_tuning(record: RunRecord) -> dict:
+    hpo = record.get("hpo")
+    return {"available": True, "results": (hpo or {}).get("hpo_results", [])} if hpo is not None \
+        else _missing("tuning record")
+
+
+def lookup_feature_importances(record: RunRecord, top_n: int = 10) -> dict:
+    explanation = record.get("explanation")
+    if not explanation or not explanation.get("feature_importances"):
+        return _missing("feature importance")
+    return {"available": True, "method": explanation.get("importance_method"),
+            "features": [{"rank": i + 1, "feature": name, "importance": value}
+                         for i, (name, value) in enumerate(explanation["feature_importances"][:top_n])]}
+
+
+def lookup_operating_point(record: RunRecord) -> dict:
+    threshold = record.get("threshold")
+    return {"available": True, **threshold} if threshold else \
+        _missing("decision threshold (it is only chosen for binary classification)")
+
+
+def lookup_promotion(record: RunRecord) -> dict:
+    promotion = record.get("promotion")
+    return {"available": True, **promotion} if promotion else \
+        _missing("champion-challenger decision (one is only logged when a retrain is gated)")
+
+
+LOOKUPS = {
+    "leaderboard": lookup_leaderboard,
+    "candidate": lookup_candidate,
+    "winner": lookup_winner,
+    "leakage": lookup_leakage,
+    "problem_detection": lookup_problem_detection,
+    "cleaning": lookup_cleaning,
+    "tuning": lookup_tuning,
+    "feature_importances": lookup_feature_importances,
+    "operating_point": lookup_operating_point,
+    "promotion": lookup_promotion,
+}
