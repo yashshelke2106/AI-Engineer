@@ -54,6 +54,9 @@ from autoeng.modeling.time_series import run_time_series_search
 from autoeng.profiling.profiler import profile_dataset
 from autoeng.monitoring.drift import raw_column_importances
 from autoeng.registry.model_store import freeze_holdout, save_model, update_training_schema
+from autoeng.reporting.model_card import (
+    build_model_card, choose_segment_columns, render_model_card, segment_results,
+)
 from autoeng.reporting.report_generator import generate_report
 from autoeng.tracking.mlflow_tracker import log_pipeline_run
 
@@ -377,6 +380,58 @@ def _classification_metric(pipeline, X_test, y_test, n_classes: int) -> dict[str
     return metrics
 
 
+def _role_dict(roles) -> dict[str, Any]:
+    return {
+        "numeric_columns": roles.numeric_columns, "categorical_columns": roles.categorical_columns,
+        "low_card_categorical_columns": roles.low_card_categorical_columns,
+        "high_card_categorical_columns": roles.high_card_categorical_columns,
+        "datetime_columns": roles.datetime_columns, "text_columns": roles.text_columns,
+        "excluded_columns": roles.excluded_columns, "group_column": roles.group_column,
+    }
+
+
+def _card_segments(pipeline, X_test, y_test, clean_df, all_groups, role_dict: dict[str, Any],
+                   explanation: dict[str, Any] | None, problem_kind: str,
+                   threshold: float | None = None) -> dict[str, Any] | None:
+    """Held-out results per segment for the model card (T2-6).
+
+    Reported, never raised: a finished search, fit and evaluation must not be
+    lost because a segment could not be scored.
+    """
+    try:
+        groups_test = None
+        if all_groups is not None:
+            groups_test = np.asarray(all_groups)[clean_df.index.get_indexer(X_test.index)]
+        return segment_results(
+            pipeline, X_test, y_test, problem_kind=problem_kind,
+            candidate_columns=choose_segment_columns(role_dict, (explanation or {}).get("feature_importances")),
+            numeric_columns=role_dict.get("numeric_columns") or [],
+            groups=groups_test, threshold=threshold,
+        )
+    except Exception as e:  # noqa: BLE001 - a card section must never take down a run
+        return {"error": f"{type(e).__name__}: {e}", "segments": []}
+
+
+def _write_model_card(*, out_dir: Path, run_name: str, model_artifact, **card_inputs) -> str | None:
+    """Write `<run>_model_card.md` beside the report and `model_card.json` beside the model.
+
+    The JSON sits in the model directory so the card travels with the artifact it
+    describes. Like the model store and tracking, a failure here is written to a
+    file next to the report rather than raised after the run has finished.
+    """
+    try:
+        card = build_model_card(run_name=run_name, model_artifact=model_artifact, **card_inputs)
+        path = out_dir / f"{run_name}_model_card.md"
+        path.write_text(render_model_card(card), encoding="utf-8")
+        if model_artifact and model_artifact.get("status") == "saved":
+            Path(model_artifact["model_dir"], "model_card.json").write_text(
+                json.dumps(card, indent=2, default=str), encoding="utf-8")
+        return str(path)
+    except Exception as e:  # noqa: BLE001 - the card must never take down a finished run
+        (out_dir / f"{run_name}_model_card_error.txt").write_text(f"{type(e).__name__}: {e}", encoding="utf-8")
+        return None
+
+
 def run_pipeline(
     dataset_path: str,
     output_dir: str = "./runs",
@@ -394,6 +449,8 @@ def run_pipeline(
     cost_false_negative: float = 10.0,
     cost_false_positive: float = 1.0,
     parent_run_id: str | None = None,
+    intended_use: str | None = None,
+    forecast_horizon: int = 1,
 ) -> PipelineRunResult:
     dataset_path = str(dataset_path)
     out_dir = Path(output_dir)
@@ -453,6 +510,9 @@ def run_pipeline(
     held_out_operating_point: dict[str, Any] | None = None
     pre_leak_dict = {"flags": []}
     post_leak_dict = {"flags": []}
+    card_segments: dict[str, Any] | None = None
+    n_train_rows: int | None = None
+    n_test_rows: int | None = None
     clustering_summary = None
     ts_baselines = None
     ts_setup_dict = None
@@ -498,7 +558,7 @@ def run_pipeline(
             leaderboard.results.append(stack_result)
             leaderboard_dict = leaderboard.as_dict()
 
-        final_name, final_params, final_source, _, hpo_improvement = _select_final_model(
+        final_name, final_params, final_source, final_cv_score, hpo_improvement = _select_final_model(
             ranked, hpo_outcomes, stack_result, leaderboard.primary_metric,
         )
         if final_name is None:
@@ -541,13 +601,20 @@ def run_pipeline(
         explanation = explain_winner(
             leaderboard.results, final_name, final_pipeline, X_test, y_test,
             leaderboard.primary_metric, hpo_improvement=hpo_improvement,
-            selection_source=final_source,
+            selection_source=final_source, winner_score=final_cv_score,
+            tuned_scores={o.model_name: o.best_score for o in hpo_outcomes if o.tuned},
         )
         explanation_dict = explanation.as_dict()
 
         importances_dict = dict(explanation.feature_importances)
         post_leak = scan_post_training(leaderboard.primary_metric, held_out_metrics.get(leaderboard.primary_metric, float("nan")), importances_dict)
         post_leak_dict = post_leak.as_dict()
+        n_train_rows, n_test_rows = len(X_train), len(X_test)
+        card_segments = _card_segments(
+            final_pipeline, X_test, y_test, clean_df, all_groups, _role_dict(roles), explanation_dict,
+            "binary" if n_classes == 2 else "multiclass",
+            threshold=(threshold_choice or {}).get("threshold"),
+        )
 
     elif chosen.problem_type == ProblemType.REGRESSION:
         y_full = clean_df[target_column]
@@ -586,7 +653,7 @@ def run_pipeline(
             leaderboard.results.append(stack_result)
             leaderboard_dict = leaderboard.as_dict()
 
-        final_name, final_params, final_source, _, hpo_improvement = _select_final_model(
+        final_name, final_params, final_source, final_cv_score, hpo_improvement = _select_final_model(
             ranked, hpo_outcomes, stack_result, leaderboard.primary_metric,
         )
         if final_name is None:
@@ -613,17 +680,23 @@ def run_pipeline(
         explanation = explain_winner(
             leaderboard.results, final_name, final_pipeline, X_test, y_test,
             leaderboard.primary_metric, hpo_improvement=hpo_improvement,
-            selection_source=final_source,
+            selection_source=final_source, winner_score=final_cv_score,
+            tuned_scores={o.model_name: o.best_score for o in hpo_outcomes if o.tuned},
         )
         explanation_dict = explanation.as_dict()
 
         importances_dict = dict(explanation.feature_importances)
         post_leak = scan_post_training("r2", held_out_metrics.get("r2", float("nan")), importances_dict)
         post_leak_dict = post_leak.as_dict()
+        n_train_rows, n_test_rows = len(X_train), len(X_test)
+        card_segments = _card_segments(
+            final_pipeline, X_test, y_test, clean_df, all_groups, _role_dict(roles), explanation_dict,
+            "regression",
+        )
 
     elif chosen.problem_type == ProblemType.TIME_SERIES_FORECASTING:
         results, baselines, ts_setup = run_time_series_search(
-            clean_df, target_column, time_column, roles, cv_folds=cv_folds,
+            clean_df, target_column, time_column, roles, cv_folds=cv_folds, horizon=forecast_horizon,
         )
         ts_baselines = [b.as_dict() for b in baselines]
         ts_setup_dict = ts_setup.as_dict()
@@ -699,13 +772,7 @@ def run_pipeline(
     )
 
     profile_summary = profile.as_dict()
-    role_dict = {
-        "numeric_columns": roles.numeric_columns, "categorical_columns": roles.categorical_columns,
-        "low_card_categorical_columns": roles.low_card_categorical_columns,
-        "high_card_categorical_columns": roles.high_card_categorical_columns,
-        "datetime_columns": roles.datetime_columns, "text_columns": roles.text_columns,
-        "excluded_columns": roles.excluded_columns, "group_column": roles.group_column,
-    }
+    role_dict = _role_dict(roles)
 
     report_text = generate_report(
         source_path=dataset_path, ingestion_report=ingestion_report.as_dict(), profile_summary=profile_summary,
@@ -750,6 +817,17 @@ def run_pipeline(
         (out_dir / f"{run_name}_mlflow_error.txt").write_text(
             f"{type(e).__name__}: {e}", encoding="utf-8")
 
+    card_path = _write_model_card(
+        out_dir=out_dir, run_name=run_name, run_id=run_id, dataset_path=dataset_path,
+        problem_decision=decision.as_dict(), target_source=target_source, role_assignment=role_dict,
+        profile_summary=profile_summary, explanation=explanation_dict, held_out_metrics=held_out_metrics,
+        leaderboard=leaderboard_dict, threshold_choice=threshold_choice,
+        held_out_operating_point=held_out_operating_point, group_decision=group_decision.as_dict(),
+        pre_training_leakage=pre_leak_dict, post_training_leakage=post_leak_dict,
+        model_artifact=model_artifact, segments=card_segments,
+        n_train=n_train_rows, n_test=n_test_rows, intended_use=intended_use,
+    )
+
     return PipelineRunResult(
         run_id=run_id, problem_type=chosen.problem_type.value, target_column=target_column,
         report_text=report_text, report_path=str(report_path), leaderboard=leaderboard_dict,
@@ -757,5 +835,5 @@ def run_pipeline(
         decision_threshold=threshold_choice,
         group_decision=group_decision.as_dict(),
         extra={"mlflow_tracking_uri": mlflow_tracking_uri, "explanation": explanation_dict,
-               "held_out_operating_point": held_out_operating_point},
+               "held_out_operating_point": held_out_operating_point, "model_card_path": card_path},
     )

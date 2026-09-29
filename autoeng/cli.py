@@ -57,11 +57,22 @@ def main(argv: list[str] | None = None) -> int:
                        help="With --threshold-objective expected_cost: the price of a missed positive.")
     run_p.add_argument("--cost-false-positive", type=float, default=1.0,
                        help="With --threshold-objective expected_cost: the price of a false alarm.")
+    run_p.add_argument("--horizon", type=int, default=1,
+                       help="Time series only: how many steps ahead the forecast will be used. Every model "
+                            "and baseline is scored at this horizon, from the series as it stood that far "
+                            "before the target. Default 1 (one step ahead).")
+    run_p.add_argument("--intended-use", default=None,
+                       help="What this model is for and who may rely on it, for the model card. The system "
+                            "cannot infer this; without it the card says so rather than guessing.")
 
     ask_p = sub.add_parser("ask", help="Ask a question about a past run, grounded in its logged experiment history.")
     ask_p.add_argument("run_id")
     ask_p.add_argument("question")
     ask_p.add_argument("--runs-dir", default="./runs")
+    ask_p.add_argument("--llm", action="store_true",
+                       help="Answer through Claude over the same grounded lookups, for open-ended phrasing. "
+                            "Every number in the answer is checked against the logged run; an answer that "
+                            "fails the check, or any API problem, falls back to the keyword answer.")
 
     serve_p = sub.add_parser(
         "serve", help="Serve a persisted model over HTTP under its training contract.")
@@ -129,6 +140,7 @@ def main(argv: list[str] | None = None) -> int:
             threshold_objective=args.threshold_objective, precision_floor=args.precision_floor,
             cost_false_negative=args.cost_false_negative,
             cost_false_positive=args.cost_false_positive,
+            intended_use=args.intended_use, forecast_horizon=args.horizon,
         )
         print(f"\nRun ID: {result.run_id}")
         print(f"Problem type: {result.problem_type} (target: {result.target_column})")
@@ -155,6 +167,9 @@ def main(argv: list[str] | None = None) -> int:
                       f"cannot show this model degrading, so drift and the gate also compare ROC-AUC "
                       f"({chosen['metrics'].get('roc_auc', float('nan')):.3f} out of fold).")
         print(f"Report written to: {result.report_path}")
+        card_path = (result.extra or {}).get("model_card_path")
+        print(f"Model card written to: {card_path}" if card_path else
+              "Model card: not written (see the *_model_card_error.txt beside the report).")
         return 0
 
     if args.command == "serve":
@@ -305,7 +320,17 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "ask":
         uri = f"sqlite:///{args.runs_dir}/mlflow.db"
-        print(answer_question(uri, args.run_id, args.question))
+        if not args.llm:
+            print(answer_question(uri, args.run_id, args.question))
+            return 0
+        from autoeng.explain.llm_qa import answer_with_llm
+
+        answer = answer_with_llm(uri, args.run_id, args.question)
+        print(answer.text)
+        if answer.note:
+            print(f"\n[{answer.note}]")
+        elif answer.tool_calls:
+            print("\n[Checked against: " + ", ".join(sorted({c["tool"] for c in answer.tool_calls})) + "]")
         return 0
 
     if args.command == "list-runs":
