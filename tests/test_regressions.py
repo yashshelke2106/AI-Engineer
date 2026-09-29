@@ -202,3 +202,44 @@ class TestIdentifierExclusion:
         pipeline.fit(X, df["churned"])
         names = list(pipeline.named_steps["encode"].get_feature_names_out())
         assert not any("customer_id" in n for n in names)
+
+
+class TestTunedWinnerIsExplainedAtItsTunedScore:
+    """
+    BUG, found on a real run: the explanation read the winner's score from the
+    leaderboard, which holds the UNTUNED configuration. A winner selected by
+    tuning (0.6866 -> 0.7007) was reported at 0.6866, behind a runner-up at
+    0.6899 — "margin -0.0033" — while the selection had actually compared 0.7007
+    against that runner-up's own tuned 0.6984. Report, Q&A and model card all
+    quoted the stale number.
+    """
+
+    def _explain(self, clean_classification_df, **kwargs):
+        from autoeng.explain.explainer import explain_winner
+        from autoeng.modeling.search import ModelResult
+
+        roles = assign_feature_roles(profile_dataset(clean_classification_df), target_column="churned")
+        X, y = clean_classification_df[roles.feature_columns], clean_classification_df["churned"]
+        pipe = _build_pipeline_for_model("logistic_regression",
+                                         get_classification_models(n_classes=2)["logistic_regression"],
+                                         roles, "classification").fit(X, y)
+        board = [ModelResult("linear_svc_balanced", "ok", {"roc_auc": 0.6866}),
+                 ModelResult("logistic_regression_balanced", "ok", {"roc_auc": 0.6899}),
+                 ModelResult("knn", "ok", {"roc_auc": 0.61})]
+        return explain_winner(board, "linear_svc_balanced", pipe, X, y, "roc_auc",
+                              hpo_improvement=0.0141, selection_source="hyperparameter tuning", **kwargs)
+
+    def test_the_selected_score_and_a_tuned_rival_are_compared(self, clean_classification_df):
+        explanation = self._explain(clean_classification_df, winner_score=0.7007,
+                                    tuned_scores={"linear_svc_balanced": 0.7007,
+                                                  "logistic_regression_balanced": 0.6984})
+        assert explanation.winner_score == pytest.approx(0.7007)
+        assert explanation.runner_up_name == "logistic_regression_balanced"
+        assert explanation.runner_up_score == pytest.approx(0.6984)
+        assert explanation.margin == pytest.approx(0.0023)
+        assert "0.7007" in explanation.narrative and "-0.0033" not in explanation.narrative
+
+    def test_without_a_selection_score_it_still_uses_the_best_it_knows(self, clean_classification_df):
+        explanation = self._explain(clean_classification_df, tuned_scores={"linear_svc_balanced": 0.7007})
+        assert explanation.winner_score == pytest.approx(0.7007)
+        assert explanation.margin > 0

@@ -140,19 +140,30 @@ def explain_winner(
     leaderboard_results, winner_name: str, fitted_pipeline,
     X_sample: pd.DataFrame, y_sample: pd.Series, primary_metric: str,
     hpo_improvement: float | None = None, selection_source: str | None = None,
+    winner_score: float | None = None, tuned_scores: dict[str, float] | None = None,
 ) -> ModelExplanation:
-    ok_sorted = sorted(
-        [r for r in leaderboard_results if r.status == "ok"],
-        key=lambda r: r.metrics.get(primary_metric, float("-inf")), reverse=True,
-    )
-    winner_result = next((r for r in ok_sorted if r.name == winner_name), None)
-    winner_score = winner_result.metrics.get(primary_metric, float("nan")) if winner_result else float("nan")
+    """
+    `winner_score` is the cross-validated score the selection actually used. For
+    a tuned winner that is the TUNED score; the leaderboard only holds the
+    untuned one. Reading it from the leaderboard reported a real run's tuned
+    winner at 0.6866 behind a runner-up at 0.6899 (margin -0.0033), when the
+    selection had compared 0.7007 against that runner-up's own tuned 0.6984
+    (margin +0.0023). `tuned_scores` holds the other tuned candidates, so each
+    rival is compared at its best as well.
+    """
+    ok_results = [r for r in leaderboard_results if r.status == "ok"]
+    best_score: dict[str, float] = {}
+    for r in ok_results:
+        score = r.metrics.get(primary_metric)
+        if score is not None:
+            best_score[r.name] = max(best_score.get(r.name, float("-inf")), score)
+    for name, score in (tuned_scores or {}).items():
+        best_score[name] = max(best_score.get(name, float("-inf")), score)
 
-    runner_up = ok_sorted[1] if len(ok_sorted) > 1 and ok_sorted[0].name == winner_name else (
-        ok_sorted[0] if ok_sorted and ok_sorted[0].name != winner_name else None
-    )
-    runner_up_name = runner_up.name if runner_up else None
-    runner_up_score = runner_up.metrics.get(primary_metric) if runner_up else None
+    if winner_score is None:
+        winner_score = best_score.get(winner_name, float("nan"))
+    rivals = sorted(((n, s) for n, s in best_score.items() if n != winner_name), key=lambda t: t[1], reverse=True)
+    runner_up_name, runner_up_score = rivals[0] if rivals else (None, None)
     margin = (winner_score - runner_up_score) if runner_up_score is not None else None
 
     scoring = "roc_auc" if primary_metric == "roc_auc" else ("r2" if primary_metric == "r2" else primary_metric)
