@@ -103,7 +103,11 @@ def get_classification_models(n_classes: int = 2) -> dict[str, ModelFactory]:
         "gradient_boosting": lambda: GradientBoostingClassifier(random_state=RANDOM_STATE),
         "hist_gradient_boosting": lambda: HistGradientBoostingClassifier(random_state=RANDOM_STATE),
         "adaboost": lambda: AdaBoostClassifier(random_state=RANDOM_STATE),
-        "bagging": lambda: BaggingClassifier(n_jobs=-1, random_state=RANDOM_STATE),
+        # n_jobs=1, unlike the forests: bagging parallelises with PROCESSES, and on
+        # 500 rows a 5-fold CV took 18.2s at n_jobs=-1 against 1.7s at 1, same
+        # score, almost all of it process-pool start-up. The forests use threads
+        # and keep n_jobs=-1 (2-3x faster at 12,000 rows).
+        "bagging": lambda: BaggingClassifier(n_jobs=1, random_state=RANDOM_STATE),
         "mlp": lambda: MLPClassifier(max_iter=500, random_state=RANDOM_STATE),
         "lda": lambda: LinearDiscriminantAnalysis(),
         # A small reg_param shrinks toward a shared covariance estimate, which
@@ -167,7 +171,8 @@ def get_regression_models() -> dict[str, ModelFactory]:
         "gradient_boosting": lambda: GradientBoostingRegressor(random_state=RANDOM_STATE),
         "hist_gradient_boosting": lambda: HistGradientBoostingRegressor(random_state=RANDOM_STATE),
         "adaboost": lambda: AdaBoostRegressor(random_state=RANDOM_STATE),
-        "bagging": lambda: BaggingRegressor(n_jobs=-1, random_state=RANDOM_STATE),
+        # n_jobs=1: see the classifier — process start-up, not parallel speed.
+        "bagging": lambda: BaggingRegressor(n_jobs=1, random_state=RANDOM_STATE),
         "mlp": lambda: MLPRegressor(max_iter=500, random_state=RANDOM_STATE),
     }
     if _HAS_XGB:
