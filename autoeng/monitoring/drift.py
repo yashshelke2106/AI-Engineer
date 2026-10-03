@@ -270,7 +270,17 @@ def _numeric_bins(reference: dict[str, Any]) -> tuple[np.ndarray | None, np.ndar
     ordered = sorted(quantiles.items(), key=lambda kv: float(kv[0]))
     values = [float(v) for _, v in ordered]
     if len(set(values)) < 2:
-        return None, None, None, "the training column was constant, so there are no bins to compare"
+        # A constant reference is a point mass, not an unmeasurable column: below,
+        # at, and above it are three bins, the outer two carrying only the usual
+        # 1/(n+1) tail. Skipping it hid exactly the case text drift needs — a
+        # corpus whose every word is known has an unknown-word share of 0 on every
+        # document, and any live departure from 0 is the signal.
+        constant = values[0]
+        edges = np.array([np.nextafter(constant, -np.inf), constant], dtype=float)
+        cumulative = np.array([0.0, 1.0])
+        n = int(reference.get("n_observed") or 0)
+        tail = 1.0 / (n + 1) if n > 0 else 0.0
+        return edges, cumulative, np.array([tail, 1.0 - 2.0 * tail, tail]), ""
     cdf = reference.get("cdf") or {}
     if not cdf and len(set(values)) < len(values):
         return None, None, None, (
@@ -505,6 +515,31 @@ def raw_column_importances(
 # The three checks
 # --------------------------------------------------------------------------
 
+def _text_views(series: pd.Series, reference: dict[str, Any]) -> list[tuple[str, pd.Series, dict[str, Any]]]:
+    """The numeric views of a text column its reference supports: length, word
+    count, and — from artifacts built since text drift was measured — the share
+    of each document's words missing from the stored training vocabulary
+    (`autoeng.common.text`).
+
+    Until this existed, a text column was skipped outright with a note, so a
+    model reading the words had no drift signal on them at all.
+    """
+    from autoeng.common.text import coverage
+
+    text = series.astype("object").where(series.notna())
+    as_text = text.where(text.isna(), text.astype(str))
+    views: list[tuple[str, pd.Series, dict[str, Any]]] = []
+    if reference.get("length"):
+        views.append(("length", as_text.str.len(), reference["length"]))
+    if reference.get("word_count"):
+        views.append(("word count", as_text.str.split().map(len, na_action="ignore"), reference["word_count"]))
+    if reference.get("unknown_share") and reference.get("vocabulary") is not None:
+        views.append(("unknown words",
+                      pd.Series(1.0 - coverage(as_text, reference["vocabulary"]), index=series.index),
+                      reference["unknown_share"]))
+    return views
+
+
 def check_data_drift(
     observed: pd.DataFrame,
     schema: dict[str, Any],
@@ -599,50 +634,70 @@ def check_data_drift(
 
     features: list[FeatureDrift] = []
     unsized_references: list[str] = []
-    for column in feature_columns:
-        meta = column_meta.get(column) or {}
-        reference = meta.get("reference") or {}
-        kind = reference.get("kind", "numeric")
-        if kind not in ("categorical", "numeric"):
-            # datetime / text references exist but have no settled drift
-            # measure here; reported as unmeasured rather than silently zero.
-            notes.append(f"'{column}' has a {kind} reference distribution, which is not compared.")
-            continue
+    measured_values: dict[str, pd.Series] = {}
+    measured_references: dict[str, dict[str, Any]] = {}
 
+    def measure(label: str, values: pd.Series, reference: dict[str, Any], kind: str, importance: float) -> None:
         if kind == "categorical":
-            n_window = sizing.count(observed[column], reference)
+            n_window = sizing.count(values, reference)
         else:
             # Sized over the bins PSI compares: bin membership is what clusters.
             edges = _numeric_bins(reference)[0]
-            n_window = sizing.count(pd.to_numeric(observed[column], errors="coerce"), reference, bins=edges)
+            n_window = sizing.count(pd.to_numeric(values, errors="coerce"), reference, bins=edges)
         n_reference = reference.get("n_effective")
         if n_reference is None or (kind == "numeric" and reference.get("n_effective_mean") is None):
             if group_column:
-                unsized_references.append(column)
+                unsized_references.append(label)
         if n_reference is None:
             n_reference = reference.get("n_observed")
 
         drift_of = _categorical_drift if kind == "categorical" else _numeric_drift
-        psi, statistic, p_value, detail, n_bins = drift_of(
-            observed[column], reference, column, n_window, n_reference, sizing,
-        )
+        psi, statistic, p_value, detail, n_bins = drift_of(values, reference, label, n_window, n_reference, sizing)
         if psi is None:
             # Reported as unmeasured, never as a zero: a zero reads as
             # "did not move", which nobody checked.
-            notes.append(f"'{column}' is not measured: {detail}.")
-            continue
+            notes.append(f"'{label}' is not measured: {detail}.")
+            return
 
         floor = noise_floor(n_bins, n_reference, n_window)
         excess = max(0.0, float(psi) - floor)
-        importance = float(weights.get(column, 0.0))
         features.append(FeatureDrift(
-            column=column, kind=kind, psi=float(psi), severity=_severity_from_psi(excess),
+            column=label, kind=kind, psi=float(psi), severity=_severity_from_psi(excess),
             importance=importance, weighted_psi=float(psi) * importance,
-            n_observed=int(observed[column].notna().sum()),
+            n_observed=int(values.notna().sum()),
             statistic=statistic, p_value=p_value, detail=detail,
             noise_floor=floor, excess_psi=excess, n_effective=n_window,
             n_effective_reference=float(n_reference) if n_reference is not None else None,
         ))
+        measured_values[label] = values
+        measured_references[label] = reference
+
+    for column in feature_columns:
+        meta = column_meta.get(column) or {}
+        reference = meta.get("reference") or {}
+        kind = reference.get("kind", "numeric")
+        importance = float(weights.get(column, 0.0))
+        if kind == "text":
+            # Numeric views of the column, each measured like any numeric
+            # feature; the column's importance is shared between them so the
+            # text column weighs what it weighs, not three times that.
+            views = _text_views(observed[column], reference)
+            if not views:
+                notes.append(f"'{column}' is a text column whose reference stores no measurable view; "
+                             f"it is not compared. Re-train to refresh the artifact.")
+                continue
+            if not any(name == "unknown words" for name, _, _ in views):
+                notes.append(f"'{column}' is compared on length and word count only: this artifact predates "
+                             f"vocabulary tracking, so a change of words that keeps their length is invisible.")
+            for name, values, view_reference in views:
+                measure(f"{column} ({name})", values, view_reference, "numeric", importance / len(views))
+            continue
+        if kind not in ("categorical", "numeric"):
+            # A datetime reference exists but has no settled drift measure here;
+            # reported as unmeasured rather than silently zero.
+            notes.append(f"'{column}' has a {kind} reference distribution, which is not compared.")
+            continue
+        measure(column, observed[column], reference, kind, importance)
 
     if unsized_references:
         notes.append(
@@ -656,9 +711,9 @@ def check_data_drift(
         feature.p_value_adjusted = adjusted
     for feature in features:
         if feature.kind == "numeric":
-            reference = (column_meta.get(feature.column) or {}).get("reference") or {}
+            reference = measured_references[feature.column]
             feature.detectable_shift_sd = _detectable_shift_sd(
-                pd.to_numeric(observed[feature.column], errors="coerce"), reference, sizing, len(features),
+                pd.to_numeric(measured_values[feature.column], errors="coerce"), reference, sizing, len(features),
             )
 
     weighted_psi = float(sum(f.weighted_psi for f in features))

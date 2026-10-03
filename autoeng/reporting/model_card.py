@@ -212,8 +212,9 @@ def _limitations(*, problem_decision, target_source, pre_leak, post_leak, thresh
         notes.append(f"The held-out set is {n_test} rows, so its figures carry wide uncertainty; the cross-validated "
                      f"figures use the whole training partition and are the steadier estimate.")
     if role_assignment.get("text_columns"):
-        notes.append("Drift monitoring watches text columns only through length and word count. A change in "
-                     "vocabulary would not be seen, even though the model reads the words.")
+        notes.append("Drift watches text columns through their length, word count and share of unknown words. "
+                     "A change in how often familiar words are used — the same vocabulary in new proportions — "
+                     "is not measured directly; prediction drift is the backstop for it.")
     flagged = [s for s in (segments or {}).get("segments", []) if s.get("flag")]
     for s in flagged:
         notes.append(f"Weaker on `{s['column']}` = {s['segment']}: {segments['metric']} {s['value']:.3f} against "

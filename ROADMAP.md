@@ -597,7 +597,7 @@ Limitations are pulled from the run's own checks: low detection confidence
 (with the runners-up, and only when the target was inferred rather than
 pinned), leakage flags quoted with their columns, grouping detected but turned
 off, a near-trivial threshold, calibration that looks worse on a small holdout,
-a small holdout, the text-drift blind spot, weak segments, and a model that was
+a small holdout, the text-drift limits, weak segments, and a model that was
 not persisted. A clean run's card says "none detected by this run's checks.
 That is not the same as none existing."
 
@@ -687,11 +687,28 @@ mutual-information screen over the components — the `NumericInteractionFeaturi
 pattern — is the remaining candidate, unbuilt because it needs its own
 measurement on small datasets before it can be trusted to drop features.
 
-**Known limit:** a text column's drift reference stores only length and word
-count (`_text_reference`), so a *vocabulary* shift — new slang, new product
-names, a new error message — moves nothing the monitor watches even though the
-model now reads the words. Prediction drift catches it only indirectly. Adding
-term-frequency drift is the natural follow-up.
+**Follow-up, done — and a correction.** This section first said a text column's
+drift was measured on length and word count. It was not measured at all:
+`check_data_drift` skipped text references with a note. Text columns now have
+three numeric views measured like any numeric feature — length, word count, and
+the share of each document's words the training corpus did not know, against a
+vocabulary stored in the artifact and a leave-one-out reference (a word is known
+only if two *other* training documents had it). On real newsgroups, reference
+980 baseball/medicine posts, windows of 300:
+
+| window (40 each) | unknown words flagged | report not ok | length / word count flagged |
+|---|---|---|---|
+| no drift (other same-topic posts) | 0 | 2 (the FDR rate) | 0 / 0 |
+| 30% from four other newsgroups | 4 | **40** (investigate) | 0 / 0 |
+| 100% from other newsgroups | **40** | 40 | 0 / 0 |
+
+Two fixes it needed first. As *coverage*, an all-known corpus piles at 1.0 —
+the top edge, where a live 0.83 fell into the 1.0 bin and rewriting every
+ticket measured PSI 0 — so it is stored as the unknown share, piled at 0. And
+drift refused constant references outright; a point mass is now three bins
+(below, at, above), the outer two carrying the usual 1/(n+1). Still unseen:
+familiar words used in new proportions (on the ticket fixture, an angrier mix
+moved length in 21 of 40 windows and unknown words in none).
 
 ### ~~T2-1 · Probability calibration~~ — **DONE**
 
@@ -757,7 +774,7 @@ Roughly 2,300 lines and 40 tests across all fourteen items; Tier 0 alone is
 about 530 lines and closes the gap between what the report claims and what the
 model does.
 
-Current state: 475 tests passing, 10/10 on unambiguous problem-type detection,
+Current state: 483 tests passing, 10/10 on unambiguous problem-type detection,
 7.4× search speedup from successive halving. **Tiers 0 and 1 are complete.**
 A trained model is persisted with its schema and a frozen holdout (T0-1),
 decides at an out-of-fold threshold (T0-2), and is split entity-aware (T0-3);

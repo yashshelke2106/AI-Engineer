@@ -186,7 +186,7 @@ class TestLimitationsComeFromTheRun:
     def test_text_features_carry_their_drift_blind_spot(self):
         card = _card(role_assignment={"numeric_columns": [], "categorical_columns": [], "datetime_columns": [],
                                       "text_columns": ["ticket"], "excluded_columns": []})
-        assert any("vocabulary would not be seen" in n for n in card["limitations"])
+        assert any("same vocabulary in new proportions" in n for n in card["limitations"])
 
     def test_an_unpersisted_model_is_stated(self):
         card = _card(model_artifact={"status": "failed", "error": "PicklingError: boom"})

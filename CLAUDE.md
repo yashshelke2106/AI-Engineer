@@ -16,7 +16,7 @@ python -m autoeng.cli run data.csv --target y   # or pin the target
 python -m autoeng.cli ask <run_id> "why did you reject random_forest?"
 python -m autoeng.cli ask <run_id> "..." --llm    # Claude over the same lookups, numbers checked
 python -m autoeng.cli run series.csv --horizon 13 # forecasts scored 13 steps ahead
-pytest tests/ -q                                # 475 tests, ~560s
+pytest tests/ -q                                # 483 tests, ~340-560s (machine load varies)
 python scripts/calibrate_detection.py           # detection accuracy, 10/10 expected
 ```
 
@@ -217,7 +217,7 @@ checkable because this exists.
 **7j. The model card states only what the run measured.** T2-6's card
 (`autoeng/reporting/model_card.py`) is assembled from the run's own numbers and
 checks: leakage flags, detection confidence, `near_trivial`, grouping, the
-text-drift blind spot, held-out size. Intended use is the one thing the system
+text-drift limits, held-out size. Intended use is the one thing the system
 cannot know, so it comes from `--intended-use` or the card says *Not supplied* —
 never a plausible-sounding default. A segment is flagged only when its whole 95%
 interval sits on the wrong side of the overall figure (entity-resampled when
@@ -396,11 +396,20 @@ that. `target_lag_{h}` is the origin level differencing rebuilds from.
   `tests/test_text_features.py`'s corpus prunes to TEN terms and goes 0.50 ->
   0.95 on them. Any future screen has to separate those two cases, and neither
   vocabulary size nor per-term significance does.
-- **Text drift is measured on length and word count only.** `_text_reference`
-  stores those two distributions, so a vocabulary shift — new slang, a new error
-  message, a renamed product — moves nothing the monitor watches, even though
-  the model now reads the words (T2-3). Do not read `ok` on a text-heavy model as
-  evidence its language has not changed.
+- **Text columns were not drift-checked at all, and the docs said otherwise.**
+  `check_data_drift` skipped any text reference with a note, while CLAUDE.md, the
+  README and the model card all claimed length and word count were watched —
+  written from what `_text_reference` stored, not from what drift read. Each
+  text column now has three numeric views (`_text_views`): length, word count,
+  and the unknown-word share against the stored training vocabulary
+  (`autoeng/common/text.py`). The reference scores each training document
+  leave-one-out — a word is known only if two OTHER documents had it — or every
+  live window would look drifted; on real newsgroups the training median was
+  0.090 and new same-topic posts 0.088. Store it as the UNKNOWN share: as
+  coverage the mass piles at 1.0, the top edge, where a live 0.83 shares the
+  1.0 bin and a full rewrite measured PSI 0. And a constant reference is now a
+  point mass with three bins, not "unmeasurable" — that skip had hidden every
+  all-known corpus. Still unseen: familiar words in new proportions.
 - **Parallelising a search that already parallelises oversubscribes silently.**
   Half the zoo asks for every core on its own. T2-4 first capped each pool
   worker at one thread, and every candidate then ran ~4x slower inside a
@@ -507,7 +516,7 @@ autoeng/
 
 ## Current state
 
-475 tests passing. Detection 10/10 on unambiguous cases (iris is genuinely
+483 tests passing. Detection 10/10 on unambiguous cases (iris is genuinely
 ambiguous and excluded). Successive halving gives 7.4× speedup with an
 identical winner.
 

@@ -29,7 +29,7 @@ python scripts/generate_grouped.py --customers 200 --out data/new_customers.csv 
 python -m autoeng.cli gate <champion> <challenger> --models-root runs/production --apply
 python scripts/generate_grouped.py --customers 300 --concept 0.7 --out data/concept.csv  # a real concept change
 
-pytest tests/ -q                                           # 475 tests, ~560s
+pytest tests/ -q                                           # 483 tests, ~340-560s (machine load varies)
 python scripts/calibrate_detection.py                      # detection accuracy harness
 ```
 
@@ -389,6 +389,13 @@ part:
   to skip boilerplate text was measured and *refused*: on the posts where the
   components are worth 0.32 ROC-AUC, only one term cleared Bonferroni, so the
   screen would have rejected the case it was for.
+- **Text drift was claimed and not measured.** The docs said text columns were
+  watched through length and word count; drift actually skipped them with a
+  note. They now get length, word count and the share of unknown words, scored
+  against a leave-one-out reference so ordinary rare words are not drift: on
+  real newsgroup posts, 0 of 40 unshifted windows flagged, a 30% topic mix
+  raised every window to investigate, a full topic switch flagged every window
+  — and length and word count saw none of it.
 - **A header made of sentences was read as data.** `csv.Sniffer().has_header`
   votes by comparing row one with the rows below, and free text — never the same
   length twice — casts no vote, so a file whose every column is text was declared
@@ -545,7 +552,7 @@ autoeng/
   reporting/       Markdown report generation
   pipeline.py      end-to-end orchestration
   cli.py           command-line entry point
-tests/             475 tests: planted leaks, regressions for every shipped bug, unit tests
+tests/             483 tests: planted leaks, regressions for every shipped bug, unit tests
 scripts/           detection calibration harness
 data/              synthetic + real validation datasets
 runs/              reports + MLflow store from the validation runs

@@ -260,19 +260,37 @@ def _datetime_reference(series: pd.Series) -> dict[str, Any]:
     return ref
 
 
-def _text_reference(series: pd.Series) -> dict[str, Any]:
-    """Free text is modelled through length/word-count stats, so that is the
-    space its drift is measurable in — not the raw strings."""
-    observed = series.dropna().astype(str)
+def _text_reference(series: pd.Series, groups: Any = None) -> dict[str, Any]:
+    """Three numeric views of a free-text column, each an ordinary numeric
+    reference so drift reads it with the same noise floor and effective sizes as
+    any other column: length, word count, and the unknown-word share — the share
+    of a document's words the training corpus did NOT know (`autoeng.common.text`). The
+    model reads the words (T2-3), so a change of vocabulary has to be visible;
+    length and word count alone cannot see one.
+
+    Every view is computed over the FULL column (NaN where missing) so `groups`
+    stays aligned row for row.
+    """
+    from autoeng.common.text import build_vocabulary
+
+    text = series.astype("object").where(series.notna())
     ref: dict[str, Any] = {
         "kind": "text",
-        "n_observed": int(len(observed)),
+        "n_observed": int(text.notna().sum()),
         "missing_ratio": float(series.isna().mean()) if len(series) else 0.0,
     }
-    if observed.empty:
+    if not ref["n_observed"]:
         return ref
-    ref["length"] = _numeric_reference(observed.str.len())
-    ref["word_count"] = _numeric_reference(observed.str.split().map(len))
+    as_text = text.where(text.isna(), text.astype(str))
+    ref["length"] = _numeric_reference(as_text.str.len(), groups)
+    ref["word_count"] = _numeric_reference(as_text.str.split().map(len, na_action="ignore"), groups)
+    vocabulary, coverage = build_vocabulary(as_text)
+    ref["vocabulary"] = vocabulary
+    # Stored as the UNKNOWN share (1 - coverage), so a corpus whose every word is
+    # known piles its mass at 0, the lower bound, where quantile bins resolve it.
+    # As coverage the pile sits at 1.0, and a live document at 0.83 fell into the
+    # same bin as 1.0: a rewrite of every ticket measured PSI 0.
+    ref["unknown_share"] = _numeric_reference(pd.Series(1.0 - coverage, index=series.index), groups)
     return ref
 
 
@@ -280,7 +298,7 @@ def _column_reference(series: pd.Series, semantic_type: SemanticType, groups: An
     if semantic_type == SemanticType.DATETIME:
         return _datetime_reference(series)
     if semantic_type == SemanticType.TEXT_FREE:
-        return _text_reference(series)
+        return _text_reference(series, groups)
     if semantic_type in CATEGORICAL_REFERENCE_TYPES:
         return _categorical_reference(series, groups)
     return _numeric_reference(series, groups)
