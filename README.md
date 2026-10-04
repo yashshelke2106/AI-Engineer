@@ -1,5 +1,7 @@
 # Autonomous ML Engineer — Core Loop
 
+[![tests](https://github.com/yashshelke2106/AI-Engineer/actions/workflows/tests.yml/badge.svg?branch=master)](https://github.com/yashshelke2106/AI-Engineer/actions/workflows/tests.yml)
+
 An AutoML system that takes a raw, undescribed dataset and produces a
 trained, explained model: it infers the problem type, cleans and engineers
 features without hand-coded per-dataset rules, benchmarks 20+ algorithms

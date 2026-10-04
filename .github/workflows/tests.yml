@@ -1,0 +1,52 @@
+# Every push and pull request runs the full suite and the detection
+# calibration, on Linux and on Windows.
+#
+# Windows is not a courtesy: the project is developed there, and one class of
+# bug only exists there. Path.write_text()/read_text() default to cp1252 on
+# Windows, and every report written there was once silently mis-encoded (see
+# CLAUDE.md). PYTHONUTF8 is therefore deliberately NOT set — UTF-8 mode would
+# hide exactly the call that forgets encoding="utf-8".
+name: tests
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    env:
+      MLFLOW_DISABLE_AGENT_HINT: "1"
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      # Exact pins (see requirements.txt): the versions recorded in every saved
+      # artifact must be the versions the suite passed on.
+      - name: Install pinned dependencies
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: Problem-type detection, 10/10 is the bar
+        run: python scripts/calibrate_detection.py
+
+      - name: Test suite
+        run: python -m pytest tests/ -q -p no:warnings --durations=15

@@ -11,7 +11,8 @@
 # lifted numpy from 1.26.4 to 2.2.6 mid-session; both satisfied the old
 # `numpy>=1.26` line.
 #
-# These are the versions the 91-test suite passes on. To move one, change it
+# These are the versions the full suite passes on, locally and in CI on Linux
+# and Windows (.github/workflows/tests.yml). To move one, change it
 # here, run `pytest tests/ -q` and `python scripts/calibrate_detection.py`
 # (10/10 is the bar), and commit the pin with the result.
 

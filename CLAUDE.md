@@ -503,6 +503,10 @@ autoeng/
 
 ## Conventions
 
+- **CI runs the suite and `calibrate_detection.py` on Linux and Windows** for
+  every push and pull request (`.github/workflows/tests.yml`), with UTF-8 mode
+  deliberately OFF: local runs had used `PYTHONUTF8=1`, which hides exactly the
+  cp1252 trap below. Run locally without it before trusting a pass on Windows.
 - **Write the failing test first.** Every "done when" in `ROADMAP.md` is phrased
   as an assertion deliberately. Two of six bugs found in this build failed
   *silently* — wrong numbers, no exception — and both were caught only because
