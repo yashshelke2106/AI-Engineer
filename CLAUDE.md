@@ -16,7 +16,7 @@ python -m autoeng.cli run data.csv --target y   # or pin the target
 python -m autoeng.cli ask <run_id> "why did you reject random_forest?"
 python -m autoeng.cli ask <run_id> "..." --llm    # Claude over the same lookups, numbers checked
 python -m autoeng.cli run series.csv --horizon 13 # forecasts scored 13 steps ahead
-pytest tests/ -q                                # 483 tests, ~340-560s (machine load varies)
+pytest tests/ -q                                # 503 tests, ~6-9 min (machine load varies)
 python scripts/calibrate_detection.py           # detection accuracy, 10/10 expected
 ```
 
@@ -241,6 +241,20 @@ failure (no SDK, no credentials, API error, refusal, a tool loop past
 `MAX_TOOL_TURNS`). Never loosen the check to make an answer through; never let
 `ask` depend on the API. Adding a lookup means adding its tool to `TOOLS`, and
 a test pins the two sets equal.
+
+**9b. A served forecast must be the offline one.** `Forecaster` builds each
+forecast's features with `build_lag_feature_frame` and the design with
+`lag_design` — the code the search cross-validated — and a test requires the
+served forecast to equal, at every origin, what the pipeline predicts for that
+row of the full series. Never add a second feature path for serving. A winning
+baseline is deployed as itself. `/observe` takes each actual exactly one step
+after the last (`strict=False` is for replaying HISTORICAL rows only, which the
+search counted by row). The concept-drift baseline is the forecaster's own
+walk-forward error over two seasonal cycles with standard errors, read with a
+noise margin over n/h independent errors (`error_span`): the search's averaged
+CV error was 2.3x pessimistic, and a one-fold baseline flagged 24% of healthy
+windows on 90 seeds after flagging 10% on 30. Measure false-alarm rates on 90+
+seeds, never 30.
 
 **8. Groups, when detected, apply to EVERY split.**
 Held-out partition, search folds, the halving screen's subsample (which samples
@@ -520,16 +534,15 @@ autoeng/
 
 ## Current state
 
-483 tests passing. Detection 10/10 on unambiguous cases (iris is genuinely
+503 tests passing. Detection 10/10 on unambiguous cases (iris is genuinely
 ambiguous and excluded). Successive halving gives 7.4× speedup with an
 identical winner.
 
 **T0-1 is done:** classification and regression runs write
 `runs/models/<run_name>/{model.joblib, training_schema.json, mlflow_model/}`,
 the report cites them, and reloading reproduces the held-out metrics at a
-measured delta of 0.0. Time-series and clustering runs still persist nothing —
-the first may pick a classical baseline with no fitted estimator, the second
-has no model to serve.
+measured delta of 0.0. Time-series runs persist a `Forecaster` (see 9b);
+clustering still persists nothing — it has no model to serve.
 
 **T0-2 is done:** binary classification selects a decision threshold on
 out-of-fold training predictions, saves it into `training_schema.json`, and

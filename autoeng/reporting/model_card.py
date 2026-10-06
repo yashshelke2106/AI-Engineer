@@ -221,8 +221,8 @@ def _limitations(*, problem_decision, target_source, pre_leak, post_leak, thresh
                      f"{segments['overall']:.3f} overall ({s['n_rows']} held-out rows).")
     if not model_artifact or model_artifact.get("status") != "saved":
         why = (model_artifact or {}).get("error") or (
-            "time-series and clustering runs do not persist a model" if problem_type in
-            ("time_series_forecasting", "clustering") else "no artifact was written")
+            "clustering runs do not persist a model" if problem_type == "clustering"
+            else "no artifact was written")
         notes.append(f"No servable model was persisted: {why}.")
     return notes
 

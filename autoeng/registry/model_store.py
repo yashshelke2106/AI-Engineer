@@ -457,6 +457,60 @@ def _write_mlflow_model(
         return None, f"MLflow model export skipped: {type(e).__name__}: {e}"
 
 
+def save_forecaster(
+    forecaster: Any, output_dir: str | Path, *, cv_metrics: dict[str, float], setup: dict[str, Any],
+    dataset_path: str | None = None, selection_source: str | None = None,
+) -> SavedModel:
+    """Persist a `Forecaster` with a schema serving and monitoring can read.
+
+    Same files as `save_model` — `model.joblib` and `training_schema.json` — so
+    `load_model`, the champion pointer and `serve` need no second path; the
+    schema's `problem_type` and `forecasting` block tell them it forecasts. The
+    baseline for concept drift is the cross-validated error at the trained
+    horizon, RMSE and MAE only: R² over a short window of a trending series
+    measures the window's variance as much as the forecasts.
+    """
+    model_dir = Path(output_dir)
+    model_dir.mkdir(parents=True, exist_ok=True)
+    f = forecaster
+    schema = {
+        "schema_version": SCHEMA_VERSION,
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "dataset_path": dataset_path,
+        "problem_type": "time_series_forecasting",
+        "n_training_rows": int(len(f.history) + f.rows_trimmed),
+        "model": {
+            "name": f.name, "kind": f.kind, "selection_source": selection_source,
+            "estimator_class": (f"{type(f.pipeline).__module__}.{type(f.pipeline).__qualname__}"
+                                if f.pipeline is not None else None),
+        },
+        "forecasting": {
+            "time_column": f.time_column, "target_column": f.target_column, "horizon": f.horizon,
+            "frequency": f.frequency, "spacing": str(f.spacing), "seasonal_period": f.seasonal_period,
+            "differenced": f.differenced, "exogenous_columns": list(f.exogenous_columns),
+            "history_end": str(f.last_time), "next_observation_time": str(f.next_observation_time),
+            "notes": list(f.notes),
+        },
+        # What a forecast request must carry: the known-in-advance covariates.
+        "feature_columns": list(f.exogenous_columns),
+        "target": {"column": f.target_column},
+        "baseline_metrics": {k: float(cv_metrics[k]) for k in ("rmse", "mae", "rmse_se", "mae_se")
+                             if k in cv_metrics},
+        "baseline_source": (f"the forecaster's own walk-forward error over the series' last "
+                            f"{cv_metrics.get('window', '?')} steps ({cv_metrics.get('n_forecasts', '?')} "
+                            f"forecasts, {f.horizon} step(s) ahead). {cv_metrics.get('reliability', '')}").strip(),
+        "time_series_setup": setup,
+        "library_versions": _library_versions(),
+    }
+    model_path = model_dir / MODEL_FILENAME
+    joblib.dump(forecaster, model_path)
+    schema_path = model_dir / SCHEMA_FILENAME
+    schema_path.write_text(json.dumps(schema, indent=2, default=str), encoding="utf-8")
+    return SavedModel(model_dir=str(model_dir.resolve()), model_path=str(model_path.resolve()),
+                      schema_path=str(schema_path.resolve()),
+                      estimator_class=schema["model"]["estimator_class"] or f"baseline:{f.name}")
+
+
 def save_model(
     estimator: Any,
     X_train: pd.DataFrame,

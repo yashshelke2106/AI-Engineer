@@ -142,8 +142,17 @@ def run_drift_report(
             summary="No predictions in the window, so nothing can be measured.", notes=notes,
         )
 
-    importances = schema.get("feature_importances") or None
-    data = check_data_drift(served, schema, importances)
+    forecasting = schema.get("problem_type") == "time_series_forecasting"
+    if forecasting:
+        # A forecaster stores no covariate references, so "no feature moved" would
+        # be vacuous — and an UNKNOWN data check would pull every verdict to
+        # UNKNOWN. It is absent and said so; forecast error is the signal.
+        data = None
+        notes.append("Input drift is not measured for a forecaster: its input is the series itself. "
+                     "Concept drift reads the forecast error directly as actuals arrive.")
+    else:
+        importances = schema.get("feature_importances") or None
+        data = check_data_drift(served, schema, importances)
 
     prediction = None
     target_reference = ((schema.get("target") or {}).get("reference") or {})
@@ -182,13 +191,18 @@ def run_drift_report(
     if resolved_baseline:
         labels = (schema.get("target") or {}).get("class_labels") or []
         concept = check_concept_drift(
-            labelled, resolved_baseline, problem_type=schema.get("problem_type"),
+            # Forecast error is regression error: scored as such, or no metric is
+            # shared with the RMSE/MAE baseline and the check reads UNKNOWN forever.
+            labelled, resolved_baseline,
+            problem_type="regression" if forecasting else schema.get("problem_type"),
+            # Consecutive h-step forecasts share h-1 shocks: about n/h independent errors.
+            error_span=int((schema.get("forecasting") or {}).get("horizon") or 1),
             positive_label=labels[1] if len(labels) == 2 else None,
             groups=(_entity_keys(labelled, (schema.get("feature_roles") or {}).get("group_column"),
                                  schema.get("entity_signature")) if not labelled.empty else None),
         )
         if schema.get("baseline_source"):
-            notes.append(f"Concept-drift baseline: {schema['baseline_source']}.")
+            notes.append(f"Concept-drift baseline: {schema['baseline_source'].rstrip('.')}.")
     else:
         notes.append(
             "No performance baseline is stored with this model, so concept drift cannot be "
@@ -250,4 +264,7 @@ def _combine(data, prediction, concept) -> tuple[DriftSeverity, str]:
             "Not enough data to judge. This is not the same as healthy — check whether "
             "labels are still arriving."
         )
+    if data is None and prediction is None:
+        # A forecaster: only its error was measured, and the verdict must not claim more.
+        return DriftSeverity.OK, "Live performance matches the training baseline (the only check that applies)."
     return DriftSeverity.OK, "Inputs, outputs and live performance all match the training baseline."

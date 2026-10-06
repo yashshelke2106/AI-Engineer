@@ -183,6 +183,13 @@ def create_app(
     app.state.store = store
     version = _model_version(schema)
 
+    if schema.get("problem_type") == "time_series_forecasting":
+        # A different contract: observations in, forecasts out (serving/forecasting.py).
+        from autoeng.serving.forecasting import add_forecasting_routes
+
+        add_forecasting_routes(app, estimator, schema, store, version)
+        return app
+
     def _score(rows: list[dict[str, Any]], allow_unknown: bool) -> dict[str, Any]:
         result = validate_payload(rows, schema, allow_unknown=allow_unknown)
         if not result.ok:

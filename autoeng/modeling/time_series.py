@@ -373,6 +373,59 @@ def _evaluate_baselines(y: np.ndarray, seasonal_period: int, cv: TimeSeriesSplit
     ]
 
 
+@dataclass
+class LagDesign:
+    """Everything the search and the final forecaster must build identically."""
+    lag_frame: pd.DataFrame
+    X: pd.DataFrame
+    roles: FeatureRoleAssignment
+    exogenous: list[str]
+    y_level: np.ndarray
+    origin_level: np.ndarray
+    y_fit: np.ndarray
+    offset: int  # rows dropped at the start for lack of history
+
+
+def lag_design(df: pd.DataFrame, target_column: str, time_column: str, roles: FeatureRoleAssignment,
+               seasonal_period: int | None, horizon: int, difference: bool) -> LagDesign:
+    """The lag frame, its feature matrix and roles, and the target as fitted.
+
+    Shared by `run_time_series_search` and `autoeng.modeling.forecaster`, so the
+    model that is served is built by exactly the code that was cross-validated.
+    """
+    from autoeng.common.roles import assign_feature_roles
+    from autoeng.profiling.profiler import profile_dataset
+
+    exogenous = [c for c in roles.feature_columns if c not in (target_column, time_column)]
+    lag_frame = build_lag_feature_frame(df, target_column, time_column, exogenous, seasonal_period,
+                                        horizon=horizon)
+    y_level = lag_frame[target_column].to_numpy(dtype=float)
+    origin_level = lag_frame[f"target_lag_{horizon}"].to_numpy(dtype=float)
+    # What the model is fitted on: either the level itself, or the change since
+    # the forecast origin. Scoring always happens on the level.
+    y_fit = (y_level - origin_level) if difference else y_level
+    X = lag_frame.drop(columns=[target_column, time_column])
+    sub_roles = assign_feature_roles(profile_dataset(X), target_column=None, time_column=None)
+    return LagDesign(lag_frame=lag_frame, X=X, roles=sub_roles, exogenous=exogenous, y_level=y_level,
+                     origin_level=origin_level, y_fit=y_fit, offset=len(df) - len(lag_frame))
+
+
+def make_forecast_pipeline(name: str, factory, roles_for_x: FeatureRoleAssignment) -> Pipeline:
+    # Never cap lag features, for any model. The cap is fitted on the training
+    # fold, and on a trending series the test fold's lags sit above that range
+    # by construction — so the cap clips exactly the most recent information.
+    # Measured on real weekly CO2 at a 13-week horizon: ridge 0.814 capped
+    # against 0.933 uncapped, huber 0.717 against 0.944; no effect either way
+    # on a stationary series.
+    pre = build_preprocessing_pipeline(roles_for_x, problem_kind="regression",
+                                        cap_outliers=False, use_interactions=False)
+    steps = list(pre.steps)
+    if name in SCALE_SENSITIVE_MODELS:
+        steps.append(("scale", StandardScaler()))
+    steps.append(("model", factory()))
+    return Pipeline(steps)
+
+
 def run_time_series_search(
     df: pd.DataFrame, target_column: str, time_column: str, roles: FeatureRoleAssignment,
     cv_folds: int = 5, seasonal_period: int | None = None, horizon: int = 1,
@@ -391,41 +444,14 @@ def run_time_series_search(
         differenced=difference, differencing_reason=difference_reason, horizon=horizon,
     )
 
-    exogenous = [c for c in roles.feature_columns if c not in (target_column, time_column)]
-    lag_frame = build_lag_feature_frame(df, target_column, time_column, exogenous, detected_period,
-                                        horizon=horizon)
-
-    y_level = lag_frame[target_column].to_numpy(dtype=float)
-    previous_level = lag_frame[f"target_lag_{horizon}"].to_numpy(dtype=float)
-    # What the model is fitted on: either the level itself, or the change since
-    # the forecast origin. Scoring always happens on the level.
-    y_fit = (y_level - previous_level) if difference else y_level
-
-    X = lag_frame.drop(columns=[target_column, time_column])
-
-    from autoeng.common.roles import assign_feature_roles
-    from autoeng.profiling.profiler import profile_dataset
-    sub_profile = profile_dataset(X)
-    sub_roles = assign_feature_roles(sub_profile, target_column=None, time_column=None)
+    design = lag_design(df, target_column, time_column, roles, detected_period, horizon, difference)
+    lag_frame, X, sub_roles = design.lag_frame, design.X, design.roles
+    y_level, previous_level, y_fit = design.y_level, design.origin_level, design.y_fit
 
     cv = TimeSeriesSplit(n_splits=cv_folds)
     models = get_regression_models()
     results: list[ModelResult] = []
-
-    def make_pipeline(name: str, factory, roles_for_x) -> Pipeline:
-        # Never cap lag features, for any model. The cap is fitted on the training
-        # fold, and on a trending series the test fold's lags sit above that range
-        # by construction — so the cap clips exactly the most recent information.
-        # Measured on real weekly CO2 at a 13-week horizon: ridge 0.814 capped
-        # against 0.933 uncapped, huber 0.717 against 0.944; no effect either way
-        # on a stationary series.
-        pre = build_preprocessing_pipeline(roles_for_x, problem_kind="regression",
-                                            cap_outliers=False, use_interactions=False)
-        steps = list(pre.steps)
-        if name in SCALE_SENSITIVE_MODELS:
-            steps.append(("scale", StandardScaler()))
-        steps.append(("model", factory()))
-        return Pipeline(steps)
+    make_pipeline = make_forecast_pipeline
 
     def score(name: str, pipe: Pipeline, stl_period: int | None = None) -> ModelResult:
         fold_metrics = {"r2": [], "neg_rmse": [], "neg_mae": []}

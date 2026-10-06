@@ -80,6 +80,15 @@ CREATE TABLE IF NOT EXISTS outcomes (
     source       TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_outcomes_request ON outcomes (request_id);
+
+-- A forecaster's observations of the series, in the order they arrived. Also
+-- append-only: they are the history every later forecast was built from, and a
+-- restarted server replays them to stand exactly where it stood.
+CREATE TABLE IF NOT EXISTS observations (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    observed_at  TEXT NOT NULL,
+    payload_json TEXT NOT NULL
+);
 """
 
 
@@ -185,6 +194,26 @@ class PredictionStore:
                 " VALUES (?, ?, ?, ?)",
                 (request_id, _now(), json.dumps(_jsonable(actual)), source),
             )
+
+    def log_observation(self, payload: dict[str, Any]) -> None:
+        """Record one observation of a forecast series (append-only)."""
+        with self._connect() as conn:
+            conn.execute("INSERT INTO observations (observed_at, payload_json) VALUES (?, ?)",
+                         (_now(), json.dumps({k: _jsonable(v) for k, v in payload.items()})))
+
+    def observations(self) -> list[dict[str, Any]]:
+        """Every observation, in arrival order."""
+        with self._connect() as conn:
+            return [json.loads(r[0]) for r in conn.execute("SELECT payload_json FROM observations ORDER BY id")]
+
+    def request_ids_where(self, field: str, value: Any) -> list[str]:
+        """Predictions whose payload has `field == value`: the forecasts made FOR a time."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT request_id FROM predictions WHERE json_extract(payload_json, ?) = ? ORDER BY predicted_at",
+                (f"$.{field}", _jsonable(value)),
+            ).fetchall()
+        return [r[0] for r in rows]
 
     # -- reading -----------------------------------------------------------
 

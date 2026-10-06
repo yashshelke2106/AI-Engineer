@@ -999,10 +999,35 @@ ROC_AUC_SKILL_LOSS_PER_TOLERANCE = 0.25
 ROC_AUC_NOISE_Z = 1.645
 
 
+def _error_noise(actual, predicted, baseline: dict[str, float], error_span: int) -> dict[str, float]:
+    """One-sided 95% noise margin on MAE / RMSE, for baselines that carry their own SE.
+
+    A forecaster's baseline is its walk-forward error over the last CV fold, ~40
+    forecasts: measured, live/baseline MAE ranged 0.62-1.69 across seeds with no
+    drift at all, so a bare 10% rule on it would alarm constantly. Consecutive
+    h-step forecasts share h-1 shocks, so `error_span` (the horizon) divides the
+    count into roughly independent errors. Only baselines that carry `mae_se` /
+    `rmse_se` get a margin; other regression baselines are read as before.
+    """
+    yt = pd.to_numeric(pd.Series(actual), errors="coerce").to_numpy(dtype=float)
+    yp = pd.to_numeric(pd.Series(predicted), errors="coerce").to_numpy(dtype=float)
+    errors = (yt - yp)[np.isfinite(yt) & np.isfinite(yp)]
+    if len(errors) < 3:
+        return {}
+    n_eff = max(len(errors) / max(int(error_span), 1), 2.0)
+    rmse = float(np.sqrt(np.mean(errors ** 2)))
+    live = {"mae": float(np.std(np.abs(errors), ddof=1) / np.sqrt(n_eff)),
+            "rmse": float(np.std(errors ** 2, ddof=1) / (2.0 * max(rmse, 1e-12) * np.sqrt(n_eff)))}
+    return {m: ROC_AUC_NOISE_Z * float(np.hypot(baseline[f"{m}_se"], live[m]))
+            for m in ("mae", "rmse") if baseline.get(f"{m}_se") is not None}
+
+
 def _drop(metric: str, baseline: float, observed: float, tolerance: float, noise: float = 0.0) -> float:
     """How much worse, on one scale for every metric: `tolerance` investigates, twice it alarms."""
     if metric in _LOWER_IS_BETTER:
-        return (observed - baseline) / baseline if baseline else observed
+        # Only the part of an error increase beyond both samples' noise counts.
+        worse = observed - baseline - noise
+        return worse / baseline if baseline else worse
     if metric == "roc_auc":
         # 0.5 is chance, so 0.70 -> 0.60 loses half the model's skill while an
         # absolute 0.10 would read as a mild dip. And both AUCs are samples.
@@ -1046,6 +1071,7 @@ def check_concept_drift(
     positive_label: Any = None,
     probability_column: str = "probability",
     groups: Any = None,
+    error_span: int = 1,
 ) -> SimpleDriftReport:
     """
     Rolling performance on the labelled window against the training baseline.
@@ -1102,7 +1128,9 @@ def check_concept_drift(
         )
 
     auc_noise = ROC_AUC_NOISE_Z * float(np.hypot(baseline.get("roc_auc_se") or 0.0, live_auc_se or 0.0))
-    drops = {m: _drop(m, baseline[m], observed[m], tolerance, auc_noise if m == "roc_auc" else 0.0)
+    error_noise = _error_noise(usable[actual_column], usable[prediction_column], baseline, error_span)         if regression else {}
+    drops = {m: _drop(m, baseline[m], observed[m], tolerance,
+                      auc_noise if m == "roc_auc" else error_noise.get(m, 0.0))
              for m in comparable}
     worst = max(drops.values())
     if worst >= tolerance * 2:
@@ -1115,6 +1143,9 @@ def check_concept_drift(
     described = ", ".join(f"{m} {observed[m]:.3f} against baseline {baseline[m]:.3f}" for m in comparable)
     if "roc_auc" in comparable and auc_noise:
         described += f" (ROC-AUC read beyond a noise margin of {auc_noise:.3f})"
+    if error_noise:
+        described += " (" + ", ".join(f"{m} read beyond a noise margin of {v:.3g}"
+                                      for m, v in sorted(error_noise.items())) + ")"
     return SimpleDriftReport(
         severity=severity, n_rows=len(usable), observed=observed, baseline=dict(baseline),
         summary=f"Live performance over {len(usable)} labelled predictions: {described} -> {severity.value}.",

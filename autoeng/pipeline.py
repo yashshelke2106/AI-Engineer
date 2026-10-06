@@ -53,7 +53,7 @@ from autoeng.modeling.threshold import (
 from autoeng.modeling.time_series import run_time_series_search
 from autoeng.profiling.profiler import profile_dataset
 from autoeng.monitoring.drift import raw_column_importances
-from autoeng.registry.model_store import freeze_holdout, save_model, update_training_schema
+from autoeng.registry.model_store import freeze_holdout, save_forecaster, save_model, update_training_schema
 from autoeng.reporting.model_card import (
     build_model_card, choose_segment_columns, render_model_card, segment_results,
 )
@@ -378,6 +378,30 @@ def _classification_metric(pipeline, X_test, y_test, n_classes: int) -> dict[str
     except Exception:
         pass
     return metrics
+
+
+def _persist_forecaster(clean_df, target_column, time_column, roles, setup, winner: str, *,
+                        model_dir: Path, dataset_path: str) -> dict[str, Any]:
+    """Refit the time-series winner on every row and save it for serving.
+
+    Reported, never raised, like `_persist_final_model`: a completed search must
+    not be lost to a packaging failure, and the report says it was not saved.
+    """
+    from autoeng.modeling.forecaster import fit_forecaster, walk_forward_baseline
+
+    try:
+        forecaster = fit_forecaster(clean_df, target_column, time_column, roles, setup, winner)
+        # Monitoring's yardstick is the forecaster's own walk-forward error over
+        # the last fold, not the search's mean over expanding folds (whose early
+        # folds train on a fraction of the data and read ~2x too pessimistic).
+        baseline = walk_forward_baseline(clean_df, target_column, time_column, roles, setup, winner)
+        saved = save_forecaster(
+            forecaster, model_dir, cv_metrics=baseline, setup=setup.as_dict(), dataset_path=dataset_path,
+            selection_source="expanding-window cross-validation against classical baselines",
+        )
+        return saved.as_dict()
+    except Exception as e:  # noqa: BLE001 - the search, and its report, still stand
+        return {"status": "failed", "error": f"{type(e).__name__}: {e}"}
 
 
 def _role_dict(roles) -> dict[str, Any]:
@@ -734,6 +758,13 @@ def run_pipeline(
                 "narrative": f"Selected lag-feature model: {best_ml.name} (r2={best_ml.metrics['r2']:.4f} under expanding-window CV).",
             }
 
+        winner = (explanation_dict or {}).get("winner_name")
+        if winner and any(r.name == winner for r in list(results) + list(baselines)):
+            model_artifact = _persist_forecaster(
+                clean_df, target_column, time_column, roles, ts_setup, winner,
+                model_dir=model_dir, dataset_path=dataset_path,
+            )
+
         temporal_check = check_temporal_split(
             clean_df.sort_values(time_column).iloc[: int(len(clean_df) * 0.8)],
             clean_df.sort_values(time_column).iloc[int(len(clean_df) * 0.8):],
@@ -766,10 +797,15 @@ def run_pipeline(
             }
             held_out_metrics = {"silhouette": top.metrics["silhouette"]}
 
-    model_artifact = _enrich_schema_after_evaluation(
-        model_artifact, explanation_dict, held_out_metrics, threshold_choice,
-        roles.feature_columns,
-    )
+    if chosen.problem_type != ProblemType.TIME_SERIES_FORECASTING:
+        # A forecaster's schema already carries its baseline: the cross-validated
+        # RMSE and MAE at its horizon. The generic enrichment would overwrite that
+        # with the held-out R², which on a short window of a trending series
+        # measures the window as much as the forecasts.
+        model_artifact = _enrich_schema_after_evaluation(
+            model_artifact, explanation_dict, held_out_metrics, threshold_choice,
+            roles.feature_columns,
+        )
 
     profile_summary = profile.as_dict()
     role_dict = _role_dict(roles)

@@ -52,10 +52,8 @@ branches) and before report generation, so the report cites the artifact.
     The export is written with cloudpickle for that reason, pinned by a test.
   - Saving failures are *reported, not raised*: the report says the model was
     not persisted and why, rather than discarding a completed search.
-- **Not covered:** time-series and clustering runs persist nothing. Time series
-  may select a classical baseline with no fitted estimator, and clustering has
-  no model to serve. Both need a decision about what "the model" even is before
-  they can have one.
+- **Not covered:** clustering persists nothing — it has no model to serve.
+  Time-series runs now persist a `Forecaster`; see "Deployable forecasters".
 
 ### ~~T0-2 · Decision threshold and class imbalance~~ — **DONE**
 
@@ -625,6 +623,57 @@ that limitation.
 A card failure is written to `<run>_model_card_error.txt` and never raised: the
 search, fit and evaluation it describes have already finished.
 
+### Deployable forecasters — **DONE** (follow-up to T0-1 and T2-2)
+
+Time-series runs now write `model.joblib` + `training_schema.json` like every
+other run, and `serve` serves them. The joblib holds a `Forecaster`
+(`autoeng/modeling/forecaster.py`): the search's winner — an estimator, a
+`<model>+stl` variant, or a classical baseline — refitted on every row, plus the
+history, horizon, sampling interval and design its features need. Each forecast's
+features come from `build_lag_feature_frame`, the function the search
+cross-validated, and the design from the same `lag_design` helper.
+
+**Served equals offline, tested at every origin:** fit on the series to T,
+forecast T+h, and get exactly (1e-9) what the same pipeline predicts for that row
+of the full series' lag frame; observe the next actual and require it again —
+including a `+stl` winner after history has been trimmed. A winning baseline is
+deployed as itself, the formula it was scored by.
+
+**Serving:** `POST /observe` appends actuals (each exactly one step after the
+last, or a 422 naming the expected time — a skipped week would misalign every
+lag), `POST /forecast` returns the forecast `horizon` steps past the latest
+observation and refuses a missing known-in-advance covariate (7a). Observations
+are logged append-only and replayed on restart. Each forecast is logged with its
+target time, and the actual for that time is attached as its outcome when it is
+observed — so concept drift reads forecast error with no labelling step.
+
+**The monitoring baseline took three tries, each measured:**
+
+| baseline | unshifted windows flagged | volatility x3 caught |
+|---|---|---|
+| search's mean over expanding folds | 1/30 | 9/30 — live error ran at 0.44x this baseline |
+| last fold alone (~40 forecasts), noise margin | **22/90 (24%)** | 23/30 |
+| two seasonal cycles, noise margin (shipped; 400-week series) | **0/60** | 18/30 |
+
+The mean over folds is pessimistic (its first folds train on 33 rows), so a
+doubled error read as healthy. The last fold looked right on 30 seeds (3/30
+false) and wrong on 90 (24%): forecast error varies across the seasonal cycle,
+and 40 weeks cover less than one, so live/baseline MAE spread 0.65-2.60 with no
+drift. The shipped baseline is the forecaster's own walk-forward error over two
+cycles (capped at half the series), with MAE/RMSE read beyond a one-sided 95%
+margin from both samples' standard errors, counting about n/h independent errors.
+On a short series the cap bites and detection weakens (8/30 at 250 weeks); the
+schema's `baseline_source` says so. A one-off level jump is mostly absorbed by a
+forecaster that models changes, so it is rightly not a lasting alarm.
+
+**End to end on real CO2:** trained on the first 1,900 weeks at a 13-week horizon
+(winner `linear_svr+stl`, baseline over 305 weeks), served, then fed the 325
+weeks it never saw: every observation accepted, 313 forecasts matured, live MAE
+0.575 against a baseline of 0.739, drift `ok` through the report and the CLI.
+
+**Not covered:** clustering still persists nothing; retrain and gate are not yet
+forecaster-aware; live observations must arrive without gaps.
+
 ### ~~T2-3 · Real text features~~ — **DONE**
 
 `TextVectorFeaturizer` in `autoeng/features/transformers.py`: TF-IDF reduced by
@@ -774,7 +823,7 @@ Roughly 2,300 lines and 40 tests across all fourteen items; Tier 0 alone is
 about 530 lines and closes the gap between what the report claims and what the
 model does.
 
-Current state: 483 tests passing, 10/10 on unambiguous problem-type detection,
+Current state: 503 tests passing, 10/10 on unambiguous problem-type detection,
 7.4× search speedup from successive halving. **Tiers 0 and 1 are complete.**
 A trained model is persisted with its schema and a frozen holdout (T0-1),
 decides at an out-of-fold threshold (T0-2), and is split entity-aware (T0-3);

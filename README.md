@@ -31,7 +31,7 @@ python scripts/generate_grouped.py --customers 200 --out data/new_customers.csv 
 python -m autoeng.cli gate <champion> <challenger> --models-root runs/production --apply
 python scripts/generate_grouped.py --customers 300 --concept 0.7 --out data/concept.csv  # a real concept change
 
-pytest tests/ -q                                           # 483 tests, ~340-560s (machine load varies)
+pytest tests/ -q                                           # 503 tests, ~6-9 min (machine load varies)
 python scripts/calibrate_detection.py                      # detection accuracy harness
 ```
 
@@ -456,11 +456,10 @@ part:
   shadow or multi-armed deployment.
 - **The serving API is a contract layer, not a hardened endpoint.** No auth,
   rate limiting, or TLS.
-- **Only classification and regression runs persist a model.** Time-series
-  forecasting may select a classical baseline that has no fitted estimator to
-  save, and clustering has no model to serve; both need a decision about what
-  "the model" is before they can have one, and guessing would produce an
-  artifact that loads but means nothing.
+- **Clustering persists no model, and forecasters are not yet retrained by the
+  lifecycle.** Forecasting runs now save and serve (`/observe`, `/forecast`),
+  but `retrain` and `gate` handle classification and regression only. Live
+  observations must arrive one step at a time; a gap is refused, not guessed.
 - **Thresholds are binary-classification only.** A single cut point is not a
   meaningful object for a multiclass target, and several zoo models
   (`RidgeClassifier`, `LinearSVC`) expose `decision_function` rather than
@@ -509,6 +508,15 @@ part:
   0.7007 after tuning was reported at 0.6866 and *behind* its runner-up (margin
   -0.0033). The selection itself was right; everything describing it was not.
   Found by reading the first real `ask` answer after T2-5, not by a test.
+- **Forecasts are deployable, and judged against the right yardstick.** A
+  forecasting run saves its winner — model, `+stl` variant or baseline — with
+  the history it needs, and serving returns exactly the forecast the search
+  would have made (tested at every origin). Monitoring compares live forecast
+  error with the forecaster's own walk-forward error over two seasonal cycles:
+  the search's averaged CV error was 2.3x too pessimistic (a doubled error read
+  as healthy), and a one-fold baseline flagged 24% of healthy windows once 90
+  seeds were run instead of 30. On real CO2, 325 unseen weeks served: live MAE
+  0.575 against a 0.739 baseline, drift `ok`.
 - **Every run writes a model card** beside its report: per-segment results
   judged against their own noise, and limitations pulled from the run's own
   checks. Intended use comes from `--intended-use` or the card says it was not
@@ -554,7 +562,7 @@ autoeng/
   reporting/       Markdown report generation
   pipeline.py      end-to-end orchestration
   cli.py           command-line entry point
-tests/             483 tests: planted leaks, regressions for every shipped bug, unit tests
+tests/             503 tests: planted leaks, regressions for every shipped bug, unit tests
 scripts/           detection calibration harness
 data/              synthetic + real validation datasets
 runs/              reports + MLflow store from the validation runs
